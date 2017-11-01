@@ -27,21 +27,28 @@
 
 #include <map>
 
-#include "Fwmark.h"
-#include "UidRanges.h"
 #include "DummyNetwork.h"
+#include "Fwmark.h"
+#include "NetdConstants.h"
+#include "NetlinkCommands.h"
+#include "UidRanges.h"
 
 #include "android-base/file.h"
+#include <android-base/stringprintf.h>
 #define LOG_TAG "Netd"
 #include "log/log.h"
 #include "logwrap/logwrap.h"
 #include "netutils/ifc.h"
 #include "resolv_netid.h"
 
+using android::base::StringPrintf;
 using android::base::WriteStringToFile;
 using android::net::UidRange;
 
-namespace {
+namespace android {
+namespace net {
+
+auto RouteController::iptablesRestoreCommandFunction = execIptablesRestoreCommand;
 
 // BEGIN CONSTANTS --------------------------------------------------------------------------------
 
@@ -60,7 +67,6 @@ const uint32_t RULE_PRIORITY_IMPLICIT_NETWORK    = 19000;
 const uint32_t RULE_PRIORITY_BYPASSABLE_VPN      = 20000;
 const uint32_t RULE_PRIORITY_VPN_FALLTHROUGH     = 21000;
 const uint32_t RULE_PRIORITY_DEFAULT_NETWORK     = 22000;
-const uint32_t RULE_PRIORITY_DIRECTLY_CONNECTED  = 23000;
 const uint32_t RULE_PRIORITY_UNREACHABLE         = 32000;
 
 const uint32_t ROUTE_TABLE_LOCAL_NETWORK  = 97;
@@ -74,30 +80,17 @@ const char* const ROUTE_TABLE_NAME_LEGACY_SYSTEM  = "legacy_system";
 const char* const ROUTE_TABLE_NAME_LOCAL = "local";
 const char* const ROUTE_TABLE_NAME_MAIN  = "main";
 
-// TODO: These values aren't defined by the Linux kernel, because legacy UID routing (as used in N
-// and below) was not upstreamed. Now that the UID routing code is upstream, we should remove these
-// and rely on the kernel header values.
-const uint16_t FRA_UID_START = 18;
-const uint16_t FRA_UID_END   = 19;
+// None of our regular routes specify priority, which causes them to have the default priority.
+// For default throw routes, we use a fixed priority of 100000.
+uint32_t PRIO_THROW = 100000;
 
-// These values are upstream, but not yet in our headers.
-// TODO: delete these definitions when updating the headers.
-const uint16_t FRA_UID_RANGE = 20;
-struct fib_rule_uid_range {
-        __u32           start;
-        __u32           end;
-};
-
-const uint16_t NETLINK_REQUEST_FLAGS = NLM_F_REQUEST | NLM_F_ACK;
-const uint16_t NETLINK_CREATE_REQUEST_FLAGS = NETLINK_REQUEST_FLAGS | NLM_F_CREATE | NLM_F_EXCL;
-
-const sockaddr_nl NETLINK_ADDRESS = {AF_NETLINK, 0, 0, 0};
+const char* const RouteController::LOCAL_MANGLE_INPUT = "routectrl_mangle_INPUT";
 
 const uint8_t AF_FAMILIES[] = {AF_INET, AF_INET6};
 
-const char* const IP_VERSIONS[] = {"-4", "-6"};
-
 const uid_t UID_ROOT = 0;
+const uint32_t FWMARK_NONE = 0;
+const uint32_t MASK_NONE = 0;
 const char* const IIF_LOOPBACK = "lo";
 const char* const IIF_NONE = NULL;
 const char* const OIF_NONE = NULL;
@@ -107,8 +100,6 @@ const bool MODIFY_NON_UID_BASED_RULES = true;
 
 const char* const RT_TABLES_PATH = "/data/misc/net/rt_tables";
 const mode_t RT_TABLES_MODE = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;  // mode 0644, rw-r--r--
-
-const unsigned ROUTE_FLUSH_ATTEMPTS = 2;
 
 // Avoids "non-constant-expression cannot be narrowed from type 'unsigned int' to 'unsigned short'"
 // warnings when using RTA_LENGTH(x) inside static initializers (even when x is already uint16_t).
@@ -122,16 +113,28 @@ rtattr FRATTR_PRIORITY  = { U16_RTA_LENGTH(sizeof(uint32_t)),           FRA_PRIO
 rtattr FRATTR_TABLE     = { U16_RTA_LENGTH(sizeof(uint32_t)),           FRA_TABLE };
 rtattr FRATTR_FWMARK    = { U16_RTA_LENGTH(sizeof(uint32_t)),           FRA_FWMARK };
 rtattr FRATTR_FWMASK    = { U16_RTA_LENGTH(sizeof(uint32_t)),           FRA_FWMASK };
-rtattr FRATTR_UID_START = { U16_RTA_LENGTH(sizeof(uid_t)),              FRA_UID_START };
-rtattr FRATTR_UID_END   = { U16_RTA_LENGTH(sizeof(uid_t)),              FRA_UID_END };
 rtattr FRATTR_UID_RANGE = { U16_RTA_LENGTH(sizeof(fib_rule_uid_range)), FRA_UID_RANGE };
 
 rtattr RTATTR_TABLE     = { U16_RTA_LENGTH(sizeof(uint32_t)),           RTA_TABLE };
 rtattr RTATTR_OIF       = { U16_RTA_LENGTH(sizeof(uint32_t)),           RTA_OIF };
+rtattr RTATTR_PRIO      = { U16_RTA_LENGTH(sizeof(uint32_t)),           RTA_PRIORITY };
 
 uint8_t PADDING_BUFFER[RTA_ALIGNTO] = {0, 0, 0, 0};
 
 // END CONSTANTS ----------------------------------------------------------------------------------
+
+const char *actionName(uint16_t action) {
+    static const char *ops[4] = {"adding", "deleting", "getting", "???"};
+    return ops[action % 4];
+}
+
+const char *familyName(uint8_t family) {
+    switch (family) {
+        case AF_INET: return "IPv4";
+        case AF_INET6: return "IPv6";
+        default: return "???";
+    }
+}
 
 // No locks needed because RouteController is accessed only from one thread (in CommandListener).
 std::map<std::string, uint32_t> interfaceToTable;
@@ -181,63 +184,6 @@ void updateTableNamesFile() {
         ALOGE("failed to write to %s (%s)", RT_TABLES_PATH, strerror(errno));
         return;
     }
-}
-
-// Sends a netlink request and expects an ack.
-// |iov| is an array of struct iovec that contains the netlink message payload.
-// The netlink header is generated by this function based on |action| and |flags|.
-// Returns -errno if there was an error or if the kernel reported an error.
-
-// Disable optimizations in ASan build.
-// ASan reports an out-of-bounds 32-bit(!) access in the first loop of the
-// function (over iov[]).
-#ifdef __clang__
-#if __has_feature(address_sanitizer)
-__attribute__((optnone))
-#endif
-#endif
-WARN_UNUSED_RESULT int sendNetlinkRequest(uint16_t action, uint16_t flags, iovec* iov, int iovlen) {
-    nlmsghdr nlmsg = {
-        .nlmsg_type = action,
-        .nlmsg_flags = flags,
-    };
-    iov[0].iov_base = &nlmsg;
-    iov[0].iov_len = sizeof(nlmsg);
-    for (int i = 0; i < iovlen; ++i) {
-        nlmsg.nlmsg_len += iov[i].iov_len;
-    }
-
-    int ret;
-    struct {
-        nlmsghdr msg;
-        nlmsgerr err;
-    } response;
-
-    int sock = socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_ROUTE);
-    if (sock != -1 &&
-            connect(sock, reinterpret_cast<const sockaddr*>(&NETLINK_ADDRESS),
-                    sizeof(NETLINK_ADDRESS)) != -1 &&
-            writev(sock, iov, iovlen) != -1 &&
-            (ret = recv(sock, &response, sizeof(response), 0)) != -1) {
-        if (ret == sizeof(response)) {
-            ret = response.err.error;  // Netlink errors are negative errno.
-            if (ret) {
-                ALOGE("netlink response contains error (%s)", strerror(-ret));
-            }
-        } else {
-            ALOGE("bad netlink response message size (%d != %zu)", ret, sizeof(response));
-            ret = -EBADMSG;
-        }
-    } else {
-        ALOGE("netlink socket/connect/writev/recv failed (%s)", strerror(errno));
-        ret = -errno;
-    }
-
-    if (sock != -1) {
-        close(sock);
-    }
-
-    return ret;
 }
 
 // Returns 0 on success or negative errno on failure.
@@ -327,18 +273,6 @@ WARN_UNUSED_RESULT int modifyIpRule(uint16_t action, uint32_t priority, uint8_t 
         { &fwmark,           mask ? sizeof(fwmark) : 0 },
         { &FRATTR_FWMASK,    mask ? sizeof(FRATTR_FWMASK) : 0 },
         { &mask,             mask ? sizeof(mask) : 0 },
-        // Rules that contain both legacy and new UID routing attributes will work on old kernels,
-        // which will simply ignore the FRA_UID_RANGE attribute since it is larger than their
-        // FRA_MAX. They will also work on kernels that are not too new:
-        // - FRA_UID_START clashes with FRA_PAD in 4.7, but that shouldn't be a problem because
-        //   FRA_PAD has no validation.
-        // - FRA_UID_END clashes with FRA_L3MDEV in 4.8 and above, and will cause an error because
-        //   FRA_L3MDEV has a maximum length of 1.
-        // TODO: delete the legacy UID routing code before running it on 4.8 or above.
-        { &FRATTR_UID_START, isUidRule ? sizeof(FRATTR_UID_START) : 0 },
-        { &uidStart,         isUidRule ? sizeof(uidStart) : 0 },
-        { &FRATTR_UID_END,   isUidRule ? sizeof(FRATTR_UID_END) : 0 },
-        { &uidEnd,           isUidRule ? sizeof(uidEnd) : 0 },
         { &FRATTR_UID_RANGE, isUidRule ? sizeof(FRATTR_UID_RANGE) : 0 },
         { &uidRange,         isUidRule ? sizeof(uidRange) : 0 },
         { &fraIifName,       iif != IIF_NONE ? sizeof(fraIifName) : 0 },
@@ -352,7 +286,13 @@ WARN_UNUSED_RESULT int modifyIpRule(uint16_t action, uint32_t priority, uint8_t 
     uint16_t flags = (action == RTM_NEWRULE) ? NETLINK_CREATE_REQUEST_FLAGS : NETLINK_REQUEST_FLAGS;
     for (size_t i = 0; i < ARRAY_SIZE(AF_FAMILIES); ++i) {
         rule.family = AF_FAMILIES[i];
-        if (int ret = sendNetlinkRequest(action, flags, iov, ARRAY_SIZE(iov))) {
+        if (int ret = sendNetlinkRequest(action, flags, iov, ARRAY_SIZE(iov), nullptr)) {
+            if (!(action == RTM_DELRULE && ret == -ENOENT && priority == RULE_PRIORITY_TETHERING)) {
+                // Don't log when deleting a tethering rule that's not there. This matches the
+                // behaviour of clearTetheringRules, which ignores ENOENT in this case.
+                ALOGE("Error %s %s rule: %s", actionName(action), familyName(rule.family),
+                      strerror(-ret));
+            }
             return ret;
         }
     }
@@ -431,6 +371,8 @@ WARN_UNUSED_RESULT int modifyIpRoute(uint16_t action, uint32_t table, const char
         }
     }
 
+    bool isDefaultThrowRoute = (type == RTN_THROW && prefixLength == 0);
+
     // Assemble a rtmsg and put it in an array of iovec structures.
     rtmsg route = {
         .rtm_protocol = RTPROT_STATIC,
@@ -454,11 +396,18 @@ WARN_UNUSED_RESULT int modifyIpRoute(uint16_t action, uint32_t table, const char
         { &ifindex,      interface != OIF_NONE ? sizeof(ifindex) : 0 },
         { &rtaGateway,   nexthop ? sizeof(rtaGateway) : 0 },
         { rawNexthop,    nexthop ? static_cast<size_t>(rawLength) : 0 },
+        { &RTATTR_PRIO,  isDefaultThrowRoute ? sizeof(RTATTR_PRIO) : 0 },
+        { &PRIO_THROW,   isDefaultThrowRoute ? sizeof(PRIO_THROW) : 0 },
     };
 
     uint16_t flags = (action == RTM_NEWROUTE) ? NETLINK_CREATE_REQUEST_FLAGS :
                                                 NETLINK_REQUEST_FLAGS;
-    return sendNetlinkRequest(action, flags, iov, ARRAY_SIZE(iov));
+    int ret = sendNetlinkRequest(action, flags, iov, ARRAY_SIZE(iov), nullptr);
+    if (ret) {
+        ALOGE("Error %s route %s -> %s %s to table %u: %s",
+              actionName(action), destination, nexthop, interface, table, strerror(-ret));
+    }
+    return ret;
 }
 
 // An iptables rule to mark incoming packets on a network with the netId of the network.
@@ -477,11 +426,10 @@ WARN_UNUSED_RESULT int modifyIncomingPacketMark(unsigned netId, const char* inte
     fwmark.protectedFromVpn = true;
     fwmark.permission = permission;
 
-    char markString[UINT32_HEX_STRLEN];
-    snprintf(markString, sizeof(markString), "0x%x", fwmark.intValue);
-
-    if (execIptables(V4V6, "-t", "mangle", add ? "-A" : "-D", "INPUT", "-i", interface, "-j",
-                     "MARK", "--set-mark", markString, NULL)) {
+    std::string cmd = StringPrintf("%s %s -i %s -j MARK --set-mark 0x%x",
+                                   add ? "-A" : "-D", RouteController::LOCAL_MANGLE_INPUT,
+                                   interface, fwmark.intValue);
+    if (RouteController::iptablesRestoreCommandFunction(V4V6, "mangle", cmd, nullptr) != 0) {
         ALOGE("failed to change iptables rule that sets incoming packet mark");
         return -EREMOTEIO;
     }
@@ -589,10 +537,10 @@ WARN_UNUSED_RESULT int modifyOutputInterfaceRules(const char* interface, uint32_
     mask.permission = permission;
 
     // If this rule does not specify a UID range, then also add a corresponding high-priority rule
-    // for UID. This covers forwarded packets and system daemons such as the tethering DHCP server.
+    // for root. This covers forwarded packets and system daemons such as the tethering DHCP server.
     if (uidStart == INVALID_UID && uidEnd == INVALID_UID) {
         if (int ret = modifyIpRule(add ? RTM_NEWRULE : RTM_DELRULE, RULE_PRIORITY_VPN_OVERRIDE_OIF,
-                                   table, fwmark.intValue, mask.intValue, IIF_NONE, interface,
+                                   table, FWMARK_NONE, MASK_NONE, IIF_NONE, interface,
                                    UID_ROOT, UID_ROOT)) {
             return ret;
         }
@@ -607,8 +555,7 @@ WARN_UNUSED_RESULT int modifyOutputInterfaceRules(const char* interface, uint32_
 // This is for sockets that have not explicitly requested a particular network, but have been
 // bound to one when they called connect(). This ensures that sockets connected on a particular
 // network stay on that network even if the default network changes.
-WARN_UNUSED_RESULT int modifyImplicitNetworkRule(unsigned netId, uint32_t table,
-                                                 Permission permission, bool add) {
+WARN_UNUSED_RESULT int modifyImplicitNetworkRule(unsigned netId, uint32_t table, bool add) {
     Fwmark fwmark;
     Fwmark mask;
 
@@ -618,8 +565,8 @@ WARN_UNUSED_RESULT int modifyImplicitNetworkRule(unsigned netId, uint32_t table,
     fwmark.explicitlySelected = false;
     mask.explicitlySelected = true;
 
-    fwmark.permission = permission;
-    mask.permission = permission;
+    fwmark.permission = PERMISSION_NONE;
+    mask.permission = PERMISSION_NONE;
 
     return modifyIpRule(add ? RTM_NEWRULE : RTM_DELRULE, RULE_PRIORITY_IMPLICIT_NETWORK, table,
                         fwmark.intValue, mask.intValue);
@@ -720,32 +667,14 @@ int configureDummyNetwork() {
     }
 
     if ((ret = modifyIpRoute(RTM_NEWROUTE, table, interface, "0.0.0.0/0", NULL))) {
-        ALOGE("Can't add IPv4 default route to %s: %s", interface, strerror(-ret));
         return ret;
     }
 
     if ((ret = modifyIpRoute(RTM_NEWROUTE, table, interface, "::/0", NULL))) {
-        ALOGE("Can't add IPv6 default route to %s: %s", interface, strerror(-ret));
         return ret;
     }
 
     return 0;
-}
-
-// Add a new rule to look up the 'main' table, with the same selectors as the "default network"
-// rule, but with a lower priority. We will never create routes in the main table; it should only be
-// used for directly-connected routes implicitly created by the kernel when adding IP addresses.
-// This is necessary, for example, when adding a route through a directly-connected gateway: in
-// order to add the route, there must already be a directly-connected route that covers the gateway.
-WARN_UNUSED_RESULT int addDirectlyConnectedRule() {
-    Fwmark fwmark;
-    Fwmark mask;
-
-    fwmark.netId = NETID_UNSET;
-    mask.netId = FWMARK_NET_ID_MASK;
-
-    return modifyIpRule(RTM_NEWRULE, RULE_PRIORITY_DIRECTLY_CONNECTED, RT_TABLE_MAIN,
-                        fwmark.intValue, mask.intValue, IIF_NONE, OIF_NONE, UID_ROOT, UID_ROOT);
 }
 
 // Add an explicit unreachable rule close to the end of the prioriy list to make it clear that
@@ -783,7 +712,31 @@ WARN_UNUSED_RESULT int modifyPhysicalNetwork(unsigned netId, const char* interfa
                                             add)) {
         return ret;
     }
-    return modifyImplicitNetworkRule(netId, table, permission, add);
+
+    // Only set implicit rules for networks that don't require permissions.
+    //
+    // This is so that if the default network ceases to be the default network and then switches
+    // from requiring no permissions to requiring permissions, we ensure that apps only use the
+    // network if they explicitly select it. This is consistent with destroySocketsLackingPermission
+    // - it closes all sockets on the network except sockets that are explicitly selected.
+    //
+    // The lack of this rule only affects the special case above, because:
+    // - The only cases where we implicitly bind a socket to a network are the default network and
+    //   the bypassable VPN that applies to the app, if any.
+    // - This rule doesn't affect VPNs because they don't support permissions at all.
+    // - The default network doesn't require permissions. While we support doing this, the framework
+    //   never does it (partly because we'd end up in the situation where we tell apps that there is
+    //   a default network, but they can't use it).
+    // - If the network is still the default network, the presence or absence of this rule does not
+    //   matter.
+    //
+    // Therefore, for the lack of this rule to affect a socket, the socket has to have been
+    // implicitly bound to a network because at the time of connect() it was the default, and that
+    // network must no longer be the default, and must now require permissions.
+    if (permission == PERMISSION_NONE) {
+        return modifyImplicitNetworkRule(netId, table, add);
+    }
+    return 0;
 }
 
 WARN_UNUSED_RESULT int modifyRejectNonSecureNetworkRule(const UidRanges& uidRanges, bool add) {
@@ -874,25 +827,7 @@ WARN_UNUSED_RESULT int modifyTetheredNetwork(uint16_t action, const char* inputI
                         inputInterface, OIF_NONE, INVALID_UID, INVALID_UID);
 }
 
-// Returns 0 on success or negative errno on failure.
-WARN_UNUSED_RESULT int flushRules() {
-    for (size_t i = 0; i < ARRAY_SIZE(IP_VERSIONS); ++i) {
-        const char* argv[] = {
-            IP_PATH,
-            IP_VERSIONS[i],
-            "rule",
-            "flush",
-        };
-        if (android_fork_execvp(ARRAY_SIZE(argv), const_cast<char**>(argv), NULL, false, false)) {
-            ALOGE("failed to flush rules");
-            return -EREMOTEIO;
-        }
-    }
-    return 0;
-}
-
-// Adds or removes an IPv4 or IPv6 route to the specified table and, if it's a directly-connected
-// route, to the main table as well.
+// Adds or removes an IPv4 or IPv6 route to the specified table.
 // Returns 0 on success or negative errno on failure.
 WARN_UNUSED_RESULT int modifyRoute(uint16_t action, const char* interface, const char* destination,
                                    const char* nexthop, RouteController::TableType tableType) {
@@ -928,56 +863,6 @@ WARN_UNUSED_RESULT int modifyRoute(uint16_t action, const char* interface, const
     return 0;
 }
 
-// Returns 0 on success or negative errno on failure.
-WARN_UNUSED_RESULT int flushRoutes(const char* interface) {
-    uint32_t table = getRouteTableForInterface(interface);
-    if (table == RT_TABLE_UNSPEC) {
-        return -ESRCH;
-    }
-
-    char tableString[UINT32_STRLEN];
-    snprintf(tableString, sizeof(tableString), "%u", table);
-
-    int ret = 0;
-    for (size_t i = 0; i < ARRAY_SIZE(IP_VERSIONS); ++i) {
-        const char* argv[] = {
-            IP_PATH,
-            IP_VERSIONS[i],
-            "route",
-            "flush",
-            "table",
-            tableString,
-        };
-
-        // A flush works by dumping routes and deleting each route as it's returned, and it can
-        // fail if something else deletes the route between the dump and the delete. This can
-        // happen, for example, if an interface goes down while we're trying to flush its routes.
-        // So try multiple times and only return an error if the last attempt fails.
-        //
-        // TODO: replace this with our own netlink code.
-        unsigned attempts = 0;
-        int err;
-        do {
-            err = android_fork_execvp(ARRAY_SIZE(argv), const_cast<char**>(argv),
-                                      NULL, false, false);
-            ++attempts;
-        } while (err != 0 && attempts < ROUTE_FLUSH_ATTEMPTS);
-        if (err) {
-            ALOGE("failed to flush %s routes in table %s after %d attempts",
-                  IP_VERSIONS[i], tableString, attempts);
-            ret = -EREMOTEIO;
-        }
-    }
-
-    // If we failed to flush routes, the caller may elect to keep this interface around, so keep
-    // track of its name.
-    if (!ret) {
-        interfaceToTable.erase(interface);
-    }
-
-    return ret;
-}
-
 WARN_UNUSED_RESULT int clearTetheringRules(const char* inputInterface) {
     int ret = 0;
     while (ret == 0) {
@@ -992,7 +877,47 @@ WARN_UNUSED_RESULT int clearTetheringRules(const char* inputInterface) {
     }
 }
 
-}  // namespace
+uint32_t getRulePriority(const nlmsghdr *nlh) {
+    return getRtmU32Attribute(nlh, FRA_PRIORITY);
+}
+
+uint32_t getRouteTable(const nlmsghdr *nlh) {
+    return getRtmU32Attribute(nlh, RTA_TABLE);
+}
+
+WARN_UNUSED_RESULT int flushRules() {
+    NetlinkDumpFilter shouldDelete = [] (nlmsghdr *nlh) {
+        // Don't touch rules at priority 0 because by default they are used for local input.
+        return getRulePriority(nlh) != 0;
+    };
+    return rtNetlinkFlush(RTM_GETRULE, RTM_DELRULE, "rules", shouldDelete);
+}
+
+WARN_UNUSED_RESULT int flushRoutes(uint32_t table) {
+    NetlinkDumpFilter shouldDelete = [table] (nlmsghdr *nlh) {
+        return getRouteTable(nlh) == table;
+    };
+
+    return rtNetlinkFlush(RTM_GETROUTE, RTM_DELROUTE, "routes", shouldDelete);
+}
+
+// Returns 0 on success or negative errno on failure.
+WARN_UNUSED_RESULT int flushRoutes(const char* interface) {
+    uint32_t table = getRouteTableForInterface(interface);
+    if (table == RT_TABLE_UNSPEC) {
+        return -ESRCH;
+    }
+
+    int ret = flushRoutes(table);
+
+    // If we failed to flush routes, the caller may elect to keep this interface around, so keep
+    // track of its name.
+    if (ret == 0) {
+        interfaceToTable.erase(interface);
+    }
+
+    return ret;
+}
 
 int RouteController::Init(unsigned localNetId) {
     if (int ret = flushRules()) {
@@ -1002,9 +927,6 @@ int RouteController::Init(unsigned localNetId) {
         return ret;
     }
     if (int ret = addLocalNetworkRules(localNetId)) {
-        return ret;
-    }
-    if (int ret = addDirectlyConnectedRule()) {
         return ret;
     }
     if (int ret = addUnreachableRule()) {
@@ -1139,3 +1061,6 @@ int RouteController::removeVirtualNetworkFallthrough(unsigned vpnNetId,
                                                      Permission permission) {
     return modifyVpnFallthroughRule(RTM_DELRULE, vpnNetId, physicalInterface, permission);
 }
+
+}  // namespace net
+}  // namespace android

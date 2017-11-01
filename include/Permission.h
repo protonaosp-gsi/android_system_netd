@@ -17,6 +17,8 @@
 #ifndef NETD_INCLUDE_PERMISSION_H
 #define NETD_INCLUDE_PERMISSION_H
 
+#include <string.h>
+
 // This enum represents the permissions we care about for networking. When applied to an app, it's
 // the permission the app (UID) has been granted. When applied to a network, it's the permission an
 // app must hold to be allowed to use the network. PERMISSION_NONE means "no special permission is
@@ -47,6 +49,16 @@ inline const char *permissionToName(Permission permission) {
         // No default statement. We want to see errors of the form:
         // "enumeration value 'PERMISSION_SYSTEM' not handled in switch [-Werror,-Wswitch]".
     }
+}
+
+inline Permission stringToPermission(const char* arg) {
+    if (!strcmp(arg, "NETWORK")) {
+        return PERMISSION_NETWORK;
+    }
+    if (!strcmp(arg, "SYSTEM")) {
+        return PERMISSION_SYSTEM;
+    }
+    return PERMISSION_NONE;
 }
 
 #endif  // NETD_INCLUDE_PERMISSION_H

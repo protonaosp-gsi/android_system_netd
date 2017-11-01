@@ -43,7 +43,6 @@
 #include "BandwidthController.h"
 #include "IdletimerController.h"
 #include "InterfaceController.h"
-#include "oem_iptables_hook.h"
 #include "NetdConstants.h"
 #include "FirewallController.h"
 #include "RouteController.h"
@@ -52,21 +51,12 @@
 #include <string>
 #include <vector>
 
-using android::net::gCtls;
+namespace android {
+namespace net {
 
 namespace {
 
 const unsigned NUM_OEM_IDS = NetworkController::MAX_OEM_ID - NetworkController::MIN_OEM_ID + 1;
-
-Permission stringToPermission(const char* arg) {
-    if (!strcmp(arg, "NETWORK")) {
-        return PERMISSION_NETWORK;
-    }
-    if (!strcmp(arg, "SYSTEM")) {
-        return PERMISSION_SYSTEM;
-    }
-    return PERMISSION_NONE;
-}
 
 unsigned stringToNetId(const char* arg) {
     if (!strcmp(arg, "local")) {
@@ -77,6 +67,12 @@ unsigned stringToNetId(const char* arg) {
         unsigned n = strtoul(arg + 3, NULL, 0);
         if (1 <= n && n <= NUM_OEM_IDS) {
             return NetworkController::MIN_OEM_ID + n;
+        }
+        return NETID_UNSET;
+    } else if (!strncmp(arg, "handle", 6)) {
+        unsigned n = netHandleToNetId((net_handle_t)strtoull(arg + 6, NULL, 10));
+        if (NetworkController::MIN_OEM_ID <= n && n <= NetworkController::MAX_OEM_ID) {
+            return n;
         }
         return NETID_UNSET;
     }
@@ -104,92 +100,15 @@ private:
 
 }  // namespace
 
-/**
- * List of module chains to be created, along with explicit ordering. ORDERING
- * IS CRITICAL, AND SHOULD BE TRIPLE-CHECKED WITH EACH CHANGE.
- */
-static const char* FILTER_INPUT[] = {
-        // Bandwidth should always be early in input chain, to make sure we
-        // correctly count incoming traffic against data plan.
-        BandwidthController::LOCAL_INPUT,
-        FirewallController::LOCAL_INPUT,
-        NULL,
-};
-
-static const char* FILTER_FORWARD[] = {
-        OEM_IPTABLES_FILTER_FORWARD,
-        FirewallController::LOCAL_FORWARD,
-        BandwidthController::LOCAL_FORWARD,
-        NatController::LOCAL_FORWARD,
-        NULL,
-};
-
-static const char* FILTER_OUTPUT[] = {
-        OEM_IPTABLES_FILTER_OUTPUT,
-        FirewallController::LOCAL_OUTPUT,
-        StrictController::LOCAL_OUTPUT,
-        BandwidthController::LOCAL_OUTPUT,
-        NULL,
-};
-
-static const char* RAW_PREROUTING[] = {
-        BandwidthController::LOCAL_RAW_PREROUTING,
-        IdletimerController::LOCAL_RAW_PREROUTING,
-        NatController::LOCAL_RAW_PREROUTING,
-        NULL,
-};
-
-static const char* MANGLE_POSTROUTING[] = {
-        BandwidthController::LOCAL_MANGLE_POSTROUTING,
-        IdletimerController::LOCAL_MANGLE_POSTROUTING,
-        NULL,
-};
-
-static const char* MANGLE_FORWARD[] = {
-        NatController::LOCAL_MANGLE_FORWARD,
-        NULL,
-};
-
-static const char* NAT_PREROUTING[] = {
-        OEM_IPTABLES_NAT_PREROUTING,
-        NULL,
-};
-
-static const char* NAT_POSTROUTING[] = {
-        NatController::LOCAL_NAT_POSTROUTING,
-        NULL,
-};
-
-static void createChildChains(IptablesTarget target, const char* table, const char* parentChain,
-        const char** childChains) {
-    const char** childChain = childChains;
-    do {
-        // Order is important:
-        // -D to delete any pre-existing jump rule (removes references
-        //    that would prevent -X from working)
-        // -F to flush any existing chain
-        // -X to delete any existing chain
-        // -N to create the chain
-        // -A to append the chain to parent
-
-        execIptablesSilently(target, "-t", table, "-D", parentChain, "-j", *childChain, NULL);
-        execIptablesSilently(target, "-t", table, "-F", *childChain, NULL);
-        execIptablesSilently(target, "-t", table, "-X", *childChain, NULL);
-        execIptables(target, "-t", table, "-N", *childChain, NULL);
-        execIptables(target, "-t", table, "-A", parentChain, "-j", *childChain, NULL);
-    } while (*(++childChain) != NULL);
-}
-
 void CommandListener::registerLockingCmd(FrameworkCommand *cmd, android::RWLock& lock) {
     registerCmd(new LockingFrameworkCommand(cmd, lock));
 }
 
-CommandListener::CommandListener() :
-                 FrameworkListener("netd", true) {
+CommandListener::CommandListener() : FrameworkListener(SOCKET_NAME, true) {
     registerLockingCmd(new InterfaceCmd());
-    registerLockingCmd(new IpFwdCmd());
-    registerLockingCmd(new TetherCmd());
-    registerLockingCmd(new NatCmd());
+    registerLockingCmd(new IpFwdCmd(), gCtls->tetherCtrl.lock);
+    registerLockingCmd(new TetherCmd(), gCtls->tetherCtrl.lock);
+    registerLockingCmd(new NatCmd(), gCtls->tetherCtrl.lock);
     registerLockingCmd(new ListTtysCmd());
     registerLockingCmd(new PppdCmd());
     registerLockingCmd(new BandwidthControlCmd(), gCtls->bandwidthCtrl.lock);
@@ -199,51 +118,6 @@ CommandListener::CommandListener() :
     registerLockingCmd(new ClatdCmd());
     registerLockingCmd(new NetworkCommand());
     registerLockingCmd(new StrictCmd());
-
-    /*
-     * This is the only time we touch top-level chains in iptables; controllers
-     * should only mutate rules inside of their children chains, as created by
-     * the constants above.
-     *
-     * Modules should never ACCEPT packets (except in well-justified cases);
-     * they should instead defer to any remaining modules using RETURN, or
-     * otherwise DROP/REJECT.
-     */
-
-    // Create chains for children modules
-    createChildChains(V4V6, "filter", "INPUT", FILTER_INPUT);
-    createChildChains(V4V6, "filter", "FORWARD", FILTER_FORWARD);
-    createChildChains(V4V6, "filter", "OUTPUT", FILTER_OUTPUT);
-    createChildChains(V4V6, "raw", "PREROUTING", RAW_PREROUTING);
-    createChildChains(V4V6, "mangle", "POSTROUTING", MANGLE_POSTROUTING);
-    createChildChains(V4V6, "mangle", "FORWARD", MANGLE_FORWARD);
-    createChildChains(V4, "nat", "PREROUTING", NAT_PREROUTING);
-    createChildChains(V4, "nat", "POSTROUTING", NAT_POSTROUTING);
-
-    // Let each module setup their child chains
-    setupOemIptablesHook();
-
-    /* When enabled, DROPs all packets except those matching rules. */
-    gCtls->firewallCtrl.setupIptablesHooks();
-
-    /* Does DROPs in FORWARD by default */
-    gCtls->natCtrl.setupIptablesHooks();
-    /*
-     * Does REJECT in INPUT, OUTPUT. Does counting also.
-     * No DROP/REJECT allowed later in netfilter-flow hook order.
-     */
-    gCtls->bandwidthCtrl.setupIptablesHooks();
-    /*
-     * Counts in nat: PREROUTING, POSTROUTING.
-     * No DROP/REJECT allowed later in netfilter-flow hook order.
-     */
-    gCtls->idletimerCtrl.setupIptablesHooks();
-
-    gCtls->bandwidthCtrl.enableBandwidthControl(false);
-
-    if (int ret = RouteController::Init(NetworkController::LOCAL_NET_ID)) {
-        ALOGE("failed to initialize RouteController (%s)", strerror(-ret));
-    }
 }
 
 CommandListener::InterfaceCmd::InterfaceCmd() :
@@ -436,21 +310,6 @@ int CommandListener::InterfaceCmd::runCommand(SocketClient *cli,
             } else {
                 cli->sendMsg(ResponseCode::OperationFailed,
                         "Failed to change IPv6 state", true);
-            }
-            return 0;
-        } else if (!strcmp(argv[1], "ipv6ndoffload")) {
-            if (argc != 4) {
-                cli->sendMsg(ResponseCode::CommandSyntaxError,
-                        "Usage: interface ipv6ndoffload <interface> <enable|disable>",
-                        false);
-                return 0;
-            }
-            int enable = !strncmp(argv[3], "enable", 7);
-            if (InterfaceController::setIPv6NdOffload(argv[2], enable) == 0) {
-                cli->sendMsg(ResponseCode::CommandOkay, "IPv6 ND offload changed", false);
-            } else {
-                cli->sendMsg(ResponseCode::OperationFailed,
-                        "Failed to change IPv6 ND offload state", true);
             }
             return 0;
         } else if (!strcmp(argv[1], "setmtu")) {
@@ -672,7 +531,7 @@ int CommandListener::NatCmd::runCommand(SocketClient *cli,
     // nat  enable intiface extiface
     // nat disable intiface extiface
     if (!strcmp(argv[1], "enable") && argc >= 4) {
-        rc = gCtls->natCtrl.enableNat(argv[2], argv[3]);
+        rc = gCtls->tetherCtrl.enableNat(argv[2], argv[3]);
         if(!rc) {
             /* Ignore ifaces for now. */
             rc = gCtls->bandwidthCtrl.setGlobalAlertInForwardChain();
@@ -680,7 +539,7 @@ int CommandListener::NatCmd::runCommand(SocketClient *cli,
     } else if (!strcmp(argv[1], "disable") && argc >= 4) {
         /* Ignore ifaces for now. */
         rc = gCtls->bandwidthCtrl.removeGlobalAlertInForwardChain();
-        rc |= gCtls->natCtrl.disableNat(argv[2], argv[3]);
+        rc |= gCtls->tetherCtrl.disableNat(argv[2], argv[3]);
     } else {
         cli->sendMsg(ResponseCode::CommandSyntaxError, "Unknown nat cmd", false);
         return 0;
@@ -1097,29 +956,6 @@ int CommandListener::BandwidthControlCmd::runCommand(SocketClient *cli, int argc
         return 0;
 
     }
-    if (!strcmp(argv[1], "gettetherstats") || !strcmp(argv[1], "gts")) {
-        BandwidthController::TetherStats tetherStats;
-        std::string extraProcessingInfo = "";
-        if (argc < 2 || argc > 4) {
-            sendGenericSyntaxError(cli, "gettetherstats [<intInterface> <extInterface>]");
-            return 0;
-        }
-        tetherStats.intIface = argc > 2 ? argv[2] : "";
-        tetherStats.extIface = argc > 3 ? argv[3] : "";
-        // No filtering requested and there are no interface pairs to lookup.
-        if (argc <= 2 && gCtls->natCtrl.ifacePairList.empty()) {
-            cli->sendMsg(ResponseCode::CommandOkay, "Tethering stats list completed", false);
-            return 0;
-        }
-        int rc = gCtls->bandwidthCtrl.getTetherStats(cli, tetherStats, extraProcessingInfo);
-        if (rc) {
-                extraProcessingInfo.insert(0, "Failed to get tethering stats.\n");
-                sendGenericOpFailed(cli, extraProcessingInfo.c_str());
-                return 0;
-        }
-        return 0;
-
-    }
 
     cli->sendMsg(ResponseCode::CommandSyntaxError, "Unknown bandwidth cmd", false);
     return 0;
@@ -1275,39 +1111,6 @@ int CommandListener::FirewallCmd::runCommand(SocketClient *cli, int argc,
         FirewallRule rule = parseRule(argv[3]);
 
         int res = gCtls->firewallCtrl.setInterfaceRule(iface, rule);
-        return sendGenericOkFail(cli, res);
-    }
-
-    if (!strcmp(argv[1], "set_egress_source_rule")) {
-        if (argc != 4) {
-            cli->sendMsg(ResponseCode::CommandSyntaxError,
-                         "Usage: firewall set_egress_source_rule <192.168.0.1> <allow|deny>",
-                         false);
-            return 0;
-        }
-
-        const char* addr = argv[2];
-        FirewallRule rule = parseRule(argv[3]);
-
-        int res = gCtls->firewallCtrl.setEgressSourceRule(addr, rule);
-        return sendGenericOkFail(cli, res);
-    }
-
-    if (!strcmp(argv[1], "set_egress_dest_rule")) {
-        if (argc != 5) {
-            cli->sendMsg(ResponseCode::CommandSyntaxError,
-                         "Usage: firewall set_egress_dest_rule <192.168.0.1> <80> <allow|deny>",
-                         false);
-            return 0;
-        }
-
-        const char* addr = argv[2];
-        int port = atoi(argv[3]);
-        FirewallRule rule = parseRule(argv[4]);
-
-        int res = 0;
-        res |= gCtls->firewallCtrl.setEgressDestRule(addr, PROTOCOL_TCP, port, rule);
-        res |= gCtls->firewallCtrl.setEgressDestRule(addr, PROTOCOL_UDP, port, rule);
         return sendGenericOkFail(cli, res);
     }
 
@@ -1737,3 +1540,6 @@ int CommandListener::NetworkCommand::runCommand(SocketClient* client, int argc, 
 
     return syntaxError(client, "Unknown argument");
 }
+
+}  // namespace net
+}  // namespace android

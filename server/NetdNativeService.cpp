@@ -16,9 +16,11 @@
 
 #define LOG_TAG "Netd"
 
+#include <set>
 #include <vector>
 
 #include <android-base/stringprintf.h>
+#include <android-base/strings.h>
 #include <cutils/log.h>
 #include <cutils/properties.h>
 #include <utils/Errors.h>
@@ -27,6 +29,8 @@
 #include <binder/IPCThreadState.h>
 #include <binder/IServiceManager.h>
 #include "android/net/BnNetd.h"
+
+#include <openssl/base64.h>
 
 #include "Controllers.h"
 #include "DumpWriter.h"
@@ -39,6 +43,7 @@
 #include "UidRanges.h"
 
 using android::base::StringPrintf;
+using android::os::PersistableBundle;
 
 namespace android {
 namespace net {
@@ -46,7 +51,15 @@ namespace net {
 namespace {
 
 const char CONNECTIVITY_INTERNAL[] = "android.permission.CONNECTIVITY_INTERNAL";
+const char NETWORK_STACK[] = "android.permission.NETWORK_STACK";
 const char DUMP[] = "android.permission.DUMP";
+
+binder::Status toBinderStatus(const netdutils::Status s) {
+    if (isOk(s)) {
+        return binder::Status::ok();
+    }
+    return binder::Status::fromServiceSpecificError(s.code(), s.msg().c_str());
+}
 
 binder::Status checkPermission(const char *permission) {
     pid_t pid;
@@ -188,13 +201,48 @@ binder::Status NetdNativeService::socketDestroy(const std::vector<UidRange>& uid
     return binder::Status::ok();
 }
 
+// Parse a base64 encoded string into a vector of bytes.
+// On failure, return an empty vector.
+static std::vector<uint8_t> parseBase64(const std::string& input) {
+    std::vector<uint8_t> decoded;
+    size_t out_len;
+    if (EVP_DecodedLength(&out_len, input.size()) != 1) {
+        return decoded;
+    }
+    // out_len is now an upper bound on the output length.
+    decoded.resize(out_len);
+    if (EVP_DecodeBase64(decoded.data(), &out_len, decoded.size(),
+            reinterpret_cast<const uint8_t*>(input.data()), input.size()) == 1) {
+        // Possibly shrink the vector if the actual output was smaller than the bound.
+        decoded.resize(out_len);
+    } else {
+        decoded.clear();
+    }
+    if (out_len != SHA256_SIZE) {
+        decoded.clear();
+    }
+    return decoded;
+}
+
 binder::Status NetdNativeService::setResolverConfiguration(int32_t netId,
         const std::vector<std::string>& servers, const std::vector<std::string>& domains,
-        const std::vector<int32_t>& params) {
+        const std::vector<int32_t>& params, bool useTls, const std::string& tlsName,
+        const std::vector<std::string>& tlsFingerprints) {
     // This function intentionally does not lock within Netd, as Bionic is thread-safe.
     ENFORCE_PERMISSION(CONNECTIVITY_INTERNAL);
 
-    int err = gCtls->resolverCtrl.setResolverConfiguration(netId, servers, domains, params);
+    std::set<std::vector<uint8_t>> decoded_fingerprints;
+    for (const std::string& fingerprint : tlsFingerprints) {
+        std::vector<uint8_t> decoded = parseBase64(fingerprint);
+        if (decoded.empty()) {
+            return binder::Status::fromServiceSpecificError(EINVAL,
+                    String8::format("ResolverController error: bad fingerprint"));
+        }
+        decoded_fingerprints.emplace(decoded);
+    }
+
+    int err = gCtls->resolverCtrl.setResolverConfiguration(netId, servers, domains, params,
+            useTls, tlsName, decoded_fingerprints);
     if (err != 0) {
         return binder::Status::fromServiceSpecificError(-err,
                 String8::format("ResolverController error: %s", strerror(-err)));
@@ -217,9 +265,45 @@ binder::Status NetdNativeService::getResolverInfo(int32_t netId,
 }
 
 binder::Status NetdNativeService::tetherApplyDnsInterfaces(bool *ret) {
-    NETD_BIG_LOCK_RPC(CONNECTIVITY_INTERNAL);
+    NETD_LOCKING_RPC(NETWORK_STACK, gCtls->tetherCtrl.lock)
 
     *ret = gCtls->tetherCtrl.applyDnsInterfaces();
+    return binder::Status::ok();
+}
+
+namespace {
+
+void tetherAddStats(PersistableBundle *bundle, const TetherController::TetherStats& stats) {
+    String16 iface = String16(stats.extIface.c_str());
+    std::vector<int64_t> statsVector(INetd::TETHER_STATS_ARRAY_SIZE);
+
+    bundle->getLongVector(iface, &statsVector);
+    if (statsVector.size() == 0) {
+        for (int i = 0; i < INetd::TETHER_STATS_ARRAY_SIZE; i++) statsVector.push_back(0);
+    }
+
+    statsVector[INetd::TETHER_STATS_RX_BYTES]   += stats.rxBytes;
+    statsVector[INetd::TETHER_STATS_RX_PACKETS] += stats.rxPackets;
+    statsVector[INetd::TETHER_STATS_TX_BYTES]   += stats.txBytes;
+    statsVector[INetd::TETHER_STATS_TX_PACKETS] += stats.txPackets;
+
+    bundle->putLongVector(iface, statsVector);
+}
+
+}  // namespace
+
+binder::Status NetdNativeService::tetherGetStats(PersistableBundle *bundle) {
+    NETD_LOCKING_RPC(NETWORK_STACK, gCtls->tetherCtrl.lock)
+
+    const auto& statsList = gCtls->tetherCtrl.getTetherStats();
+    if (!isOk(statsList)) {
+        return toBinderStatus(statsList);
+    }
+
+    for (const auto& stats : statsList.value()) {
+        tetherAddStats(bundle, stats);
+    }
+
     return binder::Status::ok();
 }
 
@@ -307,6 +391,117 @@ binder::Status NetdNativeService::setMetricsReportingLevel(const int reportingLe
     return (gCtls->eventReporter.setMetricsReportingLevel(reportingLevel) == 0)
             ? binder::Status::ok()
             : binder::Status::fromExceptionCode(binder::Status::EX_ILLEGAL_ARGUMENT);
+}
+
+binder::Status NetdNativeService::ipSecAllocateSpi(
+        int32_t transformId,
+        int32_t direction,
+        const std::string& localAddress,
+        const std::string& remoteAddress,
+        int32_t inSpi,
+        int32_t* outSpi) {
+    // Necessary locking done in IpSecService and kernel
+    ENFORCE_PERMISSION(CONNECTIVITY_INTERNAL);
+    ALOGD("ipSecAllocateSpi()");
+    return asBinderStatus(gCtls->xfrmCtrl.ipSecAllocateSpi(
+                    transformId,
+                    direction,
+                    localAddress,
+                    remoteAddress,
+                    inSpi,
+                    outSpi));
+}
+
+binder::Status NetdNativeService::ipSecAddSecurityAssociation(
+        int32_t transformId,
+        int32_t mode,
+        int32_t direction,
+        const std::string& localAddress,
+        const std::string& remoteAddress,
+        int64_t underlyingNetworkHandle,
+        int32_t spi,
+        const std::string& authAlgo, const std::vector<uint8_t>& authKey, int32_t authTruncBits,
+        const std::string& cryptAlgo, const std::vector<uint8_t>& cryptKey, int32_t cryptTruncBits,
+        const std::string& aeadAlgo, const std::vector<uint8_t>& aeadKey, int32_t aeadIcvBits,
+        int32_t encapType,
+        int32_t encapLocalPort,
+        int32_t encapRemotePort) {
+    // Necessary locking done in IpSecService and kernel
+    ENFORCE_PERMISSION(CONNECTIVITY_INTERNAL);
+    ALOGD("ipSecAddSecurityAssociation()");
+    return asBinderStatus(gCtls->xfrmCtrl.ipSecAddSecurityAssociation(
+              transformId, mode, direction, localAddress, remoteAddress,
+              underlyingNetworkHandle,
+              spi,
+              authAlgo, authKey, authTruncBits,
+              cryptAlgo, cryptKey, cryptTruncBits,
+              aeadAlgo, aeadKey, aeadIcvBits,
+              encapType, encapLocalPort, encapRemotePort));
+}
+
+binder::Status NetdNativeService::ipSecDeleteSecurityAssociation(
+        int32_t transformId,
+        int32_t direction,
+        const std::string& localAddress,
+        const std::string& remoteAddress,
+        int32_t spi) {
+    // Necessary locking done in IpSecService and kernel
+    ENFORCE_PERMISSION(CONNECTIVITY_INTERNAL);
+    ALOGD("ipSecDeleteSecurityAssociation()");
+    return asBinderStatus(gCtls->xfrmCtrl.ipSecDeleteSecurityAssociation(
+                    transformId,
+                    direction,
+                    localAddress,
+                    remoteAddress,
+                    spi));
+}
+
+binder::Status NetdNativeService::ipSecApplyTransportModeTransform(
+        const android::base::unique_fd& socket,
+        int32_t transformId,
+        int32_t direction,
+        const std::string& localAddress,
+        const std::string& remoteAddress,
+        int32_t spi) {
+    // Necessary locking done in IpSecService and kernel
+    ENFORCE_PERMISSION(CONNECTIVITY_INTERNAL);
+    ALOGD("ipSecApplyTransportModeTransform()");
+    return asBinderStatus(gCtls->xfrmCtrl.ipSecApplyTransportModeTransform(
+                    socket,
+                    transformId,
+                    direction,
+                    localAddress,
+                    remoteAddress,
+                    spi));
+}
+
+binder::Status NetdNativeService::ipSecRemoveTransportModeTransform(
+            const android::base::unique_fd& socket) {
+    // Necessary locking done in IpSecService and kernel
+    ENFORCE_PERMISSION(CONNECTIVITY_INTERNAL);
+    ALOGD("ipSecRemoveTransportModeTransform()");
+    return asBinderStatus(gCtls->xfrmCtrl.ipSecRemoveTransportModeTransform(
+                    socket));
+}
+
+binder::Status NetdNativeService::setIPv6AddrGenMode(const std::string& ifName,
+                                                     int32_t mode) {
+    ENFORCE_PERMISSION(NETWORK_STACK);
+    return toBinderStatus(InterfaceController::setIPv6AddrGenMode(ifName, mode));
+}
+
+binder::Status NetdNativeService::wakeupAddInterface(const std::string& ifName,
+                                                     const std::string& prefix, int32_t mark,
+                                                     int32_t mask) {
+    ENFORCE_PERMISSION(NETWORK_STACK);
+    return toBinderStatus(gCtls->wakeupCtrl.addInterface(ifName, prefix, mark, mask));
+}
+
+binder::Status NetdNativeService::wakeupDelInterface(const std::string& ifName,
+                                                     const std::string& prefix, int32_t mark,
+                                                     int32_t mask) {
+    ENFORCE_PERMISSION(NETWORK_STACK);
+    return toBinderStatus(gCtls->wakeupCtrl.delInterface(ifName, prefix, mark, mask));
 }
 
 }  // namespace net

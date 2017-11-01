@@ -19,19 +19,36 @@
 #include <malloc.h>
 #include <sys/socket.h>
 
+#include <functional>
+
 #define LOG_TAG "InterfaceController"
 #include <android-base/file.h>
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <cutils/log.h>
 #include <logwrap/logwrap.h>
 #include <netutils/ifc.h>
 
+#include <android/net/INetd.h>
+#include <netdutils/Misc.h>
+#include <netdutils/Slice.h>
+#include <netdutils/Syscalls.h>
+
 #include "InterfaceController.h"
 #include "RouteController.h"
 
-using android::base::StringPrintf;
 using android::base::ReadFileToString;
+using android::base::StringPrintf;
 using android::base::WriteStringToFile;
+using android::net::INetd;
+using android::net::RouteController;
+using android::netdutils::Status;
+using android::netdutils::StatusOr;
+using android::netdutils::makeSlice;
+using android::netdutils::sSyscalls;
+using android::netdutils::status::ok;
+using android::netdutils::statusFromErrno;
+using android::netdutils::toString;
 
 namespace {
 
@@ -44,7 +61,25 @@ const char ipv6_neigh_conf_dir[] = "/proc/sys/net/ipv6/neigh";
 const char proc_net_path[] = "/proc/sys/net";
 const char sys_net_path[] = "/sys/class/net";
 
-const char wl_util_path[] = "/vendor/xbin/wlutil";
+constexpr int kRouteInfoMinPrefixLen = 48;
+
+// RFC 7421 prefix length.
+constexpr int kRouteInfoMaxPrefixLen = 64;
+
+// Property used to persist RFC 7217 stable secret. Protected by SELinux policy.
+const char kStableSecretProperty[] = "persist.netd.stable_secret";
+
+// RFC 7217 stable secret on linux is formatted as an IPv6 address.
+// This function uses 128 bits of high quality entropy to generate an
+// address for this purpose. This function should be not be called
+// frequently.
+StatusOr<std::string> randomIPv6Address() {
+    in6_addr addr = {};
+    const auto& sys = sSyscalls.get();
+    ASSIGN_OR_RETURN(auto fd, sys.open("/dev/random", O_RDONLY));
+    RETURN_IF_NOT_OK(sys.read(fd, makeSlice(addr)));
+    return toString(addr);
+}
 
 inline bool isNormalPathComponent(const char *component) {
     return (strcmp(component, ".") != 0) &&
@@ -69,24 +104,34 @@ int writeValueToPath(
     return WriteStringToFile(value, path) ? 0 : -1;
 }
 
-void setOnAllInterfaces(const char* dirname, const char* basename, const char* value) {
-    // Set the default value, which is used by any interfaces that are created in the future.
-    writeValueToPath(dirname, "default", basename, value);
-
-    // Set the value on all the interfaces that currently exist.
-    DIR* dir = opendir(dirname);
+// Run @fn on each interface as well as 'default' in the path @dirname.
+void forEachInterface(const std::string& dirname,
+                      std::function<void(const std::string& path, const std::string& iface)> fn) {
+    // Run on default, which controls the behavior of any interfaces that are created in the future.
+    fn(dirname, "default");
+    DIR* dir = opendir(dirname.c_str());
     if (!dir) {
-        ALOGE("Can't list %s: %s", dirname, strerror(errno));
+        ALOGE("Can't list %s: %s", dirname.c_str(), strerror(errno));
         return;
     }
-    dirent* d;
-    while ((d = readdir(dir))) {
-        if ((d->d_type != DT_DIR) || !isInterfaceName(d->d_name)) {
+    while (true) {
+        const dirent *ent = readdir(dir);
+        if (!ent) {
+            break;
+        }
+        if ((ent->d_type != DT_DIR) || !isInterfaceName(ent->d_name)) {
             continue;
         }
-        writeValueToPath(dirname, d->d_name, basename, value);
+        fn(dirname, ent->d_name);
     }
     closedir(dir);
+}
+
+void setOnAllInterfaces(const char* dirname, const char* basename, const char* value) {
+    auto fn = [basename, value](const std::string& path, const std::string& iface) {
+        writeValueToPath(path.c_str(), iface.c_str(), basename, value);
+    };
+    forEachInterface(dirname, fn);
 }
 
 void setIPv6UseOutgoingInterfaceAddrsOnly(const char *value) {
@@ -108,7 +153,75 @@ std::string getParameterPathname(
     return StringPrintf("%s/%s/%s/%s/%s", proc_net_path, family, which, interface, parameter);
 }
 
+void setAcceptIPv6RIO(int min, int max) {
+    auto fn = [min, max](const std::string& prefix, const std::string& iface) {
+        int rv = writeValueToPath(prefix.c_str(), iface.c_str(), "accept_ra_rt_info_min_plen",
+                                  std::to_string(min).c_str());
+        if (rv != 0) {
+            // Only update max_plen if the write to min_plen succeeded. This ordering will prevent
+            // RIOs from being accepted unless both min and max are written successfully.
+            return;
+        }
+        writeValueToPath(prefix.c_str(), iface.c_str(), "accept_ra_rt_info_max_plen",
+                         std::to_string(max).c_str());
+    };
+    forEachInterface(ipv6_proc_path, fn);
+}
+
+// Ideally this function would return StatusOr<std::string>, however
+// there is no safe value for dflt that will always differ from the
+// stored property. Bugs code could conceivably end up persisting the
+// reserved value resulting in surprising behavior.
+std::string getProperty(const std::string& key, const std::string& dflt) {
+    return android::base::GetProperty(key, dflt);
+};
+
+Status setProperty(const std::string& key, const std::string& val) {
+    // SetProperty does not dependably set errno to a meaningful value. Use our own error code so
+    // callers don't get confused.
+    return android::base::SetProperty(key, val)
+        ? ok
+        : statusFromErrno(EREMOTEIO, "SetProperty failed, see libc logs");
+};
+
+
 }  // namespace
+
+android::netdutils::Status InterfaceController::enableStablePrivacyAddresses(
+        const std::string& iface, GetPropertyFn getProperty, SetPropertyFn setProperty) {
+    const auto& sys = sSyscalls.get();
+    const std::string procTarget = std::string(ipv6_proc_path) + "/" + iface + "/stable_secret";
+    auto procFd = sys.open(procTarget, O_CLOEXEC | O_WRONLY);
+
+    // Devices with old kernels (typically < 4.4) don't support
+    // RFC 7217 stable privacy addresses.
+    if (equalToErrno(procFd, ENOENT)) {
+        return statusFromErrno(EOPNOTSUPP,
+                               "Failed to open stable_secret. Assuming unsupported kernel version");
+    }
+
+    // If stable_secret exists but we can't open it, something strange is going on.
+    RETURN_IF_NOT_OK(procFd);
+
+    const char kUninitialized[] = "uninitialized";
+    const auto oldSecret = getProperty(kStableSecretProperty, kUninitialized);
+    std::string secret = oldSecret;
+
+    // Generate a new secret if no persistent property existed.
+    if (oldSecret == kUninitialized) {
+        ASSIGN_OR_RETURN(secret, randomIPv6Address());
+    }
+
+    // Ask the OS to generate SLAAC addresses on iface using secret.
+    RETURN_IF_NOT_OK(sys.write(procFd.value(), makeSlice(secret)));
+
+    // Don't persist an existing secret.
+    if (oldSecret != kUninitialized) {
+        return ok;
+    }
+
+    return setProperty(kStableSecretProperty, secret);
+}
 
 void InterfaceController::initializeAll() {
     // Initial IPv6 settings.
@@ -117,6 +230,9 @@ void InterfaceController::initializeAll() {
     // learned from RAs to go away when forwarding is turned on. Make this behaviour predictable
     // by always setting accept_ra to 2.
     setAcceptRA("2");
+
+    // Accept RIOs with prefix length in the closed interval [48, 64].
+    setAcceptIPv6RIO(kRouteInfoMinPrefixLen, kRouteInfoMaxPrefixLen);
 
     setAcceptRARouteTable(-RouteController::ROUTE_TABLE_OFFSET_FROM_INDEX);
 
@@ -141,6 +257,31 @@ int InterfaceController::setEnableIPv6(const char *interface, const int on) {
     // addresses and routes and disables IPv6 on the interface.
     const char *disable_ipv6 = on ? "0" : "1";
     return writeValueToPath(ipv6_proc_path, interface, "disable_ipv6", disable_ipv6);
+}
+
+// Changes to addrGenMode will not fully take effect until the next
+// time disable_ipv6 transitions from 1 to 0.
+Status InterfaceController::setIPv6AddrGenMode(const std::string& interface, int mode) {
+    if (!isIfaceName(interface)) {
+        return statusFromErrno(ENOENT, "invalid iface name: " + interface);
+    }
+
+    switch (mode) {
+        case INetd::IPV6_ADDR_GEN_MODE_EUI64:
+            // Ignore return value. If /proc/.../stable_secret is
+            // missing we're probably in EUI64 mode already.
+            writeValueToPath(ipv6_proc_path, interface.c_str(), "stable_secret", "");
+            break;
+        case INetd::IPV6_ADDR_GEN_MODE_STABLE_PRIVACY: {
+            return enableStablePrivacyAddresses(interface, getProperty, setProperty);
+        }
+        case INetd::IPV6_ADDR_GEN_MODE_NONE:
+        case INetd::IPV6_ADDR_GEN_MODE_RANDOM:
+        default:
+            return statusFromErrno(EOPNOTSUPP, "unsupported addrGenMode");
+    }
+
+    return ok;
 }
 
 int InterfaceController::setAcceptIPv6Ra(const char *interface, const int on) {
@@ -177,31 +318,8 @@ int InterfaceController::setIPv6PrivacyExtensions(const char *interface, const i
         return -1;
     }
     // 0: disable IPv6 privacy addresses
-    // 0: enable IPv6 privacy addresses and prefer them over non-privacy ones.
+    // 2: enable IPv6 privacy addresses and prefer them over non-privacy ones.
     return writeValueToPath(ipv6_proc_path, interface, "use_tempaddr", on ? "2" : "0");
-}
-
-// Enables or disables IPv6 ND offload. This is useful for 464xlat on wifi, IPv6 tethering, and
-// generally implementing IPv6 neighbour discovery and duplicate address detection properly.
-// TODO: This should be implemented in wpa_supplicant via driver commands instead.
-int InterfaceController::setIPv6NdOffload(char* interface, const int on) {
-    // Only supported on Broadcom chipsets via wlutil for now.
-    if (access(wl_util_path, X_OK) == 0) {
-        const char *argv[] = {
-            wl_util_path,
-            "-a",
-            interface,
-            "ndoe",
-            on ? "1" : "0"
-        };
-        int ret = android_fork_execvp(ARRAY_SIZE(argv), const_cast<char**>(argv), NULL,
-                                      false, false);
-        ALOGD("%s ND offload on %s: %d (%s)",
-              (on ? "enabling" : "disabling"), interface, ret, strerror(errno));
-        return ret;
-    } else {
-        return 0;
-    }
 }
 
 void InterfaceController::setAcceptRA(const char *value) {

@@ -17,6 +17,7 @@
 package android.net;
 
 import android.net.UidRange;
+import android.os.PersistableBundle;
 
 /** {@hide} */
 interface INetd {
@@ -103,11 +104,16 @@ interface INetd {
      * @param params the params to set. This array contains RESOLVER_PARAMS_COUNT integers that
      *   encode the contents of Bionic's __res_params struct, i.e. sample_validity is stored at
      *   position RESOLVER_PARAMS_SAMPLE_VALIDITY, etc.
+     * @param useTls If true, try to contact servers over TLS on port 853.
+     * @param tlsName The TLS subject name to require for all servers, or empty if there is none.
+     * @param tlsFingerprints An array containing TLS public key fingerprints (pins) of which each
+     *   server must match at least one, or empty if there are no pinned keys.
      * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
      *         unix errno.
      */
     void setResolverConfiguration(int netId, in @utf8InCpp String[] servers,
-            in @utf8InCpp String[] domains, in int[] params);
+            in @utf8InCpp String[] domains, in int[] params, boolean useTls,
+            in @utf8InCpp String tlsName, in @utf8InCpp String[] tlsFingerprints);
 
     // Array indices for resolver stats.
     const int RESOLVER_STATS_SUCCESSES = 0;
@@ -156,6 +162,25 @@ interface INetd {
      */
     boolean tetherApplyDnsInterfaces();
 
+    // Ordering of the elements in the arrays returned by tetherGetStats.
+    const int TETHER_STATS_RX_BYTES   = 0;
+    const int TETHER_STATS_RX_PACKETS = 1;
+    const int TETHER_STATS_TX_BYTES   = 2;
+    const int TETHER_STATS_TX_PACKETS = 3;
+    const int TETHER_STATS_ARRAY_SIZE = 4;
+
+    /**
+     * Return tethering statistics.
+     *
+     * @return a PersistableBundle, where each entry maps the upstream interface name to an array
+     *         of longs representing stats. The array is TETHER_STATS_ARRAY_SIZE elements long and
+     *         the order of the elements is specified by the TETHER_STATS_{RX,TX}_{PACKETS,BYTES}
+     *         constants.
+     * @throws ServiceSpecificException in case of failure, with an error code indicating the
+     *         cause of the the failure.
+     */
+    PersistableBundle tetherGetStats();
+
     /**
      * Add/Remove and IP address from an interface.
      *
@@ -199,4 +224,134 @@ interface INetd {
      */
     int getMetricsReportingLevel();
     void setMetricsReportingLevel(int level);
+
+   /**
+    * Reserve an SPI from the kernel
+    *
+    * @param transformId a unique identifier for allocated resources
+    * @param direction DIRECTION_IN or DIRECTION_OUT
+    * @param localAddress InetAddress as string for the local endpoint
+    * @param remoteAddress InetAddress as string for the remote endpoint
+    * @param spi a requested 32-bit unique ID or 0 to request random allocation
+    * @return the SPI that was allocated or 0 if failed
+    */
+    int ipSecAllocateSpi(
+            int transformId,
+            int direction,
+            in @utf8InCpp String localAddress,
+            in @utf8InCpp String remoteAddress,
+            int spi);
+
+   /**
+    * Create an IpSec Security Association describing how ip(v6) traffic will be encrypted
+    * or decrypted.
+    *
+    * @param transformId a unique identifier for allocated resources
+    * @param mode either Transport or Tunnel mode
+    * @param direction DIRECTION_IN or DIRECTION_OUT
+    * @param localAddress InetAddress as string for the local endpoint
+    * @param remoteAddress InetAddress as string for the remote endpoint
+    * @param underlyingNetworkHandle the networkHandle of the network to which the SA is applied
+    * @param spi a 32-bit unique ID allocated to the user
+    * @param authAlgo a string identifying the authentication algorithm to be used
+    * @param authKey a byte array containing the authentication key
+    * @param authTruncBits the truncation length of the MAC produced by the authentication algorithm
+    * @param cryptAlgo a string identifying the encryption algorithm to be used
+    * @param cryptKey a byte arrray containing the encryption key
+    * @param cryptTruncBits unused parameter
+    * @param aeadAlgo a string identifying the authenticated encryption algorithm to be used
+    * @param aeadKey a byte arrray containing the key to be used in authenticated encryption
+    * @param aeadIcvBits the truncation length of the ICV produced by the authentication algorithm
+    *        (similar to authTruncBits in function)
+    * @param encapType encapsulation type used (if any) for the udp encap socket
+    * @param encapLocalPort the port number on the host to be used in encap packets
+    * @param encapRemotePort the port number of the remote to be used for encap packets
+    */
+    void ipSecAddSecurityAssociation(
+            int transformId,
+            int mode,
+            int direction,
+            in @utf8InCpp String localAddress,
+            in @utf8InCpp String remoteAddress,
+            long underlyingNetworkHandle,
+            int spi,
+            in @utf8InCpp String authAlgo, in byte[] authKey, in int authTruncBits,
+            in @utf8InCpp String cryptAlgo, in byte[] cryptKey, in int cryptTruncBits,
+            in @utf8InCpp String aeadAlgo, in byte[] aeadKey, in int aeadIcvBits,
+            int encapType,
+            int encapLocalPort,
+            int encapRemotePort);
+
+   /**
+    * Delete a previously created security association identified by the provided parameters
+    *
+    * @param transformId a unique identifier for allocated resources
+    * @param direction DIRECTION_IN or DIRECTION_OUT
+    * @param localAddress InetAddress as string for the local endpoint
+    * @param remoteAddress InetAddress as string for the remote endpoint
+    * @param spi a requested 32-bit unique ID allocated to the user
+    */
+    void ipSecDeleteSecurityAssociation(
+            int transformId,
+            int direction,
+            in @utf8InCpp String localAddress,
+            in @utf8InCpp String remoteAddress,
+            int spi);
+
+   /**
+    * Apply a previously created SA to a specified socket, starting IPsec on that socket
+    *
+    * @param socket a user-provided socket that will have IPsec applied
+    * @param transformId a unique identifier for allocated resources
+    * @param direction DIRECTION_IN or DIRECTION_OUT
+    * @param localAddress InetAddress as string for the local endpoint
+    * @param remoteAddress InetAddress as string for the remote endpoint
+    * @param spi a 32-bit unique ID allocated to the user (socket owner)
+    */
+    void ipSecApplyTransportModeTransform(
+            in FileDescriptor socket,
+            int transformId,
+            int direction,
+            in @utf8InCpp String localAddress,
+            in @utf8InCpp String remoteAddress,
+            int spi);
+
+   /**
+    * Remove an IPsec SA from a given socket. This will allow unencrypted traffic to flow
+    * on that socket if a transform had been previously applied.
+    *
+    * @param socket a user-provided socket from which to remove any IPsec configuration
+    */
+    void ipSecRemoveTransportModeTransform(
+            in FileDescriptor socket);
+
+   /**
+    * Request notification of wakeup packets arriving on an interface. Notifications will be
+    * delivered to INetdEventListener.onWakeupEvent().
+    *
+    * @param ifName the interface
+    * @param prefix arbitrary string used to identify wakeup sources in onWakeupEvent
+    */
+    void wakeupAddInterface(in @utf8InCpp String ifName, in @utf8InCpp String prefix, int mark, int mask);
+
+   /**
+    * Stop notification of wakeup packets arriving on an interface.
+    *
+    * @param ifName the interface
+    * @param prefix arbitrary string used to identify wakeup sources in onWakeupEvent
+    */
+    void wakeupDelInterface(in @utf8InCpp String ifName, in @utf8InCpp String prefix, int mark, int mask);
+
+    const int IPV6_ADDR_GEN_MODE_EUI64 = 0;
+    const int IPV6_ADDR_GEN_MODE_NONE = 1;
+    const int IPV6_ADDR_GEN_MODE_STABLE_PRIVACY = 2;
+    const int IPV6_ADDR_GEN_MODE_RANDOM = 3;
+
+    const int IPV6_ADDR_GEN_MODE_DEFAULT = 0;
+   /**
+    * Set IPv6 address generation mode. IPv6 should be disabled before changing mode.
+    *
+    * @param mode SLAAC address generation mechanism to use
+    */
+    void setIPv6AddrGenMode(in @utf8InCpp String ifName, int mode);
 }

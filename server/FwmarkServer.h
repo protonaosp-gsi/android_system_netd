@@ -21,11 +21,16 @@
 #include "EventReporter.h"
 #include "sysutils/SocketListener.h"
 
+namespace android {
+namespace net {
+
 class NetworkController;
 
 class FwmarkServer : public SocketListener {
 public:
     explicit FwmarkServer(NetworkController* networkController, EventReporter* eventReporter);
+
+    static constexpr const char* SOCKET_NAME = "fwmarkd";
 
 private:
     // Overridden from SocketListener:
@@ -37,5 +42,8 @@ private:
     NetworkController* const mNetworkController;
     EventReporter* mEventReporter;
 };
+
+}  // namespace net
+}  // namespace android
 
 #endif  // NETD_SERVER_FWMARK_SERVER_H

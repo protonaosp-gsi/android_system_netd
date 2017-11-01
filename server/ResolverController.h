@@ -18,17 +18,16 @@
 #define _RESOLVER_CONTROLLER_H_
 
 #include <vector>
-#include <netinet/in.h>
-#include <linux/in.h>
+#include "dns/DnsTlsTransport.h"
 
 struct __res_params;
-class DumpWriter;
+struct sockaddr_storage;
 
 namespace android {
 namespace net {
+
+class DumpWriter;
 struct ResolverStats;
-}  // namespace net
-}  // namespace android
 
 class ResolverController {
 public:
@@ -39,6 +38,16 @@ public:
     // TODO: delete this function
     int setDnsServers(unsigned netId, const char* searchDomains, const char** servers,
             int numservers, const __res_params* params);
+
+    // Validation status of a DNS over TLS server (on a specific netId).
+    enum class Validation : uint8_t { in_process, success, fail, unknown_server, unknown_netid };
+
+    // Given a netId and the address of an insecure (i.e. normal) DNS server, this method checks
+    // if there is a known secure DNS server with the same IP address that has been validated as
+    // accessible on this netId.  It returns the validation status, and provides the secure server
+    // (including port, name, and fingerprints) in the output parameter.
+    Validation getTlsStatus(unsigned netId, const sockaddr_storage& insecureServer,
+            DnsTlsTransport::Server* secureServer);
 
     int clearDnsServers(unsigned netid);
 
@@ -51,12 +60,18 @@ public:
     // Binder specific functions, which convert between the binder int/string arrays and the
     // actual data structures, and call setDnsServer() / getDnsInfo() for the actual processing.
     int setResolverConfiguration(int32_t netId, const std::vector<std::string>& servers,
-            const std::vector<std::string>& domains, const std::vector<int32_t>& params);
+            const std::vector<std::string>& domains, const std::vector<int32_t>& params,
+            bool useTls, const std::string& tlsName,
+            const std::set<std::vector<uint8_t>>& tlsFingerprints);
 
     int getResolverInfo(int32_t netId, std::vector<std::string>* servers,
             std::vector<std::string>* domains, std::vector<int32_t>* params,
             std::vector<int32_t>* stats);
     void dump(DumpWriter& dw, unsigned netId);
+
 };
+
+}  // namespace net
+}  // namespace android
 
 #endif /* _RESOLVER_CONTROLLER_H_ */

@@ -33,7 +33,6 @@
 #include "NetdConstants.h"
 #include "StrictController.h"
 
-auto StrictController::execIptables = ::execIptables;
 auto StrictController::execIptablesRestore = ::execIptablesRestore;
 
 const char* StrictController::LOCAL_OUTPUT = "st_OUTPUT";
@@ -42,6 +41,7 @@ const char* StrictController::LOCAL_CLEAR_CAUGHT = "st_clear_caught";
 const char* StrictController::LOCAL_PENALTY_LOG = "st_penalty_log";
 const char* StrictController::LOCAL_PENALTY_REJECT = "st_penalty_reject";
 
+using android::base::Join;
 using android::base::StringPrintf;
 
 StrictController::StrictController(void) {
@@ -127,10 +127,10 @@ int StrictController::enableStrict(void) {
            LOCAL_CLEAR_DETECT, u32, LOCAL_CLEAR_CAUGHT);
 
     CMD_V4V6("-A %s -p udp -j %s", LOCAL_CLEAR_DETECT, LOCAL_CLEAR_CAUGHT);
-    CMD_V4V6("COMMIT\n\x04");
+    CMD_V4V6("COMMIT\n");
 
-    res |= execIptablesRestore(V4, android::base::Join(v4, '\n'));
-    res |= execIptablesRestore(V6, android::base::Join(v6, '\n'));
+    res |= execIptablesRestore(V4, Join(v4, '\n'));
+    res |= execIptablesRestore(V6, Join(v6, '\n'));
 
 #undef CMD_V4
 #undef CMD_V6
@@ -149,46 +149,50 @@ int StrictController::disableStrict(void) {
         CLEAR_CHAIN(LOCAL_PENALTY_REJECT),
         CLEAR_CHAIN(LOCAL_CLEAR_CAUGHT),
         CLEAR_CHAIN(LOCAL_CLEAR_DETECT),
-        "COMMIT\n\x04"
+        "COMMIT\n"
     };
-    const std::string commands = android::base::Join(commandList, '\n');
+    const std::string commands = Join(commandList, '\n');
     return execIptablesRestore(V4V6, commands);
 #undef CLEAR_CHAIN
 }
 
 int StrictController::setUidCleartextPenalty(uid_t uid, StrictPenalty penalty) {
-    char uidStr[16];
-    sprintf(uidStr, "%d", uid);
+    // When a penalty is set, we don't know what penalty the UID previously had. In order to be able
+    // to clear the previous penalty without causing an iptables error by deleting rules that don't
+    // exist, put each UID's rules in a chain specific to that UID. That way, the commands we need
+    // to run to clear the previous penalty don't depend on what the penalty actually was - all we
+    // need to do is clear the chain.
+    std::string perUidChain = StringPrintf("st_clear_caught_%u", uid);
 
-    int res = 0;
+    std::vector<std::string> commands;
     if (penalty == ACCEPT) {
         // Clean up any old rules
-        execIptables(V4V6, "-D", LOCAL_OUTPUT,
-                "-m", "owner", "--uid-owner", uidStr,
-                "-j", LOCAL_CLEAR_DETECT, NULL);
-        execIptables(V4V6, "-D", LOCAL_CLEAR_CAUGHT,
-                "-m", "owner", "--uid-owner", uidStr,
-                "-j", LOCAL_PENALTY_LOG, NULL);
-        execIptables(V4V6, "-D", LOCAL_CLEAR_CAUGHT,
-                "-m", "owner", "--uid-owner", uidStr,
-                "-j", LOCAL_PENALTY_REJECT, NULL);
-
+        commands = {
+            "*filter",
+            StringPrintf("-D %s -m owner --uid-owner %d -j %s",
+                         LOCAL_OUTPUT, uid, LOCAL_CLEAR_DETECT),
+            StringPrintf("-D %s -m owner --uid-owner %d -j %s",
+                         LOCAL_CLEAR_CAUGHT, uid, perUidChain.c_str()),
+            StringPrintf("-F %s", perUidChain.c_str()),
+            StringPrintf("-X %s", perUidChain.c_str()),
+        };
     } else {
         // Always take a detour to investigate this UID
-        res |= execIptables(V4V6, "-I", LOCAL_OUTPUT,
-                "-m", "owner", "--uid-owner", uidStr,
-                "-j", LOCAL_CLEAR_DETECT, NULL);
+        commands.push_back("*filter");
+        commands.push_back(StringPrintf(":%s -", perUidChain.c_str()));
+        commands.push_back(StringPrintf("-I %s -m owner --uid-owner %d -j %s",
+                                        LOCAL_OUTPUT, uid, LOCAL_CLEAR_DETECT));
+        commands.push_back(StringPrintf("-I %s -m owner --uid-owner %d -j %s",
+                                        LOCAL_CLEAR_CAUGHT, uid, perUidChain.c_str()));
 
         if (penalty == LOG) {
-            res |= execIptables(V4V6, "-I", LOCAL_CLEAR_CAUGHT,
-                    "-m", "owner", "--uid-owner", uidStr,
-                    "-j", LOCAL_PENALTY_LOG, NULL);
+            commands.push_back(StringPrintf("-A %s -j %s", perUidChain.c_str(), LOCAL_PENALTY_LOG));
         } else if (penalty == REJECT) {
-            res |= execIptables(V4V6, "-I", LOCAL_CLEAR_CAUGHT,
-                    "-m", "owner", "--uid-owner", uidStr,
-                    "-j", LOCAL_PENALTY_REJECT, NULL);
+            commands.push_back(StringPrintf("-A %s -j %s", perUidChain.c_str(),
+                                            LOCAL_PENALTY_REJECT));
         }
     }
+    commands.push_back("COMMIT\n");
 
-    return res;
+    return execIptablesRestore(V4V6, Join(commands, "\n"));
 }

@@ -17,6 +17,7 @@
 #ifndef NETD_SERVER_NETWORK_CONTROLLER_H
 #define NETD_SERVER_NETWORK_CONTROLLER_H
 
+#include <android/multinetwork.h>
 #include "NetdConstants.h"
 #include "Permission.h"
 
@@ -27,6 +28,41 @@
 #include <set>
 #include <sys/types.h>
 #include <vector>
+
+struct android_net_context;
+
+namespace android {
+namespace net {
+
+// Utility to convert from netId to net_handle_t. Doing this here as opposed to exporting
+// from net.c as it may have NDK implications. Besides no conversion available in net.c for
+// obtaining handle given netId.
+// TODO: Use getnetidfromhandle() in net.c.
+static inline unsigned netHandleToNetId(net_handle_t fromNetHandle) {
+    const uint32_t k32BitMask = 0xffffffff;
+    // This value MUST be kept in sync with the corresponding value in
+    // the android.net.Network#getNetworkHandle() implementation.
+    const uint32_t kHandleMagic = 0xfacade;
+
+    // Check for minimum acceptable version of the API in the low bits.
+    if (fromNetHandle != NETWORK_UNSPECIFIED &&
+        (fromNetHandle & k32BitMask) != kHandleMagic) {
+        return 0;
+    }
+
+    return ((fromNetHandle >> (CHAR_BIT * sizeof(k32BitMask))) & k32BitMask);
+}
+
+// Utility to convert from nethandle to netid, keep in sync with getNetworkHandle
+// in Network.java.
+static inline net_handle_t netIdToNetHandle(unsigned fromNetId) {
+    const net_handle_t HANDLE_MAGIC = 0xfacade;
+
+    if (!fromNetId) {
+        return NETWORK_UNSPECIFIED;
+    }
+    return (((net_handle_t)fromNetId << 32) | HANDLE_MAGIC);
+}
 
 class DumpWriter;
 class Network;
@@ -62,6 +98,7 @@ public:
     bool isVirtualNetwork(unsigned netId) const;
 
     int createPhysicalNetwork(unsigned netId, Permission permission) WARN_UNUSED_RESULT;
+    int createPhysicalOemNetwork(Permission permission, unsigned *netId) WARN_UNUSED_RESULT;
     int createVirtualNetwork(unsigned netId, bool hasDns, bool secure) WARN_UNUSED_RESULT;
     int destroyNetwork(unsigned netId) WARN_UNUSED_RESULT;
 
@@ -95,10 +132,12 @@ public:
 
 private:
     bool isValidNetwork(unsigned netId) const;
+    bool isValidNetworkLocked(unsigned netId) const;
     Network* getNetworkLocked(unsigned netId) const;
     VirtualNetwork* getVirtualNetworkForUserLocked(uid_t uid) const;
     Permission getPermissionForUserLocked(uid_t uid) const;
     int checkUserNetworkAccessLocked(uid_t uid, unsigned netId) const;
+    int createPhysicalNetworkLocked(unsigned netId, Permission permission) WARN_UNUSED_RESULT;
 
     int modifyRoute(unsigned netId, const char* interface, const char* destination,
                     const char* nexthop, bool add, bool legacy, uid_t uid) WARN_UNUSED_RESULT;
@@ -113,7 +152,9 @@ private:
     std::map<unsigned, Network*> mNetworks;  // Map keys are NetIds.
     std::map<uid_t, Permission> mUsers;
     std::set<uid_t> mProtectableUsers;
-
 };
+
+}  // namespace net
+}  // namespace android
 
 #endif  // NETD_SERVER_NETWORK_CONTROLLER_H

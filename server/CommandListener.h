@@ -24,7 +24,6 @@
 #include "NetdConstants.h"
 #include "NetworkController.h"
 #include "TetherController.h"
-#include "NatController.h"
 #include "PppController.h"
 #include "BandwidthController.h"
 #include "IdletimerController.h"
@@ -34,10 +33,15 @@
 #include "ClatdController.h"
 #include "StrictController.h"
 
+namespace android {
+namespace net {
+
 class CommandListener : public FrameworkListener {
 public:
     CommandListener();
     virtual ~CommandListener() {}
+
+    static constexpr const char* SOCKET_NAME = "netd";
 
 private:
     void registerLockingCmd(FrameworkCommand *cmd, android::RWLock& lock);
@@ -155,5 +159,8 @@ private:
         int success(SocketClient* cli);
     };
 };
+
+}  // namespace net
+}  // namespace android
 
 #endif

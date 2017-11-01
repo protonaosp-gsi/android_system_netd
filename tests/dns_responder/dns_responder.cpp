@@ -31,6 +31,7 @@
 #include <iostream>
 #include <vector>
 
+#define LOG_TAG "DNSResponder"
 #include <log/log.h>
 
 namespace test {
@@ -587,6 +588,7 @@ bool DNSResponder::startServer() {
         if (s < 0) continue;
         const int one = 1;
         setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         if (bind(s, ai->ai_addr, ai->ai_addrlen)) {
             APLOGI("bind failed for socket %d", s);
             close(s);

@@ -43,13 +43,25 @@ class NetdNativeService : public BinderService<NetdNativeService>, public BnNetd
     binder::Status socketDestroy(const std::vector<UidRange>& uids,
             const std::vector<int32_t>& skipUids) override;
     binder::Status setResolverConfiguration(int32_t netId, const std::vector<std::string>& servers,
-            const std::vector<std::string>& domains, const std::vector<int32_t>& params) override;
+            const std::vector<std::string>& domains, const std::vector<int32_t>& params,
+            bool useTls, const std::string& tlsName,
+            const std::vector<std::string>& tlsFingerprints) override;
     binder::Status getResolverInfo(int32_t netId, std::vector<std::string>* servers,
             std::vector<std::string>* domains, std::vector<int32_t>* params,
             std::vector<int32_t>* stats) override;
 
+    binder::Status setIPv6AddrGenMode(const std::string& ifName, int32_t mode) override;
+
+    // NFLOG-related commands
+    binder::Status wakeupAddInterface(const std::string& ifName, const std::string& prefix,
+                                      int32_t mark, int32_t mask) override;
+
+    binder::Status wakeupDelInterface(const std::string& ifName, const std::string& prefix,
+                                      int32_t mark, int32_t mask) override;
+
     // Tethering-related commands.
     binder::Status tetherApplyDnsInterfaces(bool *ret) override;
+    binder::Status tetherGetStats(android::os::PersistableBundle *ret) override;
 
     binder::Status interfaceAddAddress(const std::string &ifName,
             const std::string &addrString, int prefixLength) override;
@@ -63,6 +75,53 @@ class NetdNativeService : public BinderService<NetdNativeService>, public BnNetd
     // Metrics reporting level set / get (internal use only).
     binder::Status getMetricsReportingLevel(int *reportingLevel) override;
     binder::Status setMetricsReportingLevel(const int reportingLevel) override;
+
+    binder::Status ipSecAllocateSpi(
+            int32_t transformId,
+            int32_t direction,
+            const std::string& localAddress,
+            const std::string& remoteAddress,
+            int32_t inSpi,
+            int32_t* outSpi);
+
+    binder::Status ipSecAddSecurityAssociation(
+            int32_t transformId,
+            int32_t mode,
+            int32_t direction,
+            const std::string& localAddress,
+            const std::string& remoteAddress,
+            int64_t underlyingNetworkHandle,
+            int32_t spi,
+            const std::string& authAlgo,
+            const std::vector<uint8_t>& authKey,
+            int32_t authTruncBits,
+            const std::string& cryptAlgo,
+            const std::vector<uint8_t>& cryptKey,
+            int32_t cryptTruncBits,
+            const std::string& aeadAlgo,
+            const std::vector<uint8_t>& aeadKey,
+            int32_t aeadIcvBits,
+            int32_t encapType,
+            int32_t encapLocalPort,
+            int32_t encapRemotePort);
+
+    binder::Status ipSecDeleteSecurityAssociation(
+            int32_t transformId,
+            int32_t direction,
+            const std::string& localAddress,
+            const std::string& remoteAddress,
+            int32_t spi);
+
+    binder::Status ipSecApplyTransportModeTransform(
+            const android::base::unique_fd& socket,
+            int32_t transformId,
+            int32_t direction,
+            const std::string& localAddress,
+            const std::string& remoteAddress,
+            int32_t spi);
+
+    binder::Status ipSecRemoveTransportModeTransform(
+            const android::base::unique_fd& socket);
 };
 
 }  // namespace net

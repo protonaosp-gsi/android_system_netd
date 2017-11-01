@@ -28,18 +28,36 @@ public:
 
     static int fake_android_fork_exec(int argc, char* argv[], int *status, bool, bool);
     static int fake_android_fork_execvp(int argc, char* argv[], int *status, bool, bool);
-    static int fakeExecIptables(IptablesTarget target, ...);
     static int fakeExecIptablesRestore(IptablesTarget target, const std::string& commands);
+    static int fakeExecIptablesRestoreWithOutput(IptablesTarget target, const std::string& commands,
+                                                 std::string *output);
+    static int fakeExecIptablesRestoreCommand(IptablesTarget target, const std::string& table,
+                                              const std::string& commands, std::string *output);
     static FILE *fake_popen(const char *cmd, const char *type);
-    void expectIptablesCommands(const std::vector<std::string>& expectedCmds);
-    void expectIptablesCommands(const ExpectedIptablesCommands& expectedCmds);
-    void expectIptablesCommands(const std::vector<ExpectedIptablesCommands>& snippets);
     void expectIptablesRestoreCommands(const std::vector<std::string>& expectedCmds);
     void expectIptablesRestoreCommands(const ExpectedIptablesCommands& expectedCmds);
+
+    static void setReturnValues(const std::deque<int>& returnValues) {
+        sReturnValues = returnValues;
+    }
+
+    static void addIptablesRestoreOutput(std::string contents) {
+        sIptablesRestoreOutput.push_back(contents);
+    }
+
+    static void addIptablesRestoreOutput(std::string contents1, std::string contents2) {
+        addIptablesRestoreOutput(contents1);
+        addIptablesRestoreOutput(contents2);
+    }
+
+    static void clearIptablesRestoreOutput() {
+        sIptablesRestoreOutput.clear();
+    }
 
 protected:
     static std::vector<std::string> sCmds;
     static ExpectedIptablesCommands sRestoreCmds;
+    static std::deque<int> sReturnValues;
     static std::deque<std::string> sPopenContents;
-    int expectIptablesCommand(IptablesTarget target, int pos, const std::string& cmd);
+    static std::deque<std::string> sIptablesRestoreOutput;
 };
