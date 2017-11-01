@@ -25,12 +25,17 @@
 #include "EventReporter.h"
 #include "NetdCommand.h"
 
+namespace android {
+namespace net {
+
 class NetworkController;
 
 class DnsProxyListener : public FrameworkListener {
 public:
     explicit DnsProxyListener(const NetworkController* netCtrl, EventReporter* eventReporter);
     virtual ~DnsProxyListener() {}
+
+    static constexpr const char* SOCKET_NAME = "dnsproxyd";
 
 private:
     const NetworkController *mNetCtrl;
@@ -59,11 +64,9 @@ private:
                            const android::sp<android::net::metrics::INetdEventListener>& listener);
         ~GetAddrInfoHandler();
 
-        static void* threadStart(void* handler);
-        void start();
+        void run();
 
     private:
-        void run();
         SocketClient* mClient;  // ref counted
         char* mHost;    // owned
         char* mService; // owned
@@ -88,20 +91,18 @@ private:
         GetHostByNameHandler(SocketClient *c,
                             char *name,
                             int af,
-                            unsigned netId,
-                            uint32_t mark,
+                            const android_net_context& netcontext,
                             int reportingLevel,
                             const android::sp<android::net::metrics::INetdEventListener>& listener);
         ~GetHostByNameHandler();
-        static void* threadStart(void* handler);
-        void start();
-    private:
+
         void run();
+
+    private:
         SocketClient* mClient; //ref counted
         char* mName; // owned
         int mAf;
-        unsigned mNetId;
-        uint32_t mMark;
+        android_net_context mNetContext;
         const int mReportingLevel;
         android::sp<android::net::metrics::INetdEventListener> mNetdEventListener;
     };
@@ -122,22 +123,21 @@ private:
                             void* address,
                             int addressLen,
                             int addressFamily,
-                            unsigned netId,
-                            uint32_t mark);
+                            const android_net_context& netcontext);
         ~GetHostByAddrHandler();
 
-        static void* threadStart(void* handler);
-        void start();
+        void run();
 
     private:
-        void run();
         SocketClient* mClient;  // ref counted
         void* mAddress;    // address to lookup; owned
         int mAddressLen; // length of address to look up
         int mAddressFamily;  // address family
-        unsigned mNetId;
-        uint32_t mMark;
+        android_net_context mNetContext;
     };
 };
+
+}  // namespace net
+}  // namespace android
 
 #endif

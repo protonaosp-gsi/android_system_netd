@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-#include <stdio.h>
 #include <errno.h>
+#include <stdio.h>
+#include <string.h>
 
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -30,11 +31,6 @@
 
 #include <cutils/log.h>
 
-#include <netlink/attr.h>
-#include <netlink/genl/genl.h>
-#include <netlink/handlers.h>
-#include <netlink/msg.h>
-
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nfnetlink_log.h>
 #include <linux/netfilter/nfnetlink_compat.h>
@@ -46,8 +42,12 @@
 
 #include "pcap-netfilter-linux-android.h"
 
+namespace android {
+namespace net {
+
 const int NetlinkManager::NFLOG_QUOTA_GROUP = 1;
 const int NetlinkManager::NETFILTER_STRICT_GROUP = 2;
+const int NetlinkManager::NFLOG_WAKEUP_GROUP = 3;
 
 NetlinkManager *NetlinkManager::sInstance = NULL;
 
@@ -73,7 +73,8 @@ NetlinkHandler *NetlinkManager::setupSocket(int *sock, int netlinkFamily,
 
     memset(&nladdr, 0, sizeof(nladdr));
     nladdr.nl_family = AF_NETLINK;
-    nladdr.nl_pid = getpid();
+    // Kernel will assign a unique nl_pid if set to zero.
+    nladdr.nl_pid = 0;
     nladdr.nl_groups = groups;
 
     if ((*sock = socket(PF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, netlinkFamily)) < 0) {
@@ -81,8 +82,12 @@ NetlinkHandler *NetlinkManager::setupSocket(int *sock, int netlinkFamily,
         return NULL;
     }
 
-    if (setsockopt(*sock, SOL_SOCKET, SO_RCVBUFFORCE, &sz, sizeof(sz)) < 0) {
-        ALOGE("Unable to set uevent socket SO_RCVBUFFORCE option: %s", strerror(errno));
+    // When running in a net/user namespace, SO_RCVBUFFORCE will fail because
+    // it will check for the CAP_NET_ADMIN capability in the root namespace.
+    // Try using SO_RCVBUF if that fails.
+    if (setsockopt(*sock, SOL_SOCKET, SO_RCVBUFFORCE, &sz, sizeof(sz)) < 0 &&
+        setsockopt(*sock, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz)) < 0) {
+        ALOGE("Unable to set uevent socket SO_RCVBUF option: %s", strerror(errno));
         close(*sock);
         return NULL;
     }
@@ -208,3 +213,6 @@ int NetlinkManager::stop() {
 
     return status;
 }
+
+}  // namespace net
+}  // namespace android

@@ -1,8 +1,6 @@
 #ifndef DNS_RESPONDER_CLIENT_H
 #define DNS_RESPONDER_CLIENT_H
 
-#include "SockDiag.h"
-
 #include <cutils/sockets.h>
 
 #include <private/android_filesystem_config.h>
@@ -31,8 +29,15 @@ public:
     bool SetResolversForNetwork(const std::vector<std::string>& servers,
             const std::vector<std::string>& domains, const std::vector<int>& params);
 
-    bool SetResolversForNetwork(const std::vector<std::string>& searchDomains,
-            const std::vector<std::string>& servers, const std::string& params);
+    bool SetResolversForNetwork(const std::vector<std::string>& servers,
+            const std::vector<std::string>& searchDomains,
+            const std::string& params);
+
+    bool SetResolversWithTls(const std::vector<std::string>& servers,
+            const std::vector<std::string>& searchDomains,
+            const std::vector<int>& params,
+            const std::string& name,
+            const std::vector<std::string>& fingerprints);
 
     static void SetupDNSServers(unsigned num_servers, const std::vector<Mapping>& mappings,
             std::vector<std::unique_ptr<test::DNSResponder>>* dns,

@@ -19,28 +19,30 @@
 
 #include <sysutils/FrameworkListener.h>
 
-#include "NetworkController.h"
-#include "TetherController.h"
-#include "NatController.h"
-#include "PppController.h"
 #include "BandwidthController.h"
+#include "ClatdController.h"
+#include "EventReporter.h"
+#include "FirewallController.h"
 #include "IdletimerController.h"
 #include "InterfaceController.h"
+#include "IptablesRestoreController.h"
+#include "NetworkController.h"
+#include "PppController.h"
 #include "ResolverController.h"
-#include "FirewallController.h"
-#include "ClatdController.h"
 #include "StrictController.h"
-#include "EventReporter.h"
+#include "TetherController.h"
+#include "WakeupController.h"
+#include "XfrmController.h"
 
 namespace android {
 namespace net {
 
-struct Controllers {
+class Controllers {
+public:
     Controllers();
 
     NetworkController netCtrl;
     TetherController tetherCtrl;
-    NatController natCtrl;
     PppController pppCtrl;
     BandwidthController bandwidthCtrl;
     IdletimerController idletimerCtrl;
@@ -49,6 +51,23 @@ struct Controllers {
     ClatdController clatdCtrl;
     StrictController strictCtrl;
     EventReporter eventReporter;
+    IptablesRestoreController iptablesRestoreCtrl;
+    WakeupController wakeupCtrl;
+    XfrmController xfrmCtrl;
+
+    void init();
+
+private:
+    friend class ControllersTest;
+    void initIptablesRules();
+    static void initChildChains();
+    static std::set<std::string> findExistingChildChains(const IptablesTarget target,
+                                                         const char* table,
+                                                         const char* parentChain);
+    static void createChildChains(IptablesTarget target, const char* table, const char* parentChain,
+                                  const std::vector<const char*>& childChains, bool exclusive);
+    static int (*execIptablesRestore)(IptablesTarget, const std::string&);
+    static int (*execIptablesRestoreWithOutput)(IptablesTarget, const std::string&, std::string *);
 };
 
 extern Controllers* gCtls;

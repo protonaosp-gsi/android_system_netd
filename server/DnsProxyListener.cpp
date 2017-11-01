@@ -40,19 +40,116 @@
 #include <utils/String16.h>
 #include <sysutils/SocketClient.h>
 
+#include "Controllers.h"
 #include "Fwmark.h"
 #include "DnsProxyListener.h"
+#include "dns/DnsTlsTransport.h"
 #include "NetdConstants.h"
 #include "NetworkController.h"
 #include "ResponseCode.h"
 #include "Stopwatch.h"
+#include "thread_util.h"
 #include "android/net/metrics/INetdEventListener.h"
 
 using android::String16;
 using android::net::metrics::INetdEventListener;
 
+namespace android {
+namespace net {
+
+namespace {
+
+template<typename T>
+void tryThreadOrError(SocketClient* cli, T* handler) {
+    cli->incRef();
+
+    const int rval = threadLaunch(handler);
+    if (rval == 0) {
+        // SocketClient decRef() happens in the handler's run() method.
+        return;
+    }
+
+    char* msg = NULL;
+    asprintf(&msg, "%s (%d)", strerror(-rval), -rval);
+    cli->sendMsg(ResponseCode::OperationFailed, msg, false);
+    free(msg);
+
+    delete handler;
+    cli->decRef();
+}
+
+thread_local android_net_context thread_netcontext = {};
+
+res_sendhookact qhook(sockaddr* const * nsap, const u_char** buf, int* buflen,
+                      u_char* ans, int anssiz, int* resplen) {
+    if (!thread_netcontext.qhook) {
+        ALOGE("qhook abort: thread qhook is null");
+        return res_goahead;
+    }
+    if (!net::gCtls) {
+        ALOGE("qhook abort: gCtls is null");
+        return res_goahead;
+    }
+    // Safely read the data from nsap without violating strict-aliasing.
+    sockaddr_storage insecureResolver;
+    if ((*nsap)->sa_family == AF_INET) {
+        std::memcpy(&insecureResolver, *nsap, sizeof(sockaddr_in));
+    } else if ((*nsap)->sa_family == AF_INET6) {
+        std::memcpy(&insecureResolver, *nsap, sizeof(sockaddr_in6));
+    } else {
+        ALOGE("qhook abort: unknown address family");
+        return res_goahead;
+    }
+    DnsTlsTransport::Server tlsServer;
+    auto tlsStatus = net::gCtls->resolverCtrl.getTlsStatus(thread_netcontext.dns_netid,
+            insecureResolver, &tlsServer);
+    if (tlsStatus == ResolverController::Validation::unknown_netid) {
+        if (DBG) {
+            ALOGD("No TLS for netid %u", thread_netcontext.dns_netid);
+        }
+        return res_goahead;
+    } else if (tlsStatus == ResolverController::Validation::unknown_server) {
+        if (DBG) {
+            ALOGW("Skipping unexpected server in TLS mode");
+        }
+        return res_nextns;
+    } else {
+        if (tlsStatus != ResolverController::Validation::success) {
+            if (DBG) {
+                ALOGD("Server is not ready");
+            }
+            // TLS validation has not completed.  In opportunistic mode, fall back to UDP.
+            // In strict mode, try a different server.
+            bool opportunistic = tlsServer.name.empty() && tlsServer.fingerprints.empty();
+            return opportunistic ? res_goahead : res_nextns;
+        }
+        if (DBG) {
+            ALOGD("Performing query over TLS");
+        }
+        auto response = DnsTlsTransport::query(tlsServer, thread_netcontext.dns_mark,
+                *buf, *buflen, ans, anssiz, resplen);
+        if (response == DnsTlsTransport::Response::success) {
+            if (DBG) {
+                ALOGD("qhook success");
+            }
+            return res_done;
+        }
+        if (DBG) {
+            ALOGW("qhook abort: doQuery failed: %d", (int)response);
+        }
+        // If there was a network error on a validated server, try a different name server.
+        if (response == DnsTlsTransport::Response::network_error) {
+            return res_nextns;
+        }
+        // There was an internal error.  Fail hard.
+        return res_error;
+    }
+}
+
+}  // namespace
+
 DnsProxyListener::DnsProxyListener(const NetworkController* netCtrl, EventReporter* eventReporter) :
-        FrameworkListener("dnsproxyd"), mNetCtrl(netCtrl), mEventReporter(eventReporter) {
+        FrameworkListener(SOCKET_NAME), mNetCtrl(netCtrl), mEventReporter(eventReporter) {
     registerCmd(new GetAddrInfoCmd(this));
     registerCmd(new GetHostByAddrCmd(this));
     registerCmd(new GetHostByNameCmd(this));
@@ -60,7 +157,7 @@ DnsProxyListener::DnsProxyListener(const NetworkController* netCtrl, EventReport
 
 DnsProxyListener::GetAddrInfoHandler::GetAddrInfoHandler(
         SocketClient *c, char* host, char* service, struct addrinfo* hints,
-        const struct android_net_context& netcontext, const int reportingLevel,
+        const android_net_context& netcontext, const int reportingLevel,
         const android::sp<android::net::metrics::INetdEventListener>& netdEventListener)
         : mClient(c),
           mHost(host),
@@ -75,21 +172,6 @@ DnsProxyListener::GetAddrInfoHandler::~GetAddrInfoHandler() {
     free(mHost);
     free(mService);
     free(mHints);
-}
-
-void DnsProxyListener::GetAddrInfoHandler::start() {
-    pthread_t thread;
-    pthread_create(&thread, NULL,
-                   DnsProxyListener::GetAddrInfoHandler::threadStart, this);
-    pthread_detach(thread);
-}
-
-void* DnsProxyListener::GetAddrInfoHandler::threadStart(void* obj) {
-    GetAddrInfoHandler* handler = reinterpret_cast<GetAddrInfoHandler*>(obj);
-    handler->run();
-    delete handler;
-    pthread_exit(NULL);
-    return NULL;
 }
 
 static bool sendBE32(SocketClient* c, uint32_t data) {
@@ -177,6 +259,7 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
 
     struct addrinfo* result = NULL;
     Stopwatch s;
+    thread_netcontext = mNetContext;
     uint32_t rv = android_getaddrinfofornetcontext(mHost, mService, mHints, &mNetContext, &result);
     const int latencyMs = lround(s.timeTaken());
 
@@ -291,8 +374,9 @@ int DnsProxyListener::GetAddrInfoCmd::runCommand(SocketClient *cli,
     unsigned netId = strtoul(argv[7], NULL, 10);
     uid_t uid = cli->getUid();
 
-    struct android_net_context netcontext;
+    android_net_context netcontext;
     mDnsProxyListener->mNetCtrl->getNetworkContext(netId, uid, &netcontext);
+    netcontext.qhook = &qhook;
 
     if (ai_flags != -1 || ai_family != -1 ||
         ai_socktype != -1 || ai_protocol != -1) {
@@ -314,12 +398,10 @@ int DnsProxyListener::GetAddrInfoCmd::runCommand(SocketClient *cli,
 
     const int metricsLevel = mDnsProxyListener->mEventReporter->getMetricsReportingLevel();
 
-    cli->incRef();
     DnsProxyListener::GetAddrInfoHandler* handler =
             new DnsProxyListener::GetAddrInfoHandler(cli, name, service, hints, netcontext,
                     metricsLevel, mDnsProxyListener->mEventReporter->getNetdEventListener());
-    handler->start();
-
+    tryThreadOrError(cli, handler);
     return 0;
 }
 
@@ -358,26 +440,26 @@ int DnsProxyListener::GetHostByNameCmd::runCommand(SocketClient *cli,
         name = strdup(name);
     }
 
-    uint32_t mark = mDnsProxyListener->mNetCtrl->getNetworkForDns(&netId, uid);
+    android_net_context netcontext;
+    mDnsProxyListener->mNetCtrl->getNetworkContext(netId, uid, &netcontext);
+    netcontext.qhook = &qhook;
+
     const int metricsLevel = mDnsProxyListener->mEventReporter->getMetricsReportingLevel();
 
-    cli->incRef();
     DnsProxyListener::GetHostByNameHandler* handler =
-            new DnsProxyListener::GetHostByNameHandler(cli, name, af, netId, mark, metricsLevel,
+            new DnsProxyListener::GetHostByNameHandler(cli, name, af, netcontext, metricsLevel,
                     mDnsProxyListener->mEventReporter->getNetdEventListener());
-    handler->start();
-
+    tryThreadOrError(cli, handler);
     return 0;
 }
 
-DnsProxyListener::GetHostByNameHandler::GetHostByNameHandler(
-        SocketClient* c, char* name, int af, unsigned netId, uint32_t mark, const int metricsLevel,
+DnsProxyListener::GetHostByNameHandler::GetHostByNameHandler(SocketClient* c, char* name, int af,
+        const android_net_context& netcontext, const int metricsLevel,
         const android::sp<android::net::metrics::INetdEventListener>& netdEventListener)
         : mClient(c),
           mName(name),
           mAf(af),
-          mNetId(netId),
-          mMark(mark),
+          mNetContext(netcontext),
           mReportingLevel(metricsLevel),
           mNetdEventListener(netdEventListener) {
 }
@@ -386,28 +468,14 @@ DnsProxyListener::GetHostByNameHandler::~GetHostByNameHandler() {
     free(mName);
 }
 
-void DnsProxyListener::GetHostByNameHandler::start() {
-    pthread_t thread;
-    pthread_create(&thread, NULL,
-            DnsProxyListener::GetHostByNameHandler::threadStart, this);
-    pthread_detach(thread);
-}
-
-void* DnsProxyListener::GetHostByNameHandler::threadStart(void* obj) {
-    GetHostByNameHandler* handler = reinterpret_cast<GetHostByNameHandler*>(obj);
-    handler->run();
-    delete handler;
-    pthread_exit(NULL);
-    return NULL;
-}
-
 void DnsProxyListener::GetHostByNameHandler::run() {
     if (DBG) {
         ALOGD("DnsProxyListener::GetHostByNameHandler::run\n");
     }
 
     Stopwatch s;
-    struct hostent* hp = android_gethostbynamefornet(mName, mAf, mNetId, mMark);
+    thread_netcontext = mNetContext;
+    struct hostent* hp = android_gethostbynamefornetcontext(mName, mAf, &mNetContext);
     const int latencyMs = lround(s.timeTaken());
 
     if (DBG) {
@@ -455,12 +523,14 @@ void DnsProxyListener::GetHostByNameHandler::run() {
                 break;
             case INetdEventListener::REPORTING_LEVEL_METRICS:
                 // Metrics reporting is on. Send metrics.
-                mNetdEventListener->onDnsEvent(mNetId, INetdEventListener::EVENT_GETHOSTBYNAME,
+                mNetdEventListener->onDnsEvent(mNetContext.dns_netid,
+                                               INetdEventListener::EVENT_GETHOSTBYNAME,
                                                h_errno, latencyMs, String16(""), {}, -1, -1);
                 break;
             case INetdEventListener::REPORTING_LEVEL_FULL:
                 // Full event info reporting is on. Send full info.
-                mNetdEventListener->onDnsEvent(mNetId, INetdEventListener::EVENT_GETHOSTBYNAME,
+                mNetdEventListener->onDnsEvent(mNetContext.dns_netid,
+                                               INetdEventListener::EVENT_GETHOSTBYNAME,
                                                h_errno, latencyMs, String16(mName), ip_addrs,
                                                total_ip_addr_count, mClient->getUid());
                 break;
@@ -514,47 +584,31 @@ int DnsProxyListener::GetHostByAddrCmd::runCommand(SocketClient *cli,
         return -1;
     }
 
-    uint32_t mark = mDnsProxyListener->mNetCtrl->getNetworkForDns(&netId, uid);
+    android_net_context netcontext;
+    mDnsProxyListener->mNetCtrl->getNetworkContext(netId, uid, &netcontext);
+    netcontext.qhook = &qhook;
 
-    cli->incRef();
     DnsProxyListener::GetHostByAddrHandler* handler =
-            new DnsProxyListener::GetHostByAddrHandler(cli, addr, addrLen, addrFamily, netId, mark);
-    handler->start();
-
+            new DnsProxyListener::GetHostByAddrHandler(cli, addr, addrLen, addrFamily, netcontext);
+    tryThreadOrError(cli, handler);
     return 0;
 }
 
-DnsProxyListener::GetHostByAddrHandler::GetHostByAddrHandler(SocketClient* c,
-                                                             void* address,
-                                                             int   addressLen,
-                                                             int   addressFamily,
-                                                             unsigned netId,
-                                                             uint32_t mark)
+DnsProxyListener::GetHostByAddrHandler::GetHostByAddrHandler(
+          SocketClient* c,
+          void* address,
+          int addressLen,
+          int addressFamily,
+          const android_net_context& netcontext)
         : mClient(c),
           mAddress(address),
           mAddressLen(addressLen),
           mAddressFamily(addressFamily),
-          mNetId(netId),
-          mMark(mark) {
+          mNetContext(netcontext) {
 }
 
 DnsProxyListener::GetHostByAddrHandler::~GetHostByAddrHandler() {
     free(mAddress);
-}
-
-void DnsProxyListener::GetHostByAddrHandler::start() {
-    pthread_t thread;
-    pthread_create(&thread, NULL,
-                   DnsProxyListener::GetHostByAddrHandler::threadStart, this);
-    pthread_detach(thread);
-}
-
-void* DnsProxyListener::GetHostByAddrHandler::threadStart(void* obj) {
-    GetHostByAddrHandler* handler = reinterpret_cast<GetHostByAddrHandler*>(obj);
-    handler->run();
-    delete handler;
-    pthread_exit(NULL);
-    return NULL;
 }
 
 void DnsProxyListener::GetHostByAddrHandler::run() {
@@ -564,7 +618,9 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
     struct hostent* hp;
 
     // NOTE gethostbyaddr should take a void* but bionic thinks it should be char*
-    hp = android_gethostbyaddrfornet((char*)mAddress, mAddressLen, mAddressFamily, mNetId, mMark);
+    thread_netcontext = mNetContext;
+    hp = android_gethostbyaddrfornetcontext(
+            (char*)mAddress, mAddressLen, mAddressFamily, &mNetContext);
 
     if (DBG) {
         ALOGD("GetHostByAddrHandler::run gethostbyaddr errno: %s hp->h_name = %s, name_len = %zu\n",
@@ -586,3 +642,6 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
     }
     mClient->decRef();
 }
+
+}  // namespace net
+}  // namespace android

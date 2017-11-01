@@ -18,14 +18,16 @@ LOCAL_PATH := $(call my-dir)
 # APCT build target
 include $(CLEAR_VARS)
 LOCAL_MODULE := netd_integration_test
+LOCAL_COMPATIBILITY_SUITE := device-tests
 LOCAL_CFLAGS := -Wall -Werror -Wunused-parameter
 # Bug: http://b/29823425 Disable -Wvarargs for Clang update to r271374
 LOCAL_CFLAGS += -Wno-varargs
 
 EXTRA_LDLIBS := -lpthread
-LOCAL_SHARED_LIBRARIES += libbase libbinder libcutils liblog liblogwrap libnetdaidl libnetd_client \
-                          libnetutils libutils
-LOCAL_STATIC_LIBRARIES += libnetd_test_dnsresponder
+LOCAL_SHARED_LIBRARIES += libbase libbinder libcrypto libcutils liblog \
+                          libnetd_client libnetutils libssl libutils
+LOCAL_STATIC_LIBRARIES += libnetd_test_dnsresponder liblogwrap libnetdaidl_static \
+                          libnetdutils
 LOCAL_AIDL_INCLUDES := system/netd/server/binder
 LOCAL_C_INCLUDES += system/netd/include system/netd/binder/include \
                     system/netd/server system/core/logwrapper/include \
@@ -38,6 +40,7 @@ LOCAL_SRC_FILES := binder_test.cpp \
                    dns_responder/dns_responder.cpp \
                    netd_integration_test.cpp \
                    netd_test.cpp \
+                   tun_interface.cpp \
                    ../server/NetdConstants.cpp \
                    ../server/binder/android/net/metrics/INetdEventListener.aidl
 LOCAL_MODULE_TAGS := eng tests

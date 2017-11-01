@@ -23,10 +23,12 @@ LOCAL_CFLAGS := -Wall -Werror -Wunused-parameter
 LOCAL_CFLAGS += -Wno-varargs
 
 EXTRA_LDLIBS := -lpthread
-LOCAL_SHARED_LIBRARIES += libbase libbinder liblog libnetd_client
+LOCAL_SHARED_LIBRARIES += libbase libbinder libcrypto liblog libnetd_client libssl
 LOCAL_STATIC_LIBRARIES += libutils
 
-LOCAL_AIDL_INCLUDES += system/netd/server/binder
+LOCAL_AIDL_INCLUDES += \
+    frameworks/native/aidl/binder \
+    system/netd/server/binder
 
 LOCAL_C_INCLUDES += system/netd/include \
                     system/netd/server \
@@ -36,6 +38,7 @@ LOCAL_C_INCLUDES += system/netd/include \
 
 LOCAL_SRC_FILES := dns_responder.cpp \
                    dns_responder_client.cpp \
+                   dns_tls_frontend.cpp \
                    ../../server/binder/android/net/INetd.aidl \
                    ../../server/binder/android/net/UidRange.cpp
 

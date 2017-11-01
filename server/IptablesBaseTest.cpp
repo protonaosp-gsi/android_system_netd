@@ -30,46 +30,35 @@
 #define LOG_TAG "IptablesBaseTest"
 #include <cutils/log.h>
 
+using android::base::StringPrintf;
+
 IptablesBaseTest::IptablesBaseTest() {
     sCmds.clear();
     sRestoreCmds.clear();
+    sReturnValues.clear();
 }
 
 int IptablesBaseTest::fake_android_fork_exec(int argc, char* argv[], int *status, bool, bool) {
     std::string cmd = argv[0];
     for (int i = 1; i < argc; i++) {
-        if (argv[i] == NULL) break;  // NatController likes to pass in invalid argc values.
+        if (argv[i] == NULL) break;
         cmd += " ";
         cmd += argv[i];
     }
     sCmds.push_back(cmd);
+
+    int ret;
+    if (sReturnValues.size()) {
+        ret = sReturnValues.front();
+        sReturnValues.pop_front();
+    } else {
+        ret = 0;
+    }
+
     if (status) {
-        *status = 0;
+        *status = ret;
     }
-    return 0;
-}
-
-int IptablesBaseTest::fakeExecIptables(IptablesTarget target, ...) {
-    std::string cmd = " -w";
-    va_list args;
-    va_start(args, target);
-    const char *arg;
-    do {
-        arg = va_arg(args, const char *);
-        if (arg != nullptr) {
-            cmd += " ";
-            cmd += arg;
-        }
-    } while (arg);
-
-    if (target == V4 || target == V4V6) {
-        sCmds.push_back(IPTABLES_PATH + cmd);
-    }
-    if (target == V6 || target == V4V6) {
-        sCmds.push_back(IP6TABLES_PATH + cmd);
-    }
-
-    return 0;
+    return ret;
 }
 
 FILE *IptablesBaseTest::fake_popen(const char * /* cmd */, const char *type) {
@@ -77,72 +66,39 @@ FILE *IptablesBaseTest::fake_popen(const char * /* cmd */, const char *type) {
         return NULL;
     }
 
-    std::string realCmd = android::base::StringPrintf("echo '%s'", sPopenContents.front().c_str());
+    std::string realCmd = StringPrintf("echo '%s'", sPopenContents.front().c_str());
     sPopenContents.pop_front();
     return popen(realCmd.c_str(), "r");
 }
 
-int IptablesBaseTest::fakeExecIptablesRestore(IptablesTarget target, const std::string& commands) {
+int IptablesBaseTest::fakeExecIptablesRestoreWithOutput(IptablesTarget target,
+                                                        const std::string& commands,
+                                                        std::string *output) {
     sRestoreCmds.push_back({ target, commands });
+    if (output != nullptr) {
+        *output = sIptablesRestoreOutput.size() ? sIptablesRestoreOutput.front().c_str() : "";
+    }
+    if (sIptablesRestoreOutput.size()) {
+        sIptablesRestoreOutput.pop_front();
+    }
     return 0;
 }
 
-int IptablesBaseTest::expectIptablesCommand(IptablesTarget target, int pos,
-                                            const std::string& cmd) {
-
-    if ((unsigned) pos >= sCmds.size()) {
-        ADD_FAILURE() << "Expected too many iptables commands, want command "
-               << pos + 1 << "/" << sCmds.size();
-        return -1;
-    }
-
-    if (target == V4 || target == V4V6) {
-        EXPECT_EQ("/system/bin/iptables -w " + cmd, sCmds[pos++]);
-    }
-    if (target == V6 || target == V4V6) {
-        EXPECT_EQ("/system/bin/ip6tables -w " + cmd, sCmds[pos++]);
-    }
-
-    return target == V4V6 ? 2 : 1;
+int IptablesBaseTest::fakeExecIptablesRestore(IptablesTarget target, const std::string& commands) {
+    return fakeExecIptablesRestoreWithOutput(target, commands, nullptr);
 }
 
-void IptablesBaseTest::expectIptablesCommands(const std::vector<std::string>& expectedCmds) {
-    ExpectedIptablesCommands expected;
-    for (auto cmd : expectedCmds) {
-        expected.push_back({ V4V6, cmd });
-    }
-    expectIptablesCommands(expected);
-}
-
-void IptablesBaseTest::expectIptablesCommands(const ExpectedIptablesCommands& expectedCmds) {
-    size_t pos = 0;
-    for (size_t i = 0; i < expectedCmds.size(); i ++) {
-        auto target = expectedCmds[i].first;
-        auto cmd = expectedCmds[i].second;
-        int numConsumed = expectIptablesCommand(target, pos, cmd);
-        if (numConsumed < 0) {
-            // Read past the end of the array.
-            break;
-        }
-        pos += numConsumed;
-    }
-
-    EXPECT_EQ(pos, sCmds.size());
-    sCmds.clear();
-}
-
-void IptablesBaseTest::expectIptablesCommands(
-        const std::vector<ExpectedIptablesCommands>& snippets) {
-    ExpectedIptablesCommands expected;
-    for (const auto& snippet: snippets) {
-        expected.insert(expected.end(), snippet.begin(), snippet.end());
-    }
-    expectIptablesCommands(expected);
+int IptablesBaseTest::fakeExecIptablesRestoreCommand(IptablesTarget target,
+                                                     const std::string& table,
+                                                     const std::string& command,
+                                                     std::string *output) {
+    std::string fullCmd = StringPrintf("-t %s %s", table.c_str(), command.c_str());
+    return fakeExecIptablesRestoreWithOutput(target, fullCmd, output);
 }
 
 void IptablesBaseTest::expectIptablesRestoreCommands(const std::vector<std::string>& expectedCmds) {
     ExpectedIptablesCommands expected;
-    for (auto cmd : expectedCmds) {
+    for (const auto& cmd : expectedCmds) {
         expected.push_back({ V4V6, cmd });
     }
     expectIptablesRestoreCommands(expected);
@@ -160,3 +116,5 @@ void IptablesBaseTest::expectIptablesRestoreCommands(const ExpectedIptablesComma
 std::vector<std::string> IptablesBaseTest::sCmds = {};
 IptablesBaseTest::ExpectedIptablesCommands IptablesBaseTest::sRestoreCmds = {};
 std::deque<std::string> IptablesBaseTest::sPopenContents = {};
+std::deque<std::string> IptablesBaseTest::sIptablesRestoreOutput = {};
+std::deque<int> IptablesBaseTest::sReturnValues = {};

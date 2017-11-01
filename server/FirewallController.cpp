@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <set>
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,16 +24,17 @@
 #define LOG_TAG "FirewallController"
 #define LOG_NDEBUG 0
 
+#include <android-base/strings.h>
 #include <android-base/stringprintf.h>
 #include <cutils/log.h>
 
 #include "NetdConstants.h"
 #include "FirewallController.h"
 
+using android::base::Join;
 using android::base::StringAppendF;
+using android::base::StringPrintf;
 
-auto FirewallController::execIptables = ::execIptables;
-auto FirewallController::execIptablesSilently = ::execIptablesSilently;
 auto FirewallController::execIptablesRestore = ::execIptablesRestore;
 
 const char* FirewallController::TABLE = "filter";
@@ -59,20 +62,14 @@ const char* FirewallController::ICMPV6_TYPES[] = {
 FirewallController::FirewallController(void) {
     // If no rules are set, it's in BLACKLIST mode
     mFirewallType = BLACKLIST;
+    mIfaceRules = {};
 }
 
 int FirewallController::setupIptablesHooks(void) {
     int res = 0;
-    // child chains are created but not attached, they will be attached explicitly.
-    FirewallType firewallType = getFirewallType(DOZABLE);
-    res |= createChain(LOCAL_DOZABLE, LOCAL_INPUT, firewallType);
-
-    firewallType = getFirewallType(STANDBY);
-    res |= createChain(LOCAL_STANDBY, LOCAL_INPUT, firewallType);
-
-    firewallType = getFirewallType(POWERSAVE);
-    res |= createChain(LOCAL_POWERSAVE, LOCAL_INPUT, firewallType);
-
+    res |= createChain(LOCAL_DOZABLE, getFirewallType(DOZABLE));
+    res |= createChain(LOCAL_STANDBY, getFirewallType(STANDBY));
+    res |= createChain(LOCAL_POWERSAVE, getFirewallType(POWERSAVE));
     return res;
 }
 
@@ -84,9 +81,13 @@ int FirewallController::enableFirewall(FirewallType ftype) {
 
         if (ftype == WHITELIST) {
             // create default rule to drop all traffic
-            res |= execIptables(V4V6, "-A", LOCAL_INPUT, "-j", "DROP", NULL);
-            res |= execIptables(V4V6, "-A", LOCAL_OUTPUT, "-j", "REJECT", NULL);
-            res |= execIptables(V4V6, "-A", LOCAL_FORWARD, "-j", "REJECT", NULL);
+            std::string command =
+                "*filter\n"
+                "-A fw_INPUT -j DROP\n"
+                "-A fw_OUTPUT -j REJECT\n"
+                "-A fw_FORWARD -j REJECT\n"
+                "COMMIT\n";
+            res = execIptablesRestore(V4V6, command.c_str());
         }
 
         // Set this after calling disableFirewall(), since it defaults to WHITELIST there
@@ -96,16 +97,18 @@ int FirewallController::enableFirewall(FirewallType ftype) {
 }
 
 int FirewallController::disableFirewall(void) {
-    int res = 0;
-
     mFirewallType = WHITELIST;
+    mIfaceRules.clear();
 
     // flush any existing rules
-    res |= execIptables(V4V6, "-F", LOCAL_INPUT, NULL);
-    res |= execIptables(V4V6, "-F", LOCAL_OUTPUT, NULL);
-    res |= execIptables(V4V6, "-F", LOCAL_FORWARD, NULL);
+    std::string command =
+        "*filter\n"
+        ":fw_INPUT -\n"
+        ":fw_OUTPUT -\n"
+        ":fw_FORWARD -\n"
+        "COMMIT\n";
 
-    return res;
+    return execIptablesRestore(V4V6, command.c_str());
 }
 
 int FirewallController::enableChildChains(ChildChain chain, bool enable) {
@@ -125,14 +128,13 @@ int FirewallController::enableChildChains(ChildChain chain, bool enable) {
             return res;
     }
 
-    if (enable) {
-        res |= attachChain(name, LOCAL_INPUT);
-        res |= attachChain(name, LOCAL_OUTPUT);
-    } else {
-        res |= detachChain(name, LOCAL_INPUT);
-        res |= detachChain(name, LOCAL_OUTPUT);
+    std::string command = "*filter\n";
+    for (const char *parent : { LOCAL_INPUT, LOCAL_OUTPUT }) {
+        StringAppendF(&command, "%s %s -j %s\n", (enable ? "-A" : "-D"), parent, name);
     }
-    return res;
+    StringAppendF(&command, "COMMIT\n");
+
+    return execIptablesRestore(V4V6, command);
 }
 
 int FirewallController::isFirewallEnabled(void) {
@@ -151,74 +153,27 @@ int FirewallController::setInterfaceRule(const char* iface, FirewallRule rule) {
         return -1;
     }
 
+    // Only delete rules if we actually added them, because otherwise our iptables-restore
+    // processes will terminate with "no such rule" errors and cause latency penalties while we
+    // spin up new ones.
     const char* op;
-    if (rule == ALLOW) {
+    if (rule == ALLOW && mIfaceRules.find(iface) == mIfaceRules.end()) {
         op = "-I";
-    } else {
+        mIfaceRules.insert(iface);
+    } else if (rule == DENY && mIfaceRules.find(iface) != mIfaceRules.end()) {
         op = "-D";
-    }
-
-    int res = 0;
-    res |= execIptables(V4V6, op, LOCAL_INPUT, "-i", iface, "-j", "RETURN", NULL);
-    res |= execIptables(V4V6, op, LOCAL_OUTPUT, "-o", iface, "-j", "RETURN", NULL);
-    return res;
-}
-
-int FirewallController::setEgressSourceRule(const char* addr, FirewallRule rule) {
-    if (mFirewallType == BLACKLIST) {
-        // Unsupported in BLACKLIST mode
-        return -1;
-    }
-
-    IptablesTarget target = V4;
-    if (strchr(addr, ':')) {
-        target = V6;
-    }
-
-    const char* op;
-    if (rule == ALLOW) {
-        op = "-I";
+        mIfaceRules.erase(iface);
     } else {
-        op = "-D";
+        return 0;
     }
 
-    int res = 0;
-    res |= execIptables(target, op, LOCAL_INPUT, "-d", addr, "-j", "RETURN", NULL);
-    res |= execIptables(target, op, LOCAL_OUTPUT, "-s", addr, "-j", "RETURN", NULL);
-    return res;
-}
-
-int FirewallController::setEgressDestRule(const char* addr, int protocol, int port,
-        FirewallRule rule) {
-    if (mFirewallType == BLACKLIST) {
-        // Unsupported in BLACKLIST mode
-        return -1;
-    }
-
-    IptablesTarget target = V4;
-    if (strchr(addr, ':')) {
-        target = V6;
-    }
-
-    char protocolStr[16];
-    sprintf(protocolStr, "%d", protocol);
-
-    char portStr[16];
-    sprintf(portStr, "%d", port);
-
-    const char* op;
-    if (rule == ALLOW) {
-        op = "-I";
-    } else {
-        op = "-D";
-    }
-
-    int res = 0;
-    res |= execIptables(target, op, LOCAL_INPUT, "-s", addr, "-p", protocolStr,
-            "--sport", portStr, "-j", "RETURN", NULL);
-    res |= execIptables(target, op, LOCAL_OUTPUT, "-d", addr, "-p", protocolStr,
-            "--dport", portStr, "-j", "RETURN", NULL);
-    return res;
+    std::string command = Join(std::vector<std::string> {
+        "*filter",
+        StringPrintf("%s fw_INPUT -i %s -j RETURN", op, iface),
+        StringPrintf("%s fw_OUTPUT -o %s -j RETURN", op, iface),
+        "COMMIT\n"
+    }, "\n");
+    return execIptablesRestore(V4V6, command);
 }
 
 FirewallType FirewallController::getFirewallType(ChildChain chain) {
@@ -237,9 +192,6 @@ FirewallType FirewallController::getFirewallType(ChildChain chain) {
 }
 
 int FirewallController::setUidRule(ChildChain chain, int uid, FirewallRule rule) {
-    char uidStr[16];
-    sprintf(uidStr, "%d", uid);
-
     const char* op;
     const char* target;
     FirewallType firewallType = getFirewallType(chain);
@@ -253,46 +205,51 @@ int FirewallController::setUidRule(ChildChain chain, int uid, FirewallRule rule)
         op = (rule == DENY)? "-A" : "-D";
     }
 
-    int res = 0;
+    std::vector<std::string> chainNames;
     switch(chain) {
         case DOZABLE:
-            res |= execIptables(V4V6, op, LOCAL_DOZABLE, "-m", "owner", "--uid-owner",
-                    uidStr, "-j", target, NULL);
+            chainNames = { LOCAL_DOZABLE };
             break;
         case STANDBY:
-            res |= execIptables(V4V6, op, LOCAL_STANDBY, "-m", "owner", "--uid-owner",
-                    uidStr, "-j", target, NULL);
+            chainNames = { LOCAL_STANDBY };
             break;
         case POWERSAVE:
-            res |= execIptables(V4V6, op, LOCAL_POWERSAVE, "-m", "owner", "--uid-owner",
-                    uidStr, "-j", target, NULL);
+            chainNames = { LOCAL_POWERSAVE };
             break;
         case NONE:
-            res |= execIptables(V4V6, op, LOCAL_INPUT, "-m", "owner", "--uid-owner", uidStr,
-                    "-j", target, NULL);
-            res |= execIptables(V4V6, op, LOCAL_OUTPUT, "-m", "owner", "--uid-owner", uidStr,
-                    "-j", target, NULL);
+            chainNames = { LOCAL_INPUT, LOCAL_OUTPUT };
             break;
         default:
             ALOGW("Unknown child chain: %d", chain);
-            break;
+            return -1;
     }
-    return res;
+
+    std::string command = "*filter\n";
+    for (std::string chainName : chainNames) {
+        StringAppendF(&command, "%s %s -m owner --uid-owner %d -j %s\n",
+                      op, chainName.c_str(), uid, target);
+    }
+    StringAppendF(&command, "COMMIT\n");
+
+    return execIptablesRestore(V4V6, command);
 }
 
-int FirewallController::attachChain(const char* childChain, const char* parentChain) {
-    return execIptables(V4V6, "-t", TABLE, "-A", parentChain, "-j", childChain, NULL);
+int FirewallController::createChain(const char* chain, FirewallType type) {
+    static const std::vector<int32_t> NO_UIDS;
+    return replaceUidChain(chain, type == WHITELIST, NO_UIDS);
 }
 
-int FirewallController::detachChain(const char* childChain, const char* parentChain) {
-    return execIptables(V4V6, "-t", TABLE, "-D", parentChain, "-j", childChain, NULL);
-}
-
-int FirewallController::createChain(const char* childChain,
-        const char* parentChain, FirewallType type) {
-    execIptablesSilently(V4V6, "-t", TABLE, "-D", parentChain, "-j", childChain, NULL);
-    std::vector<int32_t> uids;
-    return replaceUidChain(childChain, type == WHITELIST, uids);
+/* static */
+std::string FirewallController::makeCriticalCommands(IptablesTarget target, const char* chainName) {
+    // Allow ICMPv6 packets necessary to make IPv6 connectivity work. http://b/23158230 .
+    std::string commands;
+    if (target == V6) {
+        for (size_t i = 0; i < ARRAY_SIZE(ICMPV6_TYPES); i++) {
+            StringAppendF(&commands, "-A %s -p icmpv6 --icmpv6-type %s -j RETURN\n",
+                   chainName, ICMPV6_TYPES[i]);
+        }
+    }
+    return commands;
 }
 
 std::string FirewallController::makeUidRules(IptablesTarget target, const char *name,
@@ -300,20 +257,10 @@ std::string FirewallController::makeUidRules(IptablesTarget target, const char *
     std::string commands;
     StringAppendF(&commands, "*filter\n:%s -\n", name);
 
-    // Always allow networking on loopback.
-    StringAppendF(&commands, "-A %s -i lo -o lo -j RETURN\n", name);
-
-    // Allow TCP RSTs so we can cleanly close TCP connections of apps that no longer have network
-    // access. Both incoming and outgoing RSTs are allowed.
-    StringAppendF(&commands, "-A %s -p tcp --tcp-flags RST RST -j RETURN\n", name);
-
+    // Whitelist chains have UIDs at the beginning, and new UIDs are added with '-I'.
     if (isWhitelist) {
-        // Allow ICMPv6 packets necessary to make IPv6 connectivity work. http://b/23158230 .
-        if (target == V6) {
-            for (size_t i = 0; i < ARRAY_SIZE(ICMPV6_TYPES); i++) {
-                StringAppendF(&commands, "-A %s -p icmpv6 --icmpv6-type %s -j RETURN\n",
-                       name, ICMPV6_TYPES[i]);
-            }
+        for (auto uid : uids) {
+            StringAppendF(&commands, "-A %s -m owner --uid-owner %d -j RETURN\n", name, uid);
         }
 
         // Always whitelist system UIDs.
@@ -321,10 +268,23 @@ std::string FirewallController::makeUidRules(IptablesTarget target, const char *
                 "-A %s -m owner --uid-owner %d-%d -j RETURN\n", name, 0, MAX_SYSTEM_UID);
     }
 
-    // Whitelist or blacklist the specified UIDs.
-    const char *action = isWhitelist ? "RETURN" : "DROP";
-    for (auto uid : uids) {
-        StringAppendF(&commands, "-A %s -m owner --uid-owner %d -j %s\n", name, uid, action);
+    // Always allow networking on loopback.
+    StringAppendF(&commands, "-A %s -i lo -j RETURN\n", name);
+    StringAppendF(&commands, "-A %s -o lo -j RETURN\n", name);
+
+    // Allow TCP RSTs so we can cleanly close TCP connections of apps that no longer have network
+    // access. Both incoming and outgoing RSTs are allowed.
+    StringAppendF(&commands, "-A %s -p tcp --tcp-flags RST RST -j RETURN\n", name);
+
+    if (isWhitelist) {
+        commands.append(makeCriticalCommands(target, name));
+    }
+
+    // Blacklist chains have UIDs at the end, and new UIDs are added with '-A'.
+    if (!isWhitelist) {
+        for (auto uid : uids) {
+            StringAppendF(&commands, "-A %s -m owner --uid-owner %d -j DROP\n", name, uid);
+        }
     }
 
     // If it's a whitelist chain, add a default DROP at the end. This is not necessary for a
@@ -333,7 +293,7 @@ std::string FirewallController::makeUidRules(IptablesTarget target, const char *
         StringAppendF(&commands, "-A %s -j DROP\n", name);
     }
 
-    StringAppendF(&commands, "COMMIT\n\x04");  // EOT.
+    StringAppendF(&commands, "COMMIT\n");
 
     return commands;
 }
