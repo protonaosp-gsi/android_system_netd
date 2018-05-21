@@ -19,70 +19,45 @@
 
 #include <linux/bpf.h>
 
+#include <netdutils/StatusOr.h>
+#include "FirewallController.h"
+#include "NetlinkListener.h"
 #include "Network.h"
+#include "android-base/thread_annotations.h"
+#include "android-base/unique_fd.h"
 
-#ifndef DEFAULT_OVERFLOWUID
-#define DEFAULT_OVERFLOWUID 65534
-#endif
-
-#define LOG_BUF_SIZE 65536
-
-#define BPF_PATH "/sys/fs/bpf"
-
-constexpr const char* COOKIE_UID_MAP_PATH = BPF_PATH "/traffic_cookie_uid_map";
-constexpr const char* UID_COUNTERSET_MAP_PATH = BPF_PATH "/traffic_uid_counterSet_map";
-constexpr const char* UID_STATS_MAP_PATH = BPF_PATH "/traffic_uid_stats_map";
-constexpr const char* TAG_STATS_MAP_PATH = BPF_PATH "/traffic_tag_stats_map";
-
-constexpr const char* CGROUP_ROOT_PATH = "/dev/cg2_bpf";
-
-constexpr const int IPV6_TRANSPORT_PROTOCOL_OFFSET = 6;
-constexpr const int IPV4_TRANSPORT_PROTOCOL_OFFSET = 9;
-
-// TODO: change it to a reasonable size.
-constexpr const int COOKIE_UID_MAP_SIZE = 100;
-constexpr const int UID_COUNTERSET_MAP_SIZE = 100;
-constexpr const int UID_STATS_MAP_SIZE = 100;
-constexpr const int TAG_STATS_MAP_SIZE = 100;
+// Since we cannot garbage collect the stats map since device boot, we need to make these maps as
+// large as possible. The current rlimit of MEM_LOCK allows at most 10000 map entries for each
+// stats map. In the old qtaguid module, we don't have a total limit for data entries but only have
+// limitation of tags each uid can have. (default is 1024 in kernel);
+// cookie_uid_map:      key:  8 bytes, value:  8 bytes, total:10000*8*2 bytes         =  160Kbytes
+// uid_counter_set_map: key:  4 bytes, value:  4 bytes, total:10000*4*2 bytes         =   80Kbytes
+// uid_stats_map:       key: 16 bytes, value: 32 bytes, total:10000*16+10000*32 bytes =  480Kbytes
+// tag_stats_map:       key: 16 bytes, value: 32 bytes, total:10000*16+10000*32 bytes =  480Kbytes
+// iface_index_name_map:key:  4 bytes, value: 32 bytes, total:10000*36 bytes          =  360Kbytes
+// total:                                                                               1560Kbytes
+constexpr const int COOKIE_UID_MAP_SIZE = 10000;
+constexpr const int UID_COUNTERSET_MAP_SIZE = 10000;
+constexpr const int UID_STATS_MAP_SIZE = 10000;
+constexpr const int TAG_STATS_MAP_SIZE = 10000;
+constexpr const int IFACE_INDEX_NAME_MAP_SIZE = 1000;
+constexpr const int IFACE_STATS_MAP_SIZE = 1000;
+constexpr const int UID_OWNER_MAP_SIZE = 10000;
 
 constexpr const int COUNTERSETS_LIMIT = 2;
 
 namespace android {
 namespace net {
 
-struct UidTag {
-    uint32_t uid;
-    uint32_t tag;
-};
-
-struct StatsKey {
-    uint32_t uid;
-    uint32_t tag;
-    uint32_t counterSet;
-    uint32_t ifaceIndex;
-};
-
-struct Stats {
-    uint64_t rxTcpPackets;
-    uint64_t rxTcpBytes;
-    uint64_t txTcpPackets;
-    uint64_t txTcpBytes;
-    uint64_t rxUdpPackets;
-    uint64_t rxUdpBytes;
-    uint64_t txUdpPackets;
-    uint64_t txUdpBytes;
-    uint64_t rxOtherPackets;
-    uint64_t rxOtherBytes;
-    uint64_t txOtherPackets;
-    uint64_t txOtherBytes;
-};
+class DumpWriter;
 
 class TrafficController {
   public:
+    TrafficController();
     /*
      * Initialize the whole controller
      */
-    int start();
+    netdutils::Status start();
     /*
      * Tag the socket with the specified tag and uid. In the qtaguid module, the
      * first tag request that grab the spinlock of rb_tree can update the tag
@@ -117,18 +92,48 @@ class TrafficController {
      */
     int deleteTagData(uint32_t tag, uid_t uid);
 
-    /* Old api for debugging the qtaguid module. When the pacifier is on, all
-     * the command will return successful but no actual action is taken.
+    /*
+     * Check if the current device have the bpf traffic stats accounting service
+     * running.
      */
-    int setPacifier(uint32_t on);
+    bool checkBpfStatsEnable();
+
+    /*
+     * Add the interface name and index pair into the eBPF map.
+     */
+    int addInterface(const char* name, uint32_t ifaceIndex);
+
+    int changeUidOwnerRule(ChildChain chain, const uid_t uid, FirewallRule rule, FirewallType type);
+
+    int removeUidOwnerRule(const uid_t uid);
+
+    int replaceUidOwnerMap(const std::string& name, bool isWhitelist,
+                           const std::vector<int32_t>& uids);
+
+    int updateOwnerMapEntry(const base::unique_fd& map_fd, uid_t uid, FirewallRule rule,
+                            FirewallType type);
+
+    void dump(DumpWriter& dw, bool verbose);
+
+    int replaceUidsInMap(const base::unique_fd& map_fd, const std::vector<int32_t> &uids,
+                         FirewallRule rule, FirewallType type);
+
+    static const String16 DUMP_KEYWORD;
+
+    int toggleUidOwnerMap(ChildChain chain, bool enable);
 
   private:
     /*
      * mCookieTagMap: Store the corresponding tag and uid for a specific socket.
+     * DO NOT hold any locks when modifying this map, otherwise when the untag
+     * operation is waiting for a lock hold by other process and there are more
+     * sockets being closed than can fit in the socket buffer of the netlink socket
+     * that receives them, then the kernel will drop some of these sockets and we
+     * won't delete their tags.
      * Map Key: uint64_t socket cookie
      * Map Value: struct UidTag, contains a uint32 uid and a uint32 tag.
      */
-    int mCookieTagMap;
+    base::unique_fd mCookieTagMap;
 
     /*
      * mUidCounterSetMap: Store the counterSet of a specific uid.
@@ -136,17 +141,19 @@ class TrafficController {
      * Map Value: uint32 counterSet specifies if the traffic is a background
      * or foreground traffic.
      */
-    int mUidCounterSetMap;
+    base::unique_fd mUidCounterSetMap;
 
     /*
      * mUidStatsMap: Store the traffic statistics for a specific combination of
-     * uid, iface and counterSet.
+     * uid, iface and counterSet. We maintain this map in addition to
+     * mTagStatsMap because we want to be able to track per-UID data usage even
+     * if mTagStatsMap is full.
      * Map Key: Struct StatsKey contains the uid, counterSet and ifaceIndex
      * information. The Tag in the StatsKey should always be 0.
      * Map Value: struct Stats, contains packet count and byte count of each
      * transport protocol on egress and ingress direction.
      */
-    int mUidStatsMap;
+    base::unique_fd mUidStatsMap GUARDED_BY(mDeleteStatsMutex);
 
     /*
      * mTagStatsMap: Store the traffic statistics for a specific combination of
@@ -157,20 +164,64 @@ class TrafficController {
      * Map Value: struct Stats, contains packet count and byte count of each
      * transport protocol on egress and ingress direction.
      */
-    int mTagStatsMap;
+    base::unique_fd mTagStatsMap GUARDED_BY(mDeleteStatsMutex);
+
 
     /*
-     * IngressProgram: Program attached to the root cgroup directory and
-     * monitoring the traffic on ingress side.
+     * mIfaceIndexNameMap: Store the index name pair of each interface show up
+     * on the device since boot. The interface index is used by the eBPF program
+     * to correctly match the iface name when receiving a packet.
      */
-    int mInProgFd;
+    base::unique_fd mIfaceIndexNameMap;
 
     /*
-     * EgressProgram: Program attached to the root cgroup directory and
-     * monitoring the traffic on egress side.
+     * mIfaceStataMap: Store per iface traffic stats gathered from xt_bpf
+     * filter.
      */
-    int mOutProgFd;
+    base::unique_fd mIfaceStatsMap;
+
+    /*
+     * mDozableUidMap: Store uids that have related rules in dozable mode owner match
+     * chain.
+     */
+    base::unique_fd mDozableUidMap GUARDED_BY(mOwnerMatchMutex);
+
+    /*
+     * mStandbyUidMap: Store uids that have related rules in standby mode owner match
+     * chain.
+     */
+    base::unique_fd mStandbyUidMap GUARDED_BY(mOwnerMatchMutex);
+
+    /*
+     * mPowerSaveUidMap: Store uids that have related rules in power save mode owner match
+     * chain.
+     */
+    base::unique_fd mPowerSaveUidMap GUARDED_BY(mOwnerMatchMutex);
+
+    std::unique_ptr<NetlinkListenerInterface> mSkDestroyListener;
+
     bool ebpfSupported;
+
+    std::mutex mOwnerMatchMutex;
+
+    // When aquiring both mOwnerMatchMutex and mDeleteStatsMutex,
+    // mOwnerMatchMutex must be grabbed first to prevent protential deadlock.
+    // This lock need to be hold when deleting from any stats map which we
+    // can iterate which are uidStatsMap and tagStatsMap. We don't need this
+    // lock to guard mUidCounterSetMap because we always directly look up /
+    // write / delete the map by uid. Also we don't need this lock for
+    // mCookieTagMap since the only time we need to iterate the map is
+    // deleteTagStats and we don't care if we failed and started from the
+    // beginning, since we will eventually scan through the map and delete all
+    // target entries.
+    std::mutex mDeleteStatsMutex;
+
+    netdutils::Status loadAndAttachProgram(bpf_attach_type type, const char* path, const char* name,
+                                           base::unique_fd& cg_fd);
+
+    netdutils::Status initMaps();
+    // For testing
+    friend class TrafficControllerTest;
 };
 
 }  // namespace net

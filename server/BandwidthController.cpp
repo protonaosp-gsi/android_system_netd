@@ -46,14 +46,17 @@
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
 #define LOG_TAG "BandwidthController"
-#include <cutils/log.h>
 #include <cutils/properties.h>
+#include <log/log.h>
 #include <logwrap/logwrap.h>
 
 #include <netdutils/Syscalls.h>
 #include "BandwidthController.h"
+#include "Controllers.h"
 #include "FirewallController.h" /* For makeCriticalCommands */
+#include "Fwmark.h"
 #include "NetdConstants.h"
+#include "bpf/BpfUtils.h"
 
 /* Alphabetical */
 #define ALERT_IPT_TEMPLATE "%s %s -m quota2 ! --quota %" PRId64" --name %s\n"
@@ -68,6 +71,8 @@ auto BandwidthController::iptablesRestoreFunction = execIptablesRestoreWithOutpu
 using android::base::Join;
 using android::base::StringAppendF;
 using android::base::StringPrintf;
+using android::bpf::XT_BPF_EGRESS_PROG_PATH;
+using android::bpf::XT_BPF_INGRESS_PROG_PATH;
 using android::netdutils::StatusOr;
 using android::netdutils::UniqueFile;
 
@@ -168,25 +173,88 @@ static const std::vector<std::string> IPT_FLUSH_COMMANDS = {
     COMMIT_AND_CLOSE
 };
 
-static const std::vector<std::string> IPT_BASIC_ACCOUNTING_COMMANDS = {
-    "*filter",
-    "-A bw_INPUT -m owner --socket-exists", /* This is a tracking rule. */
-    "-A bw_OUTPUT -m owner --socket-exists", /* This is a tracking rule. */
-    "-A bw_costly_shared --jump bw_penalty_box",
-    "-A bw_penalty_box --jump bw_happy_box",
-    "-A bw_happy_box --jump bw_data_saver",
-    "-A bw_data_saver -j RETURN",
-    HAPPY_BOX_WHITELIST_COMMAND,
-    "COMMIT",
+static const uint32_t uidBillingMask = Fwmark::getUidBillingMask();
 
-    "*raw",
-    "-A bw_raw_PREROUTING -m owner --socket-exists", /* This is a tracking rule. */
-    "COMMIT",
+/**
+ * Basic commands for creation of hooks into data accounting and data boxes.
+ *
+ * Included in these commands are rules to prevent the double-counting of IPsec
+ * packets. The general overview is as follows:
+ * > All interface counters (counted in PREROUTING, POSTROUTING) must be
+ *     completely accurate, and count only the outer packet. As such, the inner
+ *     packet must be ignored, which is done through the use of two rules: use
+ *     of the policy module (for tunnel mode), and VTI interface checks (for
+ *     tunnel or transport-in-tunnel mode). The VTI interfaces should be named
+ *     ipsec*
+ * > Outbound UID billing can always be done with the outer packets, due to the
+ *     ability to always find the correct UID (based on the skb->sk). As such,
+ *     the inner packets should be ignored based on the policy module, or the
+ *     output interface if a VTI (ipsec+)
+ * > Inbound UDP-encap-ESP packets can be correctly mapped to the UID that
+ *     opened the encap socket, and as such, should be billed as early as
+ *     possible (for transport mode; tunnel mode usage should be billed to
+ *     sending/receiving application). Due to the inner packet being
+ *     indistinguishable from the inner packet of ESP, a uidBillingDone mark
+ *     has to be applied to prevent counting a second time.
+ * > Inbound ESP has no socket, and as such must be accounted later. ESP
+ *     protocol packets are skipped via a blanket rule.
+ * > Note that this solution is asymmetrical. Adding the VTI or policy matcher
+ *     ignore rule in the input chain would actually break the INPUT chain;
+ *     Those rules are designed to ignore inner packets, and in the tunnel
+ *     mode UDP, or any ESP case, we would not have billed the outer packet.
+ *
+ * See go/ipsec-data-accounting for more information.
+ */
 
-    "*mangle",
-    "-A bw_mangle_POSTROUTING -m owner --socket-exists", /* This is a tracking rule. */
-    COMMIT_AND_CLOSE
-};
+const std::vector<std::string> getBasicAccountingCommands() {
+    bool useBpf = BandwidthController::getBpfStatsStatus();
+    const std::vector<std::string> ipt_basic_accounting_commands = {
+        "*filter",
+        // Prevents IPSec double counting (ESP and UDP-encap-ESP respectively)
+        "-A bw_INPUT -p esp -j RETURN",
+        StringPrintf("-A bw_INPUT -m mark --mark 0x%x/0x%x -j RETURN",
+                     uidBillingMask, uidBillingMask),
+        "-A bw_INPUT -m owner --socket-exists", /* This is a tracking rule. */
+        StringPrintf("-A bw_INPUT -j MARK --or-mark 0x%x", uidBillingMask),
+
+        // Prevents IPSec double counting (Tunnel mode and Transport mode,
+        // respectively)
+        "-A bw_OUTPUT -o " IPSEC_IFACE_PREFIX "+ -j RETURN",
+        "-A bw_OUTPUT -m policy --pol ipsec --dir out -j RETURN",
+        "-A bw_OUTPUT -m owner --socket-exists", /* This is a tracking rule. */
+
+        "-A bw_costly_shared --jump bw_penalty_box",
+        "-A bw_penalty_box --jump bw_happy_box",
+        "-A bw_happy_box --jump bw_data_saver",
+        "-A bw_data_saver -j RETURN",
+        HAPPY_BOX_WHITELIST_COMMAND,
+        "COMMIT",
+
+        "*raw",
+        // Prevents IPSec double counting (Tunnel mode and Transport mode,
+        // respectively)
+        "-A bw_raw_PREROUTING -i " IPSEC_IFACE_PREFIX "+ -j RETURN",
+        "-A bw_raw_PREROUTING -m policy --pol ipsec --dir in -j RETURN",
+        "-A bw_raw_PREROUTING -m owner --socket-exists", /* This is a tracking rule. */
+        useBpf ? StringPrintf("-A bw_raw_PREROUTING -m bpf --object-pinned %s",
+                              XT_BPF_INGRESS_PROG_PATH):"",
+        "COMMIT",
+
+        "*mangle",
+        // Prevents IPSec double counting (Tunnel mode and Transport mode,
+        // respectively)
+        "-A bw_mangle_POSTROUTING -o " IPSEC_IFACE_PREFIX "+ -j RETURN",
+        "-A bw_mangle_POSTROUTING -m policy --pol ipsec --dir out -j RETURN",
+        "-A bw_mangle_POSTROUTING -m owner --socket-exists", /* This is a tracking rule. */
+        StringPrintf("-A bw_mangle_POSTROUTING -j MARK --set-mark 0x0/0x%x",
+                     uidBillingMask), // Clear the mark before sending this packet
+        useBpf ? StringPrintf("-A bw_mangle_POSTROUTING -m bpf --object-pinned %s",
+                              XT_BPF_EGRESS_PROG_PATH):"",
+        COMMIT_AND_CLOSE
+    };
+    return ipt_basic_accounting_commands;
+}
+
 
 std::vector<std::string> toStrVec(int num, char* strs[]) {
     std::vector<std::string> tmp;
@@ -197,6 +265,11 @@ std::vector<std::string> toStrVec(int num, char* strs[]) {
 }
 
 }  // namespace
+
+bool BandwidthController::getBpfStatsStatus() {
+    return (access(XT_BPF_INGRESS_PROG_PATH, F_OK) != -1) &&
+           (access(XT_BPF_EGRESS_PROG_PATH, F_OK) != -1);
+}
 
 BandwidthController::BandwidthController() {
 }
@@ -232,7 +305,8 @@ int BandwidthController::enableBandwidthControl(bool force) {
     mSharedQuotaBytes = mSharedAlertBytes = 0;
 
     flushCleanTables(false);
-    std::string commands = Join(IPT_BASIC_ACCOUNTING_COMMANDS, '\n');
+
+    std::string commands = Join(getBasicAccountingCommands(), '\n');
     return iptablesRestoreFunction(V4V6, commands, nullptr);
 }
 

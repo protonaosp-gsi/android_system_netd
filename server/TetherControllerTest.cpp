@@ -94,22 +94,33 @@ protected:
                 "COMMIT\n" },
     };
 
-    ExpectedIptablesCommands firstNatCommands(const char *extIf) {
+    ExpectedIptablesCommands firstIPv4UpstreamCommands(const char *extIf) {
         std::string v4Cmd = StringPrintf(
             "*nat\n"
             "-A tetherctrl_nat_POSTROUTING -o %s -j MASQUERADE\n"
             "COMMIT\n", extIf);
+        return {
+            { V4, v4Cmd },
+        };
+    }
+
+    ExpectedIptablesCommands firstIPv6UpstreamCommands() {
         std::string v6Cmd =
             "*filter\n"
             "-A tetherctrl_FORWARD -g tetherctrl_counters\n"
             "COMMIT\n";
         return {
-            { V4, v4Cmd },
             { V6, v6Cmd },
         };
     }
 
-    ExpectedIptablesCommands startNatCommands(const char *intIf, const char *extIf) {
+    template<typename T>
+    void appendAll(std::vector<T>& cmds, const std::vector<T>& appendCmds) {
+        cmds.insert(cmds.end(), appendCmds.begin(), appendCmds.end());
+    }
+
+    ExpectedIptablesCommands startNatCommands(const char *intIf, const char *extIf,
+            bool withCounterChainRules) {
         std::string rpfilterCmd = StringPrintf(
             "*raw\n"
             "-A tetherctrl_raw_PREROUTING -i %s -m rpfilter --invert ! -s fe80::/64 -j DROP\n"
@@ -123,25 +134,58 @@ protected:
                          intIf, extIf),
             StringPrintf("-A tetherctrl_FORWARD -i %s -o %s -g tetherctrl_counters",
                          intIf, extIf),
-            StringPrintf("-A tetherctrl_counters -i %s -o %s -j RETURN", intIf, extIf),
-            StringPrintf("-A tetherctrl_counters -i %s -o %s -j RETURN", extIf, intIf),
-            "-D tetherctrl_FORWARD -j DROP",
-            "-A tetherctrl_FORWARD -j DROP",
-            "COMMIT\n",
         };
 
         std::vector<std::string> v6Cmds = {
             "*filter",
-            StringPrintf("-A tetherctrl_counters -i %s -o %s -j RETURN", intIf, extIf),
-            StringPrintf("-A tetherctrl_counters -i %s -o %s -j RETURN", extIf, intIf),
-            "COMMIT\n",
         };
+
+        if (withCounterChainRules) {
+            const std::vector<std::string> counterRules = {
+                StringPrintf("-A tetherctrl_counters -i %s -o %s -j RETURN", intIf, extIf),
+                StringPrintf("-A tetherctrl_counters -i %s -o %s -j RETURN", extIf, intIf),
+            };
+
+            appendAll(v4Cmds, counterRules);
+            appendAll(v6Cmds, counterRules);
+        }
+
+        appendAll(v4Cmds, {
+            "-D tetherctrl_FORWARD -j DROP",
+            "-A tetherctrl_FORWARD -j DROP",
+            "COMMIT\n",
+        });
+
+        v6Cmds.push_back("COMMIT\n");
 
         return {
             { V6, rpfilterCmd },
             { V4, Join(v4Cmds, '\n') },
             { V6, Join(v6Cmds, '\n') },
         };
+    }
+
+    constexpr static const bool WITH_COUNTERS = true;
+    constexpr static const bool NO_COUNTERS = false;
+    constexpr static const bool WITH_IPV6 = true;
+    constexpr static const bool NO_IPV6 = false;
+    ExpectedIptablesCommands allNewNatCommands(
+            const char *intIf, const char *extIf, bool withCounterChainRules,
+            bool withIPv6Upstream) {
+
+        ExpectedIptablesCommands commands;
+        ExpectedIptablesCommands setupFirstIPv4Commands = firstIPv4UpstreamCommands(extIf);
+        ExpectedIptablesCommands startFirstNatCommands = startNatCommands(intIf, extIf,
+            withCounterChainRules);
+
+        appendAll(commands, setupFirstIPv4Commands);
+        if (withIPv6Upstream) {
+            ExpectedIptablesCommands setupFirstIPv6Commands = firstIPv6UpstreamCommands();
+            appendAll(commands, setupFirstIPv6Commands);
+        }
+        appendAll(commands, startFirstNatCommands);
+
+        return commands;
     }
 
     ExpectedIptablesCommands stopNatCommands(const char *intIf, const char *extIf) {
@@ -180,26 +224,72 @@ TEST_F(TetherControllerTest, TestSetDefaults) {
 }
 
 TEST_F(TetherControllerTest, TestAddAndRemoveNat) {
-    ExpectedIptablesCommands expected;
-    ExpectedIptablesCommands setupFirstNatCommands = firstNatCommands("rmnet0");
-    ExpectedIptablesCommands startFirstNatCommands = startNatCommands("wlan0", "rmnet0");
-    expected.insert(expected.end(), setupFirstNatCommands.begin(), setupFirstNatCommands.end());
-    expected.insert(expected.end(), startFirstNatCommands.begin(), startFirstNatCommands.end());
+    // Start first NAT on first upstream interface. Expect the upstream and NAT rules to be created.
+    ExpectedIptablesCommands firstNat = allNewNatCommands(
+            "wlan0", "rmnet0", WITH_COUNTERS, WITH_IPV6);
     mTetherCtrl.enableNat("wlan0", "rmnet0");
-    expectIptablesRestoreCommands(expected);
+    expectIptablesRestoreCommands(firstNat);
 
-    ExpectedIptablesCommands startOtherNat = startNatCommands("usb0", "rmnet0");
+    // Start second NAT on same upstream. Expect only the counter rules to be created.
+    ExpectedIptablesCommands startOtherNatOnSameUpstream = startNatCommands(
+            "usb0", "rmnet0", WITH_COUNTERS);
     mTetherCtrl.enableNat("usb0", "rmnet0");
-    expectIptablesRestoreCommands(startOtherNat);
+    expectIptablesRestoreCommands(startOtherNatOnSameUpstream);
 
-    ExpectedIptablesCommands stopOtherNat = stopNatCommands("wlan0", "rmnet0");
+    // Remove the first NAT.
+    ExpectedIptablesCommands stopFirstNat = stopNatCommands("wlan0", "rmnet0");
     mTetherCtrl.disableNat("wlan0", "rmnet0");
-    expectIptablesRestoreCommands(stopOtherNat);
+    expectIptablesRestoreCommands(stopFirstNat);
 
-    expected = stopNatCommands("usb0", "rmnet0");
-    expected.insert(expected.end(), FLUSH_COMMANDS.begin(), FLUSH_COMMANDS.end());
+    // Remove the last NAT. Expect rules to be cleared.
+    ExpectedIptablesCommands stopLastNat = stopNatCommands("usb0", "rmnet0");
+
+    appendAll(stopLastNat, FLUSH_COMMANDS);
     mTetherCtrl.disableNat("usb0", "rmnet0");
-    expectIptablesRestoreCommands(expected);
+    expectIptablesRestoreCommands(stopLastNat);
+
+    // Re-add a NAT removed previously: tetherctrl_counters chain rules are not re-added
+    firstNat = allNewNatCommands("wlan0", "rmnet0", NO_COUNTERS, WITH_IPV6);
+    mTetherCtrl.enableNat("wlan0", "rmnet0");
+    expectIptablesRestoreCommands(firstNat);
+
+    // Remove it again. Expect rules to be cleared.
+    stopLastNat = stopNatCommands("wlan0", "rmnet0");
+    appendAll(stopLastNat, FLUSH_COMMANDS);
+    mTetherCtrl.disableNat("wlan0", "rmnet0");
+    expectIptablesRestoreCommands(stopLastNat);
+}
+
+TEST_F(TetherControllerTest, TestMultipleUpstreams) {
+    // Start first NAT on first upstream interface. Expect the upstream and NAT rules to be created.
+    ExpectedIptablesCommands firstNat = allNewNatCommands(
+            "wlan0", "rmnet0", WITH_COUNTERS, WITH_IPV6);
+    mTetherCtrl.enableNat("wlan0", "rmnet0");
+    expectIptablesRestoreCommands(firstNat);
+
+    // Start second NAT, on new upstream. Expect the upstream and NAT rules to be created for IPv4,
+    // but no counter rules for IPv6.
+    ExpectedIptablesCommands secondNat = allNewNatCommands(
+            "wlan0", "v4-rmnet0", WITH_COUNTERS, NO_IPV6);
+    mTetherCtrl.enableNat("wlan0", "v4-rmnet0");
+    expectIptablesRestoreCommands(secondNat);
+
+    // Pretend that the caller has forgotten that it set up the second NAT, and asks us to do so
+    // again. Expect that we take no action.
+    const ExpectedIptablesCommands NONE = {};
+    mTetherCtrl.enableNat("wlan0", "v4-rmnet0");
+    expectIptablesRestoreCommands(NONE);
+
+    // Remove the second NAT.
+    ExpectedIptablesCommands stopSecondNat = stopNatCommands("wlan0", "v4-rmnet0");
+    mTetherCtrl.disableNat("wlan0", "v4-rmnet0");
+    expectIptablesRestoreCommands(stopSecondNat);
+
+    // Remove the first NAT. Expect rules to be cleared.
+    ExpectedIptablesCommands stopFirstNat = stopNatCommands("wlan0", "rmnet0");
+    appendAll(stopFirstNat, FLUSH_COMMANDS);
+    mTetherCtrl.disableNat("wlan0", "rmnet0");
+    expectIptablesRestoreCommands(stopFirstNat);
 }
 
 std::string kTetherCounterHeaders = Join(std::vector<std::string> {

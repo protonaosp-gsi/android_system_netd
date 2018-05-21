@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2017 The Android Open Source Project
+ * Copyright (C) 2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,21 +13,26 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <linux/bpf.h>
-#include <linux/if_ether.h>
-#include <linux/in.h>
-#include <linux/unistd.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
+
+#ifndef _DNS_IDNSTLSSOCKETOBSERVER_H
+#define _DNS_IDNSTLSSOCKETOBSERVER_H
 
 namespace android {
 namespace net {
-namespace bpf_prog {
 
-int loadIngressProg(int cookieTagMap, int uidStatsMap, int tagStatsMap, int uidCounterSetMap);
-int loadEgressProg(int cookieTagMap, int uidStatsMap, int tagStatsMap, int uidCounterSetMap);
+// Interface to listen for DNS query responses on a socket, and to be notified
+// when the socket is closed by the remote peer.  This is only implemented by
+// DnsTlsTransport, but it is a separate interface for clarity and to avoid a
+// circular dependency with DnsTlsSocket.
+class IDnsTlsSocketObserver {
+public:
+    virtual ~IDnsTlsSocketObserver() {};
+    virtual void onResponse(std::vector<uint8_t> response) = 0;
 
-}  // namespace bpf_prog
+    virtual void onClosed() = 0;
+};
+
 }  // namespace net
 }  // namespace android
+
+#endif  // _DNS_IDNSTLSSOCKETOBSERVER_H

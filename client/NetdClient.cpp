@@ -122,6 +122,10 @@ unsigned getNetworkForResolv(unsigned netId) {
     if (netId != NETID_UNSET) {
         return netId;
     }
+    // Special case for DNS-over-TLS bypass; b/72345192 .
+    if ((netIdForResolv & ~NETID_USE_LOCAL_NAMESERVERS) != NETID_UNSET) {
+        return netIdForResolv;
+    }
     netId = netIdForProcess;
     if (netId != NETID_UNSET) {
         return netId;
@@ -130,6 +134,9 @@ unsigned getNetworkForResolv(unsigned netId) {
 }
 
 int setNetworkForTarget(unsigned netId, std::atomic_uint* target) {
+    const unsigned requestedNetId = netId;
+    netId &= ~NETID_USE_LOCAL_NAMESERVERS;
+
     if (netId == NETID_UNSET) {
         *target = netId;
         return 0;
@@ -148,13 +155,36 @@ int setNetworkForTarget(unsigned netId, std::atomic_uint* target) {
     }
     int error = setNetworkForSocket(netId, socketFd);
     if (!error) {
-        *target = netId;
+        *target = (target == &netIdForResolv) ? requestedNetId : netId;
     }
     close(socketFd);
     return error;
 }
 
+int checkSocket(int socketFd) {
+    if (socketFd < 0) {
+        return -EBADF;
+    }
+    int family;
+    socklen_t familyLen = sizeof(family);
+    if (getsockopt(socketFd, SOL_SOCKET, SO_DOMAIN, &family, &familyLen) == -1) {
+        return -errno;
+    }
+    if (!FwmarkClient::shouldSetFwmark(family)) {
+        return -EAFNOSUPPORT;
+    }
+    return 0;
+}
+
 }  // namespace
+
+#define CHECK_SOCKET_IS_MARKABLE(sock)          \
+    do {                                        \
+        int err;                                \
+        if ((err = checkSocket(sock)) != 0) {   \
+            return err;                         \
+        }                                       \
+    } while (false);
 
 // accept() just calls accept4(..., 0), so there's no need to handle accept() separately.
 extern "C" void netdClientInitAccept4(Accept4FunctionType* function) {
@@ -202,9 +232,7 @@ extern "C" unsigned getNetworkForProcess() {
 }
 
 extern "C" int setNetworkForSocket(unsigned netId, int socketFd) {
-    if (socketFd < 0) {
-        return -EBADF;
-    }
+    CHECK_SOCKET_IS_MARKABLE(socketFd);
     FwmarkCommand command = {FwmarkCommand::SELECT_NETWORK, netId, 0, 0};
     return FwmarkClient().send(&command, socketFd, nullptr);
 }
@@ -226,9 +254,7 @@ extern "C" int protectFromVpn(int socketFd) {
 }
 
 extern "C" int setNetworkForUser(uid_t uid, int socketFd) {
-    if (socketFd < 0) {
-        return -EBADF;
-    }
+    CHECK_SOCKET_IS_MARKABLE(socketFd);
     FwmarkCommand command = {FwmarkCommand::SELECT_FOR_USER, 0, uid, 0};
     return FwmarkClient().send(&command, socketFd, nullptr);
 }
@@ -239,11 +265,13 @@ extern "C" int queryUserAccess(uid_t uid, unsigned netId) {
 }
 
 extern "C" int tagSocket(int socketFd, uint32_t tag, uid_t uid) {
+    CHECK_SOCKET_IS_MARKABLE(socketFd);
     FwmarkCommand command = {FwmarkCommand::TAG_SOCKET, 0, uid, tag};
     return FwmarkClient().send(&command, socketFd, nullptr);
 }
 
 extern "C" int untagSocket(int socketFd) {
+    CHECK_SOCKET_IS_MARKABLE(socketFd);
     FwmarkCommand command = {FwmarkCommand::UNTAG_SOCKET, 0, 0, 0};
     return FwmarkClient().send(&command, socketFd, nullptr);
 }

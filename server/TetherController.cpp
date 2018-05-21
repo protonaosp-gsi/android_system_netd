@@ -18,7 +18,6 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <netdb.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include <sys/socket.h>
@@ -29,11 +28,16 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include <array>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
 #define LOG_TAG "TetherController"
 #include <android-base/strings.h>
 #include <android-base/stringprintf.h>
-#include <cutils/log.h>
 #include <cutils/properties.h>
+#include <log/log.h>
 #include <netdutils/StatusOr.h>
 
 #include "Fwmark.h"
@@ -57,6 +61,9 @@ const char IPV4_FORWARDING_PROC_FILE[] = "/proc/sys/net/ipv4/ip_forward";
 const char IPV6_FORWARDING_PROC_FILE[] = "/proc/sys/net/ipv6/conf/all/forwarding";
 const char SEPARATOR[] = "|";
 constexpr const char kTcpBeLiberal[] = "/proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal";
+
+// Chosen to match AID_DNS_TETHER, as made "friendly" by fs_config_generator.py.
+constexpr const char kDnsmasqUsername[] = "dns_tether";
 
 bool writeToFile(const char* filename, const char* value) {
     int fd = open(filename, O_WRONLY | O_CLOEXEC);
@@ -117,21 +124,11 @@ const std::string GET_TETHER_STATS_COMMAND = StringPrintf(
     "COMMIT\n", android::net::TetherController::LOCAL_TETHER_COUNTERS_CHAIN);
 
 TetherController::TetherController() {
-    mDnsNetId = 0;
-    mDaemonFd = -1;
-    mDaemonPid = 0;
     if (inBpToolsMode()) {
         enableForwarding(BP_TOOLS_MODE);
     } else {
         setIpFwdEnabled();
     }
-}
-
-TetherController::~TetherController() {
-    mInterfaces.clear();
-    mDnsForwarders.clear();
-    mForwardingRequests.clear();
-    ifacePairList.clear();
 }
 
 bool TetherController::setIpFwdEnabled() {
@@ -159,8 +156,6 @@ bool TetherController::disableForwarding(const char* requester) {
 size_t TetherController::forwardingRequestCount() {
     return mForwardingRequests.size();
 }
-
-#define TETHER_START_CONST_ARG        10
 
 int TetherController::startTethering(int num_addrs, char **dhcp_ranges) {
     if (mDaemonPid != 0) {
@@ -208,29 +203,32 @@ int TetherController::startTethering(int num_addrs, char **dhcp_ranges) {
         char markStr[UINT32_HEX_STRLEN];
         snprintf(markStr, sizeof(markStr), "0x%x", fwmark.intValue);
 
-        int num_processed_args = TETHER_START_CONST_ARG + (num_addrs/2) + 1;
-        char **args = (char **)malloc(sizeof(char *) * num_processed_args);
-        args[num_processed_args - 1] = NULL;
-        args[0] = (char *)"/system/bin/dnsmasq";
-        args[1] = (char *)"--keep-in-foreground";
-        args[2] = (char *)"--no-resolv";
-        args[3] = (char *)"--no-poll";
-        args[4] = (char *)"--dhcp-authoritative";
-        // TODO: pipe through metered status from ConnService
-        args[5] = (char *)"--dhcp-option-force=43,ANDROID_METERED";
-        args[6] = (char *)"--pid-file";
-        args[7] = (char *)"--listen-mark";
-        args[8] = (char *)markStr;
-        args[9] = (char *)"";
+        std::vector<const std::string> argVector = {
+            "/system/bin/dnsmasq",
+            "--keep-in-foreground",
+            "--no-resolv",
+            "--no-poll",
+            "--dhcp-authoritative",
+            // TODO: pipe through metered status from ConnService
+            "--dhcp-option-force=43,ANDROID_METERED",
+            "--pid-file",
+            "--listen-mark", markStr,
+            "--user", kDnsmasqUsername,
+        };
 
-        int nextArg = TETHER_START_CONST_ARG;
         for (int addrIndex = 0; addrIndex < num_addrs; addrIndex += 2) {
-            asprintf(&(args[nextArg++]),"--dhcp-range=%s,%s,1h",
-                     dhcp_ranges[addrIndex], dhcp_ranges[addrIndex+1]);
+            argVector.push_back(
+                    StringPrintf("--dhcp-range=%s,%s,1h",
+                                 dhcp_ranges[addrIndex], dhcp_ranges[addrIndex+1]));
+        }
+
+        auto args = (char**)std::calloc(argVector.size() + 1, sizeof(char*));
+        for (unsigned i = 0; i < argVector.size(); i++) {
+            args[i] = (char*)argVector[i].c_str();
         }
 
         if (execv(args[0], args)) {
-            ALOGE("execl failed (%s)", strerror(errno));
+            ALOGE("execv failed (%s)", strerror(errno));
         }
         ALOGE("Should never get here!");
         _exit(-1);
@@ -431,7 +429,7 @@ int TetherController::setupIptablesHooks() {
         return res;
     }
 
-    ifacePairList.clear();
+    mFwdIfaces.clear();
 
     return 0;
 }
@@ -464,8 +462,6 @@ int TetherController::setDefaults() {
         return res;
     }
 
-    natCount = 0;
-
     return 0;
 }
 
@@ -484,48 +480,127 @@ int TetherController::enableNat(const char* intIface, const char* extIface) {
         return -1;
     }
 
-    // add this if we are the first added nat
-    if (natCount == 0) {
+    if (isForwardingPairEnabled(intIface, extIface)) {
+        return 0;
+    }
+
+    // add this if we are the first enabled nat for this upstream
+    if (!isAnyForwardingEnabledOnUpstream(extIface)) {
         std::vector<std::string> v4Cmds = {
             "*nat",
             StringPrintf("-A %s -o %s -j MASQUERADE", LOCAL_NAT_POSTROUTING, extIface),
             "COMMIT\n"
         };
 
-        /*
-         * IPv6 tethering doesn't need the state-based conntrack rules, so
-         * it unconditionally jumps to the tether counters chain all the time.
-         */
-        std::vector<std::string> v6Cmds = {
-            "*filter",
-            StringPrintf("-A %s -g %s", LOCAL_FORWARD, LOCAL_TETHER_COUNTERS_CHAIN),
-            "COMMIT\n"
-        };
-
         if (iptablesRestoreFunction(V4, Join(v4Cmds, '\n'), nullptr) ||
-            iptablesRestoreFunction(V6, Join(v6Cmds, '\n'), nullptr)) {
+            setupIPv6CountersChain()) {
             ALOGE("Error setting postroute rule: iface=%s", extIface);
-            // unwind what's been done, but don't care about success - what more could we do?
-            setDefaults();
+            if (!isAnyForwardingPairEnabled()) {
+                // unwind what's been done, but don't care about success - what more could we do?
+                setDefaults();
+            }
             return -1;
         }
     }
 
     if (setForwardRules(true, intIface, extIface) != 0) {
         ALOGE("Error setting forward rules");
-        if (natCount == 0) {
+        if (!isAnyForwardingPairEnabled()) {
             setDefaults();
         }
         errno = ENODEV;
         return -1;
     }
 
-    natCount++;
     return 0;
 }
 
-bool TetherController::checkTetherCountingRuleExist(const std::string& pair_name) {
-    return std::find(ifacePairList.begin(), ifacePairList.end(), pair_name) != ifacePairList.end();
+int TetherController::setupIPv6CountersChain() {
+    // Only add this if we are the first enabled nat
+    if (isAnyForwardingPairEnabled()) {
+        return 0;
+    }
+
+    /*
+     * IPv6 tethering doesn't need the state-based conntrack rules, so
+     * it unconditionally jumps to the tether counters chain all the time.
+     */
+    std::vector<std::string> v6Cmds = {
+        "*filter",
+        StringPrintf("-A %s -g %s", LOCAL_FORWARD, LOCAL_TETHER_COUNTERS_CHAIN),
+        "COMMIT\n"
+    };
+
+    return iptablesRestoreFunction(V6, Join(v6Cmds, '\n'), nullptr);
+}
+
+// Gets a pointer to the ForwardingDownstream for an interface pair in the map, or nullptr
+TetherController::ForwardingDownstream* TetherController::findForwardingDownstream(
+        const std::string& intIface, const std::string& extIface) {
+    auto extIfaceMatches = mFwdIfaces.equal_range(extIface);
+    for (auto it = extIfaceMatches.first; it != extIfaceMatches.second; ++it) {
+        if (it->second.iface == intIface) {
+            return &(it->second);
+        }
+    }
+    return nullptr;
+}
+
+void TetherController::addForwardingPair(const std::string& intIface, const std::string& extIface) {
+    ForwardingDownstream* existingEntry = findForwardingDownstream(intIface, extIface);
+    if (existingEntry != nullptr) {
+        existingEntry->active = true;
+        return;
+    }
+
+    mFwdIfaces.insert(std::pair<std::string, ForwardingDownstream>(extIface, {
+        .iface = intIface,
+        .active = true
+    }));
+}
+
+void TetherController::markForwardingPairDisabled(
+        const std::string& intIface, const std::string& extIface) {
+    ForwardingDownstream* existingEntry = findForwardingDownstream(intIface, extIface);
+    if (existingEntry == nullptr) {
+        return;
+    }
+
+    existingEntry->active = false;
+}
+
+bool TetherController::isForwardingPairEnabled(
+        const std::string& intIface, const std::string& extIface) {
+    ForwardingDownstream* existingEntry = findForwardingDownstream(intIface, extIface);
+    return existingEntry != nullptr && existingEntry->active;
+}
+
+bool TetherController::isAnyForwardingEnabledOnUpstream(const std::string& extIface) {
+    auto extIfaceMatches = mFwdIfaces.equal_range(extIface);
+    for (auto it = extIfaceMatches.first; it != extIfaceMatches.second; ++it) {
+        if (it->second.active) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TetherController::isAnyForwardingPairEnabled() {
+    for (auto& it : mFwdIfaces) {
+        if (it.second.active) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TetherController::tetherCountingRuleExists(
+        const std::string& iface1, const std::string& iface2) {
+    // A counting rule exists if NAT was ever enabled for this interface pair, so if the pair
+    // is in the map regardless of its active status. Rules are added both ways so we check with
+    // the 2 combinations.
+    return findForwardingDownstream(iface1, iface2) != nullptr
+        || findForwardingDownstream(iface2, iface1) != nullptr;
 }
 
 /* static */
@@ -558,15 +633,11 @@ int TetherController::setForwardRules(bool add, const char *intIface, const char
         "*filter",
     };
 
-    /* We only ever add tethering quota rules so that they stick. */
-    std::string pair1 = StringPrintf("%s_%s", intIface, extIface);
-    if (add && !checkTetherCountingRuleExist(pair1)) {
+    // We only ever add tethering quota rules so that they stick.
+    if (add && !tetherCountingRuleExists(intIface, extIface)) {
         v4.push_back(makeTetherCountingRule(intIface, extIface));
-        v6.push_back(makeTetherCountingRule(intIface, extIface));
-    }
-    std::string pair2 = StringPrintf("%s_%s", extIface, intIface);
-    if (add && !checkTetherCountingRuleExist(pair2)) {
         v4.push_back(makeTetherCountingRule(extIface, intIface));
+        v6.push_back(makeTetherCountingRule(intIface, extIface));
         v6.push_back(makeTetherCountingRule(extIface, intIface));
     }
 
@@ -591,11 +662,10 @@ int TetherController::setForwardRules(bool add, const char *intIface, const char
         return -1;
     }
 
-    if (add && !checkTetherCountingRuleExist(pair1)) {
-        ifacePairList.push_front(pair1);
-    }
-    if (add && !checkTetherCountingRuleExist(pair2)) {
-        ifacePairList.push_front(pair2);
+    if (add) {
+        addForwardingPair(intIface, extIface);
+    } else {
+        markForwardingPairDisabled(intIface, extIface);
     }
 
     return 0;
@@ -608,8 +678,7 @@ int TetherController::disableNat(const char* intIface, const char* extIface) {
     }
 
     setForwardRules(false, intIface, extIface);
-    if (--natCount <= 0) {
-        // handle decrement to 0 case (do reset to defaults) and erroneous dec below 0
+    if (!isAnyForwardingPairEnabled()) {
         setDefaults();
     }
     return 0;

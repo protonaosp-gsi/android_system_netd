@@ -17,88 +17,78 @@
 #ifndef _DNS_DNSTLSTRANSPORT_H
 #define _DNS_DNSTLSTRANSPORT_H
 
-#include <deque>
+#include <future>
+#include <map>
 #include <mutex>
-#include <openssl/ssl.h>
+#include <vector>
 
 #include <android-base/thread_annotations.h>
 #include <android-base/unique_fd.h>
 
+#include "dns/DnsTlsSessionCache.h"
+#include "dns/DnsTlsQueryMap.h"
 #include "dns/DnsTlsServer.h"
+#include "dns/IDnsTlsSocket.h"
+#include "dns/IDnsTlsSocketObserver.h"
+
+#include <netdutils/Slice.h>
 
 namespace android {
 namespace net {
 
-class DnsTlsTransport {
+class IDnsTlsSocketFactory;
+
+// Manages at most one DnsTlsSocket at a time.  This class handles socket lifetime issues,
+// such as reopening the socket and reissuing pending queries.
+class DnsTlsTransport : public IDnsTlsSocketObserver {
 public:
-    DnsTlsTransport(const DnsTlsServer& server, unsigned mark)
-            : mMark(mark), mServer(server)
-            {}
-    ~DnsTlsTransport() {}
+    DnsTlsTransport(const DnsTlsServer& server, unsigned mark,
+                    IDnsTlsSocketFactory* _Nonnull factory) :
+            mMark(mark), mServer(server), mFactory(factory) {}
+    ~DnsTlsTransport();
 
-    // Creates the SSL context for this session.  Returns false on failure.
-    // This method should be called after construction and before use of a DnsTlsTransport.
-    bool initialize();
-    
-    enum class Response : uint8_t { success, network_error, limit_error, internal_error };
+    typedef DnsTlsServer::Response Response;
+    typedef DnsTlsServer::Result Result;
 
-    // Given a |query| of length |qlen|, this method sends it to the server
-    // and writes the response into |ans|, which can accept up to |anssiz| bytes.
-    // The number of bytes is written to |resplen|.  If |resplen| is zero, an
-    // error has occurred.
-    Response query(const uint8_t *query, size_t qlen,
-            uint8_t *ans, size_t anssiz, int *resplen);
+    // Given a |query|, this method sends it to the server and returns the result asynchronously.
+    std::future<Result> query(const netdutils::Slice query) EXCLUDES(mLock);
 
     // Check that a given TLS server is fully working on the specified netid, and has the
     // provided SHA-256 fingerprint (if nonempty).  This function is used in ResolverController
     // to ensure that we don't enable DNS over TLS on networks where it doesn't actually work.
     static bool validate(const DnsTlsServer& server, unsigned netid);
 
+    // Implement IDnsTlsSocketObserver
+    void onResponse(std::vector<uint8_t> response) override;
+    void onClosed() override EXCLUDES(mLock);
+
 private:
-    // Send a query on the provided SSL socket.
-    Response sendQuery(int fd, SSL* ssl, const uint8_t *query, size_t qlen);
+    std::mutex mLock;
 
-    // Wait for the response to |query| on |ssl|, and write it to |ans|, an output buffer
-    // of size |anssiz|.  If |resplen| is zero, the read failed.
-    Response readResponse(int fd, SSL* ssl, const uint8_t *query,
-        uint8_t *ans, size_t anssiz, int *resplen);
-
-    // On success, returns a non-blocking socket connected to mAddr (the
-    // connection will likely be in progress if mProtocol is IPPROTO_TCP).
-    // On error, returns -1 with errno set appropriately.
-    base::unique_fd makeConnectedSocket() const;
-
-    // Connect an SSL session on the provided socket.  If connection fails, closing the
-    // socket remains the caller's responsibility.
-    bssl::UniquePtr<SSL> sslConnect(int fd);
-
-    // Disconnect the SSL session and close the socket.
-    void sslDisconnect(bssl::UniquePtr<SSL> ssl, base::unique_fd fd);
-
-    // Writes a buffer to the socket.
-    bool sslWrite(int fd, SSL *ssl, const uint8_t *buffer, int len);
-
-    // Reads exactly the specified number of bytes from the socket.  Blocking.
-    // Returns false if the socket closes before enough bytes can be read.
-    bool sslRead(int fd, SSL *ssl, uint8_t *buffer, int len);
-
-    // Using SSL_CTX to create new SSL objects is thread-safe, so this object does not
-    // require a lock annotation.
-    bssl::UniquePtr<SSL_CTX> mSslCtx;
+    DnsTlsSessionCache mCache;
+    DnsTlsQueryMap mQueries;
 
     const unsigned mMark;  // Socket mark
     const DnsTlsServer mServer;
+    IDnsTlsSocketFactory* _Nonnull const mFactory;
 
-    // Cache of recently seen SSL_SESSIONs.  This is used to support session tickets.
-    static int newSessionCallback(SSL* ssl, SSL_SESSION* session);
-    void recordSession(SSL_SESSION* session);
-    static void removeSessionCallback(SSL_CTX* ssl_ctx, SSL_SESSION* session);
-    void removeSession(SSL_SESSION* session);
-    std::mutex mLock;
-    std::deque<bssl::UniquePtr<SSL_SESSION>> mSessions GUARDED_BY(mLock);
+    void doConnect() REQUIRES(mLock);
+
+    // doReconnect is used by onClosed.  It runs on the reconnect thread.
+    void doReconnect() EXCLUDES(mLock);
+    std::unique_ptr<std::thread> mReconnectThread GUARDED_BY(mLock);
+
+    // Used to prevent onClosed from starting a reconnect during the destructor.
+    bool mClosing GUARDED_BY(mLock) = false;
+
+    // Sending queries on the socket is thread-safe, but construction/destruction is not.
+    std::unique_ptr<IDnsTlsSocket> mSocket GUARDED_BY(mLock);
+
+    // Send a query to the socket.
+    bool sendQuery(const DnsTlsQueryMap::Query q) REQUIRES(mLock);
 };
 
-}  // namespace net
-}  // namespace android
+}  // end of namespace net
+}  // end of namespace android
 
 #endif  // _DNS_DNSTLSTRANSPORT_H
