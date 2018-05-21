@@ -15,39 +15,6 @@
 LOCAL_PATH := $(call my-dir)
 
 ###
-### netd service AIDL interface.
-###
-include $(CLEAR_VARS)
-
-LOCAL_CFLAGS := -Wall -Werror -Wthread-safety
-LOCAL_SANITIZE := unsigned-integer-overflow
-LOCAL_MODULE := libnetdaidl_static
-LOCAL_SHARED_LIBRARIES := \
-        libbinder \
-        libutils
-LOCAL_EXPORT_C_INCLUDE_DIRS := $(LOCAL_PATH)/binder
-LOCAL_AIDL_INCLUDES := $(LOCAL_PATH)/binder frameworks/native/aidl/binder
-LOCAL_C_INCLUDES := $(LOCAL_PATH)/binder
-LOCAL_SRC_FILES := \
-        binder/android/net/INetd.aidl \
-        binder/android/net/UidRange.cpp
-
-include $(BUILD_STATIC_LIBRARY)
-
-include $(CLEAR_VARS)
-
-LOCAL_CFLAGS := -Wall -Werror -Wthread-safety
-LOCAL_SANITIZE := unsigned-integer-overflow
-LOCAL_MODULE := libnetdaidl
-LOCAL_SHARED_LIBRARIES := \
-        libbinder \
-        libutils
-LOCAL_WHOLE_STATIC_LIBRARIES := libnetdaidl_static
-LOCAL_EXPORT_C_INCLUDE_DIRS := $(LOCAL_PATH)/binder
-
-include $(BUILD_SHARED_LIBRARY)
-
-###
 ### netd daemon.
 ###
 include $(CLEAR_VARS)
@@ -58,8 +25,7 @@ LOCAL_C_INCLUDES := \
         external/mdnsresponder/mDNSShared \
         system/netd/include \
 
-LOCAL_CPPFLAGS := -Wall -Werror -Wthread-safety
-LOCAL_SANITIZE := unsigned-integer-overflow
+LOCAL_CPPFLAGS := -Wall -Werror -Wthread-safety -Wnullable-to-nonnull-conversion
 LOCAL_MODULE := netd
 
 # Bug: http://b/29823425 Disable -Wvarargs for Clang update to r271374
@@ -75,7 +41,9 @@ LOCAL_INIT_RC := netd.rc
 
 LOCAL_SHARED_LIBRARIES := \
         android.system.net.netd@1.0 \
+        android.system.net.netd@1.1 \
         libbinder \
+        libbpf    \
         libcrypto \
         libcutils \
         libdl \
@@ -97,8 +65,6 @@ LOCAL_SHARED_LIBRARIES := \
 
 LOCAL_SRC_FILES := \
         BandwidthController.cpp \
-        BpfProgSets.cpp \
-        BpfUtils.cpp \
         ClatdController.cpp \
         CommandListener.cpp \
         Controllers.cpp \
@@ -136,13 +102,17 @@ LOCAL_SRC_FILES := \
         VirtualNetwork.cpp \
         WakeupController.cpp \
         XfrmController.cpp \
+        TcpSocketMonitor.cpp \
         main.cpp \
         oem_iptables_hook.cpp \
         binder/android/net/UidRange.cpp \
         binder/android/net/metrics/INetdEventListener.aidl \
         dns/DnsTlsDispatcher.cpp \
+        dns/DnsTlsQueryMap.cpp \
         dns/DnsTlsTransport.cpp \
         dns/DnsTlsServer.cpp \
+        dns/DnsTlsSessionCache.cpp \
+        dns/DnsTlsSocket.cpp \
 
 LOCAL_AIDL_INCLUDES := $(LOCAL_PATH)/binder
 
@@ -195,7 +165,9 @@ LOCAL_SRC_FILES := \
         SockDiagTest.cpp SockDiag.cpp \
         StrictController.cpp StrictControllerTest.cpp \
         TetherController.cpp TetherControllerTest.cpp \
+        TrafficController.cpp TrafficControllerTest.cpp \
         XfrmController.cpp XfrmControllerTest.cpp \
+        TcpSocketMonitor.cpp \
         UidRanges.cpp \
         NetlinkListener.cpp \
         WakeupController.cpp WakeupControllerTest.cpp \
@@ -203,10 +175,16 @@ LOCAL_SRC_FILES := \
         binder/android/net/UidRange.cpp \
         binder/android/net/metrics/INetdEventListener.aidl \
         ../tests/tun_interface.cpp \
+        dns/DnsTlsDispatcher.cpp \
+        dns/DnsTlsTransport.cpp \
+        dns/DnsTlsServer.cpp \
+        dns/DnsTlsSessionCache.cpp \
+        dns/DnsTlsSocket.cpp \
 
 LOCAL_MODULE_TAGS := tests
 LOCAL_STATIC_LIBRARIES := libgmock libpcap
 LOCAL_SHARED_LIBRARIES := \
+        libbpf    \
         libnetdaidl \
         libbase \
         libbinder \
@@ -216,6 +194,7 @@ LOCAL_SHARED_LIBRARIES := \
         liblogwrap \
         libnetutils \
         libnetdutils \
+        libqtaguid \
         libsysutils \
         libutils \
         libssl \

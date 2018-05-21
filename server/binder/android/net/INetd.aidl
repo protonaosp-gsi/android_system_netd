@@ -39,7 +39,9 @@ interface INetd {
      * @param uids The list of UIDs to allow/deny.
      * @return true if the chain was successfully replaced, false otherwise.
      */
-    boolean firewallReplaceUidChain(String chainName, boolean isWhitelist, in int[] uids);
+    boolean firewallReplaceUidChain(in @utf8InCpp String chainName,
+                                    boolean isWhitelist,
+                                    in int[] uids);
 
     /**
      * Enables or disables data saver mode on costly network interfaces.
@@ -58,6 +60,94 @@ interface INetd {
      * @return true if the if the operation was successful, false otherwise.
      */
     boolean bandwidthEnableDataSaver(boolean enable);
+
+    // Network permission values.
+    const String PERMISSION_NETWORK = "NETWORK";
+    const String PERMISSION_SYSTEM = "SYSTEM";
+
+    /**
+     * Creates a physical network (i.e., one containing physical interfaces.
+     *
+     * @param netId the networkId to create.
+     * @param permission the permission necessary to use the network. Must be one of the
+     *         PERMISSION_xxx values above.
+     *
+     * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
+     *         unix errno.
+     */
+    void networkCreatePhysical(int netId, in @utf8InCpp String permission);
+
+    /**
+     * Creates a VPN network.
+     *
+     * @param netId the network to create.
+     * @param hasDns whether the VPN has DNS servers.
+     * @param secure whether unprivileged apps are allowed to bypass the VPN.
+     *
+     * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
+     *         unix errno.
+     */
+    void networkCreateVpn(int netId, boolean hasDns, boolean secure);
+
+    /**
+     * Destroys a network. Any interfaces added to the network are removed, and the network ceases
+     * to be the default network.
+     *
+     * @param netId the network to destroy.
+     *
+     * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
+     *         unix errno.
+     */
+    void networkDestroy(int netId);
+
+    /**
+     * Adds an interface to a network. The interface must not be assigned to any network, including
+     * the specified network.
+     *
+     * @param netId the network to add the interface to.
+     * @param interface the name of the interface to add.
+     *
+     * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
+     *         unix errno.
+     */
+    void networkAddInterface(int netId, in @utf8InCpp String iface);
+
+    /**
+     * Adds an interface to a network. The interface must be assigned to the specified network.
+     *
+     * @param netId the network to remove the interface from.
+     * @param interface the name of the interface to remove.
+     *
+     * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
+     *         unix errno.
+     */
+    void networkRemoveInterface(int netId, in @utf8InCpp String iface);
+
+    /**
+     * Adds the specified UID ranges to the specified network. The network must be a VPN. Traffic
+     * from the UID ranges will be routed through the VPN.
+     *
+     * @param netId the network ID of the network to add the ranges to.
+     * @param uidRanges a set of non-overlapping, contiguous ranges of UIDs to add. The ranges
+     *        must not overlap with existing ranges routed to this network.
+     *
+     * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
+     *         unix errno.
+     */
+    void networkAddUidRanges(int netId, in UidRange[] uidRanges);
+
+    /**
+     * Adds the specified UID ranges to the specified network. The network must be a VPN. Traffic
+     * from the UID ranges will no longer be routed through the VPN.
+     *
+     * @param netId the network ID of the network to remove the ranges from.
+     * @param uidRanges a set of non-overlapping, contiguous ranges of UIDs to add. The ranges
+     *        must already be routed to this network.
+     *
+     * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
+     *         unix errno.
+     */
+    void networkRemoveUidRanges(int netId, in UidRange[] uidRanges);
 
     /**
      * Adds or removes one rule for each supplied UID range to prohibit all network activity outside
@@ -104,16 +194,17 @@ interface INetd {
      * @param params the params to set. This array contains RESOLVER_PARAMS_COUNT integers that
      *   encode the contents of Bionic's __res_params struct, i.e. sample_validity is stored at
      *   position RESOLVER_PARAMS_SAMPLE_VALIDITY, etc.
-     * @param useTls If true, try to contact servers over TLS on port 853.
      * @param tlsName The TLS subject name to require for all servers, or empty if there is none.
+     * @param tlsServers the DNS servers to configure for strict mode Private DNS.
      * @param tlsFingerprints An array containing TLS public key fingerprints (pins) of which each
      *   server must match at least one, or empty if there are no pinned keys.
      * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
      *         unix errno.
      */
     void setResolverConfiguration(int netId, in @utf8InCpp String[] servers,
-            in @utf8InCpp String[] domains, in int[] params, boolean useTls,
-            in @utf8InCpp String tlsName, in @utf8InCpp String[] tlsFingerprints);
+            in @utf8InCpp String[] domains, in int[] params,
+            in @utf8InCpp String tlsName, in @utf8InCpp String[] tlsServers,
+            in @utf8InCpp String[] tlsFingerprints);
 
     // Array indices for resolver stats.
     const int RESOLVER_STATS_SUCCESSES = 0;
@@ -226,20 +317,27 @@ interface INetd {
     void setMetricsReportingLevel(int level);
 
    /**
+    * Sets owner of socket FileDescriptor to the new UID, checking to ensure that the caller's
+    * uid is that of the old owner's, and that this is a UDP-encap socket
+    *
+    * @param FileDescriptor socket Socket file descriptor
+    * @param int newUid UID of the new socket fd owner
+    */
+    void ipSecSetEncapSocketOwner(in FileDescriptor socket, int newUid);
+
+   /**
     * Reserve an SPI from the kernel
     *
     * @param transformId a unique identifier for allocated resources
-    * @param direction DIRECTION_IN or DIRECTION_OUT
-    * @param localAddress InetAddress as string for the local endpoint
-    * @param remoteAddress InetAddress as string for the remote endpoint
+    * @param sourceAddress InetAddress as string for the sending endpoint
+    * @param destinationAddress InetAddress as string for the receiving endpoint
     * @param spi a requested 32-bit unique ID or 0 to request random allocation
     * @return the SPI that was allocated or 0 if failed
     */
     int ipSecAllocateSpi(
             int transformId,
-            int direction,
-            in @utf8InCpp String localAddress,
-            in @utf8InCpp String remoteAddress,
+            in @utf8InCpp String sourceAddress,
+            in @utf8InCpp String destinationAddress,
             int spi);
 
    /**
@@ -248,11 +346,12 @@ interface INetd {
     *
     * @param transformId a unique identifier for allocated resources
     * @param mode either Transport or Tunnel mode
-    * @param direction DIRECTION_IN or DIRECTION_OUT
-    * @param localAddress InetAddress as string for the local endpoint
-    * @param remoteAddress InetAddress as string for the remote endpoint
-    * @param underlyingNetworkHandle the networkHandle of the network to which the SA is applied
+    * @param sourceAddress InetAddress as string for the sending endpoint
+    * @param destinationAddress InetAddress as string for the receiving endpoint
+    * @param underlyingNetId the netId of the network to which the SA is applied
     * @param spi a 32-bit unique ID allocated to the user
+    * @param markValue a 32-bit unique ID chosen by the user
+    * @param markMask a 32-bit mask chosen by the user
     * @param authAlgo a string identifying the authentication algorithm to be used
     * @param authKey a byte array containing the authentication key
     * @param authTruncBits the truncation length of the MAC produced by the authentication algorithm
@@ -270,11 +369,12 @@ interface INetd {
     void ipSecAddSecurityAssociation(
             int transformId,
             int mode,
-            int direction,
-            in @utf8InCpp String localAddress,
-            in @utf8InCpp String remoteAddress,
-            long underlyingNetworkHandle,
+            in @utf8InCpp String sourceAddress,
+            in @utf8InCpp String destinationAddress,
+            int underlyingNetId,
             int spi,
+            int markValue,
+            int markMask,
             in @utf8InCpp String authAlgo, in byte[] authKey, in int authTruncBits,
             in @utf8InCpp String cryptAlgo, in byte[] cryptKey, in int cryptTruncBits,
             in @utf8InCpp String aeadAlgo, in byte[] aeadKey, in int aeadIcvBits,
@@ -286,17 +386,19 @@ interface INetd {
     * Delete a previously created security association identified by the provided parameters
     *
     * @param transformId a unique identifier for allocated resources
-    * @param direction DIRECTION_IN or DIRECTION_OUT
-    * @param localAddress InetAddress as string for the local endpoint
-    * @param remoteAddress InetAddress as string for the remote endpoint
+    * @param sourceAddress InetAddress as string for the sending endpoint
+    * @param destinationAddress InetAddress as string for the receiving endpoint
     * @param spi a requested 32-bit unique ID allocated to the user
+    * @param markValue a 32-bit unique ID chosen by the user
+    * @param markMask a 32-bit mask chosen by the user
     */
     void ipSecDeleteSecurityAssociation(
             int transformId,
-            int direction,
-            in @utf8InCpp String localAddress,
-            in @utf8InCpp String remoteAddress,
-            int spi);
+            in @utf8InCpp String sourceAddress,
+            in @utf8InCpp String destinationAddress,
+            int spi,
+            int markValue,
+            int markMask);
 
    /**
     * Apply a previously created SA to a specified socket, starting IPsec on that socket
@@ -304,16 +406,16 @@ interface INetd {
     * @param socket a user-provided socket that will have IPsec applied
     * @param transformId a unique identifier for allocated resources
     * @param direction DIRECTION_IN or DIRECTION_OUT
-    * @param localAddress InetAddress as string for the local endpoint
-    * @param remoteAddress InetAddress as string for the remote endpoint
+    * @param sourceAddress InetAddress as string for the sending endpoint
+    * @param destinationAddress InetAddress as string for the receiving endpoint
     * @param spi a 32-bit unique ID allocated to the user (socket owner)
     */
     void ipSecApplyTransportModeTransform(
             in FileDescriptor socket,
             int transformId,
             int direction,
-            in @utf8InCpp String localAddress,
-            in @utf8InCpp String remoteAddress,
+            in @utf8InCpp String sourceAddress,
+            in @utf8InCpp String destinationAddress,
             int spi);
 
    /**
@@ -324,6 +426,107 @@ interface INetd {
     */
     void ipSecRemoveTransportModeTransform(
             in FileDescriptor socket);
+
+   /**
+    * Adds an IPsec global policy.
+    *
+    * @param transformId a unique identifier for allocated resources
+    * @param direction DIRECTION_IN or DIRECTION_OUT
+    * @param sourceAddress InetAddress as string for the sending endpoint
+    * @param destinationAddress InetAddress as string for the receiving endpoint
+    * @param spi a 32-bit unique ID allocated to the user
+    * @param markValue a 32-bit unique ID chosen by the user
+    * @param markMask a 32-bit mask chosen by the user
+    */
+    void ipSecAddSecurityPolicy(
+            int transformId,
+            int direction,
+            in @utf8InCpp String sourceAddress,
+            in @utf8InCpp String destinationAddress,
+            int spi,
+            int markValue,
+            int markMask);
+
+   /**
+    * Updates an IPsec global policy.
+    *
+    * @param transformId a unique identifier for allocated resources
+    * @param direction DIRECTION_IN or DIRECTION_OUT
+    * @param sourceAddress InetAddress as string for the sending endpoint
+    * @param destinationAddress InetAddress as string for the receiving endpoint
+    * @param spi a 32-bit unique ID allocated to the user
+    * @param markValue a 32-bit unique ID chosen by the user
+    * @param markMask a 32-bit mask chosen by the user
+    */
+    void ipSecUpdateSecurityPolicy(
+            int transformId,
+            int direction,
+            in @utf8InCpp String sourceAddress,
+            in @utf8InCpp String destinationAddress,
+            int spi,
+            int markValue,
+            int markMask);
+
+   /**
+    * Deletes an IPsec global policy.
+    *
+    * @param transformId a unique identifier for allocated resources
+    * @param direction DIRECTION_IN or DIRECTION_OUT
+    * @param sourceAddress InetAddress as string for the sending endpoint
+    * @param destinationAddress InetAddress as string for the receiving endpoint
+    * @param markValue a 32-bit unique ID chosen by the user
+    * @param markMask a 32-bit mask chosen by the user
+    */
+    void ipSecDeleteSecurityPolicy(
+            int transformId,
+            int direction,
+            in @utf8InCpp String sourceAddress,
+            in @utf8InCpp String destinationAddress,
+            int markValue,
+            int markMask);
+
+    // This could not be declared as @uft8InCpp; thus, when used in native code it must be
+    // converted from a UTF-16 string to an ASCII string.
+    const String IPSEC_INTERFACE_PREFIX = "ipsec";
+
+   /**
+    * Add a Virtual Tunnel Interface.
+    *
+    * @param devName a unique identifier that represents the name of the device
+    * @param localAddress InetAddress as string for the local endpoint
+    * @param remoteAddress InetAddress as string for the remote endpoint
+    * @param iKey, to match Policies and SAs for input packets.
+    * @param oKey, to match Policies and SAs for output packets.
+    */
+    void addVirtualTunnelInterface(
+            in @utf8InCpp String deviceName,
+            in @utf8InCpp String localAddress,
+            in @utf8InCpp String remoteAddress,
+            int iKey,
+            int oKey);
+
+   /**
+    * Update a Virtual Tunnel Interface.
+    *
+    * @param devName a unique identifier that represents the name of the device
+    * @param localAddress InetAddress as string for the local endpoint
+    * @param remoteAddress InetAddress as string for the remote endpoint
+    * @param iKey, to match Policies and SAs for input packets.
+    * @param oKey, to match Policies and SAs for output packets.
+    */
+    void updateVirtualTunnelInterface(
+            in @utf8InCpp String deviceName,
+            in @utf8InCpp String localAddress,
+            in @utf8InCpp String remoteAddress,
+            int iKey,
+            int oKey);
+
+   /**
+    * Removes a Virtual Tunnel Interface.
+    *
+    * @param devName a unique identifier that represents the name of the device
+    */
+    void removeVirtualTunnelInterface(in @utf8InCpp String deviceName);
 
    /**
     * Request notification of wakeup packets arriving on an interface. Notifications will be
@@ -354,4 +557,10 @@ interface INetd {
     * @param mode SLAAC address generation mechanism to use
     */
     void setIPv6AddrGenMode(in @utf8InCpp String ifName, int mode);
+
+   /**
+    * Query the netd service to know if the eBPF traffic stats accounting service is currently
+    * running on the device.
+    */
+    boolean trafficCheckBpfStatsEnable();
 }

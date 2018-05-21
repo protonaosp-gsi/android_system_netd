@@ -34,17 +34,40 @@ class NetdNativeService : public BinderService<NetdNativeService>, public BnNetd
     virtual status_t dump(int fd, const Vector<String16> &args) override;
 
     binder::Status isAlive(bool *alive) override;
+
+    // Firewall commands.
     binder::Status firewallReplaceUidChain(
-            const String16& chainName, bool isWhitelist,
+            const std::string& chainName, bool isWhitelist,
             const std::vector<int32_t>& uids, bool *ret) override;
+
+    // Bandwidth control commands.
     binder::Status bandwidthEnableDataSaver(bool enable, bool *ret) override;
+
+    // Network and routing commands.
+    binder::Status networkCreatePhysical(int32_t netId, const std::string& permission)
+            override;
+    binder::Status networkCreateVpn(int32_t netId, bool hasDns, bool secure) override;
+    binder::Status networkDestroy(int32_t netId) override;
+
+    binder::Status networkAddInterface(int32_t netId, const std::string& iface) override;
+    binder::Status networkRemoveInterface(int32_t netId, const std::string& iface) override;
+
+    binder::Status networkAddUidRanges(int32_t netId, const std::vector<UidRange>& uids)
+            override;
+    binder::Status networkRemoveUidRanges(int32_t netId, const std::vector<UidRange>& uids)
+            override;
     binder::Status networkRejectNonSecureVpn(bool enable, const std::vector<UidRange>& uids)
             override;
+
+    // SOCK_DIAG commands.
     binder::Status socketDestroy(const std::vector<UidRange>& uids,
             const std::vector<int32_t>& skipUids) override;
+
+    // Resolver commands.
     binder::Status setResolverConfiguration(int32_t netId, const std::vector<std::string>& servers,
             const std::vector<std::string>& domains, const std::vector<int32_t>& params,
-            bool useTls, const std::string& tlsName,
+            const std::string& tlsName,
+            const std::vector<std::string>& tlsServers,
             const std::vector<std::string>& tlsFingerprints) override;
     binder::Status getResolverInfo(int32_t netId, std::vector<std::string>* servers,
             std::vector<std::string>* domains, std::vector<int32_t>* params,
@@ -63,6 +86,7 @@ class NetdNativeService : public BinderService<NetdNativeService>, public BnNetd
     binder::Status tetherApplyDnsInterfaces(bool *ret) override;
     binder::Status tetherGetStats(android::os::PersistableBundle *ret) override;
 
+    // Interface-related commands.
     binder::Status interfaceAddAddress(const std::string &ifName,
             const std::string &addrString, int prefixLength) override;
     binder::Status interfaceDelAddress(const std::string &ifName,
@@ -76,9 +100,10 @@ class NetdNativeService : public BinderService<NetdNativeService>, public BnNetd
     binder::Status getMetricsReportingLevel(int *reportingLevel) override;
     binder::Status setMetricsReportingLevel(const int reportingLevel) override;
 
+    binder::Status ipSecSetEncapSocketOwner(const android::base::unique_fd& socket, int newUid);
+
     binder::Status ipSecAllocateSpi(
             int32_t transformId,
-            int32_t direction,
             const std::string& localAddress,
             const std::string& remoteAddress,
             int32_t inSpi,
@@ -87,11 +112,12 @@ class NetdNativeService : public BinderService<NetdNativeService>, public BnNetd
     binder::Status ipSecAddSecurityAssociation(
             int32_t transformId,
             int32_t mode,
-            int32_t direction,
-            const std::string& localAddress,
-            const std::string& remoteAddress,
-            int64_t underlyingNetworkHandle,
+            const std::string& sourceAddress,
+            const std::string& destinationAddress,
+            int32_t underlyingNetId,
             int32_t spi,
+            int32_t markValue,
+            int32_t markMask,
             const std::string& authAlgo,
             const std::vector<uint8_t>& authKey,
             int32_t authTruncBits,
@@ -107,21 +133,66 @@ class NetdNativeService : public BinderService<NetdNativeService>, public BnNetd
 
     binder::Status ipSecDeleteSecurityAssociation(
             int32_t transformId,
-            int32_t direction,
-            const std::string& localAddress,
-            const std::string& remoteAddress,
-            int32_t spi);
+            const std::string& sourceAddress,
+            const std::string& destinationAddress,
+            int32_t spi,
+            int32_t markValue,
+            int32_t markMask);
 
     binder::Status ipSecApplyTransportModeTransform(
             const android::base::unique_fd& socket,
             int32_t transformId,
             int32_t direction,
-            const std::string& localAddress,
-            const std::string& remoteAddress,
+            const std::string& sourceAddress,
+            const std::string& destinationAddress,
             int32_t spi);
 
     binder::Status ipSecRemoveTransportModeTransform(
             const android::base::unique_fd& socket);
+
+    binder::Status ipSecAddSecurityPolicy(
+            int32_t transformId,
+            int32_t direction,
+            const std::string& sourceAddress,
+            const std::string& destinationAddress,
+            int32_t spi,
+            int32_t markValue,
+            int32_t markMask);
+
+    binder::Status ipSecUpdateSecurityPolicy(
+            int32_t transformId,
+            int32_t direction,
+            const std::string& sourceAddress,
+            const std::string& destinationAddress,
+            int32_t spi,
+            int32_t markValue,
+            int32_t markMask);
+
+    binder::Status ipSecDeleteSecurityPolicy(
+            int32_t transformId,
+            int32_t direction,
+            const std::string& sourceAddress,
+            const std::string& destinationAddress,
+            int32_t markValue,
+            int32_t markMask);
+
+    binder::Status trafficCheckBpfStatsEnable(bool* ret) override;
+
+    binder::Status addVirtualTunnelInterface(
+            const std::string& deviceName,
+            const std::string& localAddress,
+            const std::string& remoteAddress,
+            int32_t iKey,
+            int32_t oKey);
+
+    binder::Status updateVirtualTunnelInterface(
+            const std::string& deviceName,
+            const std::string& localAddress,
+            const std::string& remoteAddress,
+            int32_t iKey,
+            int32_t oKey);
+
+    binder::Status removeVirtualTunnelInterface(const std::string& deviceName);
 };
 
 }  // namespace net

@@ -136,24 +136,27 @@ const char *familyName(uint8_t family) {
     }
 }
 
-// No locks needed because RouteController is accessed only from one thread (in CommandListener).
-std::map<std::string, uint32_t> interfaceToTable;
-
-uint32_t getRouteTableForInterface(const char* interface) {
+// Caller must hold sInterfaceToTableLock.
+uint32_t RouteController::getRouteTableForInterfaceLocked(const char* interface) {
     uint32_t index = if_nametoindex(interface);
     if (index) {
         index += RouteController::ROUTE_TABLE_OFFSET_FROM_INDEX;
-        interfaceToTable[interface] = index;
+        sInterfaceToTable[interface] = index;
         return index;
     }
     // If the interface goes away if_nametoindex() will return 0 but we still need to know
     // the index so we can remove the rules and routes.
-    auto iter = interfaceToTable.find(interface);
-    if (iter == interfaceToTable.end()) {
+    auto iter = sInterfaceToTable.find(interface);
+    if (iter == sInterfaceToTable.end()) {
         ALOGE("cannot find interface %s", interface);
         return RT_TABLE_UNSPEC;
     }
     return iter->second;
+}
+
+uint32_t RouteController::getRouteTableForInterface(const char* interface) {
+    android::RWLock::AutoRLock lock(sInterfaceToTableLock);
+    return getRouteTableForInterfaceLocked(interface);
 }
 
 void addTableName(uint32_t table, const std::string& name, std::string* contents) {
@@ -166,7 +169,7 @@ void addTableName(uint32_t table, const std::string& name, std::string* contents
 }
 
 // Doesn't return success/failure as the file is optional; it's okay if we fail to update it.
-void updateTableNamesFile() {
+void RouteController::updateTableNamesFile() {
     std::string contents;
 
     addTableName(RT_TABLE_LOCAL, ROUTE_TABLE_NAME_LOCAL, &contents);
@@ -176,7 +179,8 @@ void updateTableNamesFile() {
     addTableName(ROUTE_TABLE_LEGACY_NETWORK, ROUTE_TABLE_NAME_LEGACY_NETWORK, &contents);
     addTableName(ROUTE_TABLE_LEGACY_SYSTEM,  ROUTE_TABLE_NAME_LEGACY_SYSTEM,  &contents);
 
-    for (const auto& entry : interfaceToTable) {
+    android::RWLock::AutoRLock lock(sInterfaceToTableLock);
+    for (const auto& entry : sInterfaceToTable) {
         addTableName(entry.second, entry.first, &contents);
     }
 
@@ -425,9 +429,11 @@ WARN_UNUSED_RESULT int modifyIncomingPacketMark(unsigned netId, const char* inte
     fwmark.protectedFromVpn = true;
     fwmark.permission = permission;
 
-    std::string cmd = StringPrintf("%s %s -i %s -j MARK --set-mark 0x%x",
-                                   add ? "-A" : "-D", RouteController::LOCAL_MANGLE_INPUT,
-                                   interface, fwmark.intValue);
+    const uint32_t mask = ~Fwmark::getUidBillingMask();
+
+    std::string cmd = StringPrintf(
+        "%s %s -i %s -j MARK --set-mark 0x%x/0x%x", add ? "-A" : "-D",
+        RouteController::LOCAL_MANGLE_INPUT, interface, fwmark.intValue, mask);
     if (RouteController::iptablesRestoreCommandFunction(V4V6, "mangle", cmd, nullptr) != 0) {
         ALOGE("failed to change iptables rule that sets incoming packet mark");
         return -EREMOTEIO;
@@ -519,7 +525,7 @@ WARN_UNUSED_RESULT int modifyExplicitNetworkRule(unsigned netId, uint32_t table,
     mask.permission = permission;
 
     return modifyIpRule(add ? RTM_NEWRULE : RTM_DELRULE, RULE_PRIORITY_EXPLICIT_NETWORK, table,
-                        fwmark.intValue, mask.intValue, IIF_NONE, OIF_NONE, uidStart, uidEnd);
+                        fwmark.intValue, mask.intValue, IIF_LOOPBACK, OIF_NONE, uidStart, uidEnd);
 }
 
 // A rule to route traffic based on a chosen outgoing interface.
@@ -536,17 +542,18 @@ WARN_UNUSED_RESULT int modifyOutputInterfaceRules(const char* interface, uint32_
     mask.permission = permission;
 
     // If this rule does not specify a UID range, then also add a corresponding high-priority rule
-    // for root. This covers forwarded packets and system daemons such as the tethering DHCP server.
+    // for root. This covers kernel-originated packets, TEEd packets and any local daemons that open
+    // sockets as root.
     if (uidStart == INVALID_UID && uidEnd == INVALID_UID) {
         if (int ret = modifyIpRule(add ? RTM_NEWRULE : RTM_DELRULE, RULE_PRIORITY_VPN_OVERRIDE_OIF,
-                                   table, FWMARK_NONE, MASK_NONE, IIF_NONE, interface,
+                                   table, FWMARK_NONE, MASK_NONE, IIF_LOOPBACK, interface,
                                    UID_ROOT, UID_ROOT)) {
             return ret;
         }
     }
 
     return modifyIpRule(add ? RTM_NEWRULE : RTM_DELRULE, RULE_PRIORITY_OUTPUT_INTERFACE, table,
-                        fwmark.intValue, mask.intValue, IIF_NONE, interface, uidStart, uidEnd);
+                        fwmark.intValue, mask.intValue, IIF_LOOPBACK, interface, uidStart, uidEnd);
 }
 
 // A rule to route traffic based on the chosen network.
@@ -568,7 +575,8 @@ WARN_UNUSED_RESULT int modifyImplicitNetworkRule(unsigned netId, uint32_t table,
     mask.permission = PERMISSION_NONE;
 
     return modifyIpRule(add ? RTM_NEWRULE : RTM_DELRULE, RULE_PRIORITY_IMPLICIT_NETWORK, table,
-                        fwmark.intValue, mask.intValue);
+                        fwmark.intValue, mask.intValue, IIF_LOOPBACK, OIF_NONE, INVALID_UID,
+                        INVALID_UID);
 }
 
 // A rule to enable split tunnel VPNs.
@@ -576,9 +584,9 @@ WARN_UNUSED_RESULT int modifyImplicitNetworkRule(unsigned netId, uint32_t table,
 // If a packet with a VPN's netId doesn't find a route in the VPN's routing table, it's allowed to
 // go over the default network, provided it wasn't explicitly restricted to the VPN and has the
 // permissions required by the default network.
-WARN_UNUSED_RESULT int modifyVpnFallthroughRule(uint16_t action, unsigned vpnNetId,
-                                                const char* physicalInterface,
-                                                Permission permission) {
+WARN_UNUSED_RESULT int RouteController::modifyVpnFallthroughRule(uint16_t action, unsigned vpnNetId,
+                                                                 const char* physicalInterface,
+                                                                 Permission permission) {
     uint32_t table = getRouteTableForInterface(physicalInterface);
     if (table == RT_TABLE_UNSPEC) {
         return -ESRCH;
@@ -643,7 +651,8 @@ WARN_UNUSED_RESULT int addLocalNetworkRules(unsigned localNetId) {
                         fwmark.intValue, mask.intValue);
 }
 
-int configureDummyNetwork() {
+/* static */
+int RouteController::configureDummyNetwork() {
     const char *interface = DummyNetwork::INTERFACE_NAME;
     uint32_t table = getRouteTableForInterface(interface);
     if (table == RT_TABLE_UNSPEC) {
@@ -693,8 +702,9 @@ WARN_UNUSED_RESULT int modifyLocalNetwork(unsigned netId, const char* interface,
                                       INVALID_UID, INVALID_UID, add);
 }
 
-WARN_UNUSED_RESULT int modifyPhysicalNetwork(unsigned netId, const char* interface,
-                                             Permission permission, bool add) {
+/* static */
+WARN_UNUSED_RESULT int RouteController::modifyPhysicalNetwork(unsigned netId, const char* interface,
+                                                              Permission permission, bool add) {
     uint32_t table = getRouteTableForInterface(interface);
     if (table == RT_TABLE_UNSPEC) {
         return -ESRCH;
@@ -756,9 +766,10 @@ WARN_UNUSED_RESULT int modifyRejectNonSecureNetworkRule(const UidRanges& uidRang
     return 0;
 }
 
-WARN_UNUSED_RESULT int modifyVirtualNetwork(unsigned netId, const char* interface,
-                                            const UidRanges& uidRanges, bool secure, bool add,
-                                            bool modifyNonUidBasedRules) {
+WARN_UNUSED_RESULT int RouteController::modifyVirtualNetwork(unsigned netId, const char* interface,
+                                                             const UidRanges& uidRanges,
+                                                             bool secure, bool add,
+                                                             bool modifyNonUidBasedRules) {
     uint32_t table = getRouteTableForInterface(interface);
     if (table == RT_TABLE_UNSPEC) {
         return -ESRCH;
@@ -795,8 +806,8 @@ WARN_UNUSED_RESULT int modifyVirtualNetwork(unsigned netId, const char* interfac
     return 0;
 }
 
-WARN_UNUSED_RESULT int modifyDefaultNetwork(uint16_t action, const char* interface,
-                                            Permission permission) {
+WARN_UNUSED_RESULT int RouteController::modifyDefaultNetwork(uint16_t action, const char* interface,
+                                                             Permission permission) {
     uint32_t table = getRouteTableForInterface(interface);
     if (table == RT_TABLE_UNSPEC) {
         return -ESRCH;
@@ -812,11 +823,12 @@ WARN_UNUSED_RESULT int modifyDefaultNetwork(uint16_t action, const char* interfa
     mask.permission = permission;
 
     return modifyIpRule(action, RULE_PRIORITY_DEFAULT_NETWORK, table, fwmark.intValue,
-                        mask.intValue);
+                        mask.intValue, IIF_LOOPBACK, OIF_NONE, INVALID_UID, INVALID_UID);
 }
 
-WARN_UNUSED_RESULT int modifyTetheredNetwork(uint16_t action, const char* inputInterface,
-                                             const char* outputInterface) {
+WARN_UNUSED_RESULT int RouteController::modifyTetheredNetwork(uint16_t action,
+                                                              const char* inputInterface,
+                                                              const char* outputInterface) {
     uint32_t table = getRouteTableForInterface(outputInterface);
     if (table == RT_TABLE_UNSPEC) {
         return -ESRCH;
@@ -828,8 +840,9 @@ WARN_UNUSED_RESULT int modifyTetheredNetwork(uint16_t action, const char* inputI
 
 // Adds or removes an IPv4 or IPv6 route to the specified table.
 // Returns 0 on success or negative errno on failure.
-WARN_UNUSED_RESULT int modifyRoute(uint16_t action, const char* interface, const char* destination,
-                                   const char* nexthop, RouteController::TableType tableType) {
+WARN_UNUSED_RESULT int RouteController::modifyRoute(uint16_t action, const char* interface,
+                                                    const char* destination, const char* nexthop,
+                                                    TableType tableType) {
     uint32_t table;
     switch (tableType) {
         case RouteController::INTERFACE: {
@@ -892,7 +905,7 @@ WARN_UNUSED_RESULT int flushRules() {
     return rtNetlinkFlush(RTM_GETRULE, RTM_DELRULE, "rules", shouldDelete);
 }
 
-WARN_UNUSED_RESULT int flushRoutes(uint32_t table) {
+WARN_UNUSED_RESULT int RouteController::flushRoutes(uint32_t table) {
     NetlinkDumpFilter shouldDelete = [table] (nlmsghdr *nlh) {
         return getRouteTable(nlh) == table;
     };
@@ -901,8 +914,10 @@ WARN_UNUSED_RESULT int flushRoutes(uint32_t table) {
 }
 
 // Returns 0 on success or negative errno on failure.
-WARN_UNUSED_RESULT int flushRoutes(const char* interface) {
-    uint32_t table = getRouteTableForInterface(interface);
+WARN_UNUSED_RESULT int RouteController::flushRoutes(const char* interface) {
+    android::RWLock::AutoWLock lock(sInterfaceToTableLock);
+
+    uint32_t table = getRouteTableForInterfaceLocked(interface);
     if (table == RT_TABLE_UNSPEC) {
         return -ESRCH;
     }
@@ -912,7 +927,7 @@ WARN_UNUSED_RESULT int flushRoutes(const char* interface) {
     // If we failed to flush routes, the caller may elect to keep this interface around, so keep
     // track of its name.
     if (ret == 0) {
-        interfaceToTable.erase(interface);
+        sInterfaceToTable.erase(interface);
     }
 
     return ret;
@@ -1060,6 +1075,11 @@ int RouteController::removeVirtualNetworkFallthrough(unsigned vpnNetId,
                                                      Permission permission) {
     return modifyVpnFallthroughRule(RTM_DELRULE, vpnNetId, physicalInterface, permission);
 }
+
+// Protects sInterfaceToTable.
+android::RWLock RouteController::sInterfaceToTableLock;
+
+std::map<std::string, uint32_t> RouteController::sInterfaceToTable;
 
 }  // namespace net
 }  // namespace android
