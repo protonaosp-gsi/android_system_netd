@@ -28,6 +28,8 @@
 #define LOG_TAG "Netd"
 #include "log/log.h"
 
+#include <android-base/strings.h>
+
 #include "cutils/misc.h"
 #include "resolv_netid.h"
 
@@ -147,12 +149,12 @@ NetworkController::NetworkController() :
 }
 
 unsigned NetworkController::getDefaultNetwork() const {
-    android::RWLock::AutoRLock lock(mRWLock);
+    ScopedRLock lock(mRWLock);
     return mDefaultNetId;
 }
 
 int NetworkController::setDefaultNetwork(unsigned netId) {
-    android::RWLock::AutoWLock lock(mRWLock);
+    ScopedWLock lock(mRWLock);
 
     if (netId == mDefaultNetId) {
         return 0;
@@ -192,6 +194,19 @@ uint32_t NetworkController::getNetworkForDnsLocked(unsigned* netId, uid_t uid) c
     Fwmark fwmark;
     fwmark.protectedFromVpn = true;
     fwmark.permission = PERMISSION_SYSTEM;
+
+    // Common case: there is no VPN that applies to the user, and the query did not specify a netId.
+    // Therefore, it is safe to set the explicit bit on this query and skip all the complex logic
+    // below. While this looks like a special case, it is actually the one that handles the vast
+    // majority of DNS queries.
+    // TODO: untangle this code.
+    if (*netId == NETID_UNSET && getVirtualNetworkForUserLocked(uid) == nullptr) {
+        *netId = mDefaultNetId;
+        fwmark.netId = *netId;
+        fwmark.explicitlySelected = true;
+        return fwmark.intValue;
+    }
+
     if (checkUserNetworkAccessLocked(uid, *netId) == 0) {
         // If a non-zero NetId was explicitly specified, and the user has permission for that
         // network, use that network's DNS servers. Do not fall through to the default network even
@@ -210,7 +225,8 @@ uint32_t NetworkController::getNetworkForDnsLocked(unsigned* netId, uid_t uid) c
     } else {
         // If the user is subject to a VPN and the VPN provides DNS servers, use those servers
         // (possibly falling through to the default network if the VPN doesn't provide a route to
-        // them). Otherwise, use the default network's DNS servers.
+        // them). Otherwise, use the default network's DNS servers. We cannot set the explicit bit
+        // because we need to be able to fall through a split tunnel to the default network.
         VirtualNetwork* virtualNetwork = getVirtualNetworkForUserLocked(uid);
         if (virtualNetwork && virtualNetwork->getHasDns()) {
             *netId = virtualNetwork->getNetId();
@@ -225,14 +241,14 @@ uint32_t NetworkController::getNetworkForDnsLocked(unsigned* netId, uid_t uid) c
 }
 
 uint32_t NetworkController::getNetworkForDns(unsigned* netId, uid_t uid) const {
-    android::RWLock::AutoRLock lock(mRWLock);
+    ScopedRLock lock(mRWLock);
     return getNetworkForDnsLocked(netId, uid);
 }
 
 // Returns the NetId that a given UID would use if no network is explicitly selected. Specifically,
 // the VPN that applies to the UID if any; otherwise, the default network.
 unsigned NetworkController::getNetworkForUser(uid_t uid) const {
-    android::RWLock::AutoRLock lock(mRWLock);
+    ScopedRLock lock(mRWLock);
     if (VirtualNetwork* virtualNetwork = getVirtualNetworkForUserLocked(uid)) {
         return virtualNetwork->getNetId();
     }
@@ -262,13 +278,13 @@ unsigned NetworkController::getNetworkForConnectLocked(uid_t uid) const {
 }
 
 unsigned NetworkController::getNetworkForConnect(uid_t uid) const {
-    android::RWLock::AutoRLock lock(mRWLock);
+    ScopedRLock lock(mRWLock);
     return getNetworkForConnectLocked(uid);
 }
 
 void NetworkController::getNetworkContext(
         unsigned netId, uid_t uid, struct android_net_context* netcontext) const {
-    android::RWLock::AutoRLock lock(mRWLock);
+    ScopedRLock lock(mRWLock);
 
     struct android_net_context nc = {
             .app_netid = netId,
@@ -325,12 +341,16 @@ unsigned NetworkController::getNetworkForInterfaceLocked(const char* interface) 
 }
 
 unsigned NetworkController::getNetworkForInterface(const char* interface) const {
-    android::RWLock::AutoRLock lock(mRWLock);
+    ScopedRLock lock(mRWLock);
     return getNetworkForInterfaceLocked(interface);
 }
 
 bool NetworkController::isVirtualNetwork(unsigned netId) const {
-    android::RWLock::AutoRLock lock(mRWLock);
+    ScopedRLock lock(mRWLock);
+    return isVirtualNetworkLocked(netId);
+}
+
+bool NetworkController::isVirtualNetworkLocked(unsigned netId) const {
     Network* network = getNetworkLocked(netId);
     return network && network->getType() == Network::VIRTUAL;
 }
@@ -362,7 +382,7 @@ int NetworkController::createPhysicalNetworkLocked(unsigned netId, Permission pe
 }
 
 int NetworkController::createPhysicalNetwork(unsigned netId, Permission permission) {
-    android::RWLock::AutoWLock lock(mRWLock);
+    ScopedWLock lock(mRWLock);
     return createPhysicalNetworkLocked(netId, permission);
 }
 
@@ -371,7 +391,7 @@ int NetworkController::createPhysicalOemNetwork(Permission permission, unsigned 
         return -EINVAL;
     }
 
-    android::RWLock::AutoWLock lock(mRWLock);
+    ScopedWLock lock(mRWLock);
     for (*pNetId = MIN_OEM_ID; *pNetId <= MAX_OEM_ID; (*pNetId)++) {
         if (!isValidNetworkLocked(*pNetId)) {
             break;
@@ -393,7 +413,7 @@ int NetworkController::createPhysicalOemNetwork(Permission permission, unsigned 
 }
 
 int NetworkController::createVirtualNetwork(unsigned netId, bool hasDns, bool secure) {
-    android::RWLock::AutoWLock lock(mRWLock);
+    ScopedWLock lock(mRWLock);
 
     if (!(MIN_NET_ID <= netId && netId <= MAX_NET_ID)) {
         ALOGE("invalid netId %u", netId);
@@ -413,7 +433,7 @@ int NetworkController::createVirtualNetwork(unsigned netId, bool hasDns, bool se
 }
 
 int NetworkController::destroyNetwork(unsigned netId) {
-    android::RWLock::AutoWLock lock(mRWLock);
+    ScopedWLock lock(mRWLock);
 
     if (netId == LOCAL_NET_ID) {
         ALOGE("cannot destroy local network");
@@ -452,13 +472,21 @@ int NetworkController::destroyNetwork(unsigned netId) {
     delete network;
     _resolv_delete_cache_for_net(netId);
 
+    for (auto iter = mIfindexToLastNetId.begin(); iter != mIfindexToLastNetId.end();) {
+        if (iter->second == netId) {
+            iter = mIfindexToLastNetId.erase(iter);
+        } else {
+            ++iter;
+        }
+    }
+
     updateTcpSocketMonitorPolling();
 
     return ret;
 }
 
 int NetworkController::addInterfaceToNetwork(unsigned netId, const char* interface) {
-    android::RWLock::AutoWLock lock(mRWLock);
+    ScopedWLock lock(mRWLock);
 
     if (!isValidNetworkLocked(netId)) {
         ALOGE("no such netId %u", netId);
@@ -470,12 +498,22 @@ int NetworkController::addInterfaceToNetwork(unsigned netId, const char* interfa
         ALOGE("interface %s already assigned to netId %u", interface, existingNetId);
         return -EBUSY;
     }
+    if (int ret = getNetworkLocked(netId)->addInterface(interface)) {
+        return ret;
+    }
 
-    return getNetworkLocked(netId)->addInterface(interface);
+    int ifIndex = RouteController::getIfIndex(interface);
+    if (ifIndex) {
+        mIfindexToLastNetId[ifIndex] = netId;
+    } else {
+        // Cannot happen, since addInterface() above will have failed.
+        ALOGE("inconceivable! added interface %s with no index", interface);
+    }
+    return 0;
 }
 
 int NetworkController::removeInterfaceFromNetwork(unsigned netId, const char* interface) {
-    android::RWLock::AutoWLock lock(mRWLock);
+    ScopedWLock lock(mRWLock);
 
     if (!isValidNetworkLocked(netId)) {
         ALOGE("no such netId %u", netId);
@@ -486,26 +524,26 @@ int NetworkController::removeInterfaceFromNetwork(unsigned netId, const char* in
 }
 
 Permission NetworkController::getPermissionForUser(uid_t uid) const {
-    android::RWLock::AutoRLock lock(mRWLock);
+    ScopedRLock lock(mRWLock);
     return getPermissionForUserLocked(uid);
 }
 
 void NetworkController::setPermissionForUsers(Permission permission,
                                               const std::vector<uid_t>& uids) {
-    android::RWLock::AutoWLock lock(mRWLock);
+    ScopedWLock lock(mRWLock);
     for (uid_t uid : uids) {
         mUsers[uid] = permission;
     }
 }
 
 int NetworkController::checkUserNetworkAccess(uid_t uid, unsigned netId) const {
-    android::RWLock::AutoRLock lock(mRWLock);
+    ScopedRLock lock(mRWLock);
     return checkUserNetworkAccessLocked(uid, netId);
 }
 
 int NetworkController::setPermissionForNetworks(Permission permission,
                                                 const std::vector<unsigned>& netIds) {
-    android::RWLock::AutoWLock lock(mRWLock);
+    ScopedWLock lock(mRWLock);
     for (unsigned netId : netIds) {
         Network* network = getNetworkLocked(netId);
         if (!network) {
@@ -525,7 +563,7 @@ int NetworkController::setPermissionForNetworks(Permission permission,
 }
 
 int NetworkController::addUsersToNetwork(unsigned netId, const UidRanges& uidRanges) {
-    android::RWLock::AutoWLock lock(mRWLock);
+    ScopedWLock lock(mRWLock);
     Network* network = getNetworkLocked(netId);
     if (!network) {
         ALOGE("no such netId %u", netId);
@@ -542,7 +580,7 @@ int NetworkController::addUsersToNetwork(unsigned netId, const UidRanges& uidRan
 }
 
 int NetworkController::removeUsersFromNetwork(unsigned netId, const UidRanges& uidRanges) {
-    android::RWLock::AutoWLock lock(mRWLock);
+    ScopedWLock lock(mRWLock);
     Network* network = getNetworkLocked(netId);
     if (!network) {
         ALOGE("no such netId %u", netId);
@@ -569,30 +607,78 @@ int NetworkController::removeRoute(unsigned netId, const char* interface, const 
     return modifyRoute(netId, interface, destination, nexthop, false, legacy, uid);
 }
 
+void NetworkController::addInterfaceAddress(unsigned ifIndex, const char* address) {
+    ScopedWLock lock(mRWLock);
+    if (ifIndex == 0) {
+        ALOGE("Attempting to add address %s without ifindex", address);
+        return;
+    }
+    mAddressToIfindices[address].insert(ifIndex);
+}
+
+// Returns whether we should call SOCK_DESTROY on the removed address.
+bool NetworkController::removeInterfaceAddress(unsigned ifindex, const char* address) {
+    ScopedWLock lock(mRWLock);
+    // First, update mAddressToIfindices map
+    auto ifindicesIter = mAddressToIfindices.find(address);
+    if (ifindicesIter == mAddressToIfindices.end()) {
+        ALOGE("Removing unknown address %s from ifindex %u", address, ifindex);
+        return true;
+    }
+    std::unordered_set<unsigned>& ifindices = ifindicesIter->second;
+    if (ifindices.erase(ifindex) > 0) {
+        if (ifindices.size() == 0) {
+            mAddressToIfindices.erase(ifindicesIter);  // Invalidates ifindices
+            // The address is no longer configured on any interface.
+            return true;
+        }
+    } else {
+        ALOGE("No record of address %s on interface %u", address, ifindex);
+        return true;
+    }
+    // Then, check for VPN handover condition
+    if (mIfindexToLastNetId.find(ifindex) == mIfindexToLastNetId.end()) {
+        ALOGE("Interface index %u was never in a currently-connected netId", ifindex);
+        return true;
+    }
+    unsigned lastNetId = mIfindexToLastNetId[ifindex];
+    for (unsigned idx : ifindices) {
+        unsigned activeNetId = mIfindexToLastNetId[idx];
+        // If this IP address is still assigned to another interface in the same network,
+        // then we don't need to destroy sockets on it because they are likely still valid.
+        // For now we do this only on VPNs.
+        // TODO: evaluate extending this to all network types.
+        if (lastNetId == activeNetId && isVirtualNetworkLocked(activeNetId)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool NetworkController::canProtectLocked(uid_t uid) const {
     return ((getPermissionForUserLocked(uid) & PERMISSION_SYSTEM) == PERMISSION_SYSTEM) ||
            mProtectableUsers.find(uid) != mProtectableUsers.end();
 }
 
 bool NetworkController::canProtect(uid_t uid) const {
-    android::RWLock::AutoRLock lock(mRWLock);
+    ScopedRLock lock(mRWLock);
     return canProtectLocked(uid);
 }
 
 void NetworkController::allowProtect(const std::vector<uid_t>& uids) {
-    android::RWLock::AutoWLock lock(mRWLock);
+    ScopedWLock lock(mRWLock);
     mProtectableUsers.insert(uids.begin(), uids.end());
 }
 
 void NetworkController::denyProtect(const std::vector<uid_t>& uids) {
-    android::RWLock::AutoWLock lock(mRWLock);
+    ScopedWLock lock(mRWLock);
     for (uid_t uid : uids) {
         mProtectableUsers.erase(uid);
     }
 }
 
 void NetworkController::dump(DumpWriter& dw) {
-    android::RWLock::AutoRLock lock(mRWLock);
+    ScopedRLock lock(mRWLock);
 
     dw.incIndent();
     dw.println("NetworkController");
@@ -605,7 +691,7 @@ void NetworkController::dump(DumpWriter& dw) {
     dw.incIndent();
     for (const auto& i : mNetworks) {
         Network* network = i.second;
-        dw.println(network->toString().c_str());
+        dw.println(network->toString());
         if (network->getType() == Network::PHYSICAL) {
             dw.incIndent();
             Permission permission = reinterpret_cast<PhysicalNetwork*>(network)->getPermission();
@@ -614,6 +700,23 @@ void NetworkController::dump(DumpWriter& dw) {
         }
         android::net::gCtls->resolverCtrl.dump(dw, i.first);
         dw.blankline();
+    }
+    dw.decIndent();
+
+    dw.blankline();
+    dw.println("Interface <-> last network map:");
+    dw.incIndent();
+    for (const auto& i : mIfindexToLastNetId) {
+        dw.println("Ifindex: %u NetId: %u", i.first, i.second);
+    }
+    dw.decIndent();
+
+    dw.blankline();
+    dw.println("Interface addresses:");
+    dw.incIndent();
+    for (const auto& i : mAddressToIfindices) {
+        dw.println("address: %s ifindices: [%s]", i.first.c_str(),
+                android::base::Join(i.second, ", ").c_str());
     }
     dw.decIndent();
 
@@ -680,7 +783,7 @@ int NetworkController::checkUserNetworkAccessLocked(uid_t uid, unsigned netId) c
 
 int NetworkController::modifyRoute(unsigned netId, const char* interface, const char* destination,
                                    const char* nexthop, bool add, bool legacy, uid_t uid) {
-    android::RWLock::AutoRLock lock(mRWLock);
+    ScopedRLock lock(mRWLock);
 
     if (!isValidNetworkLocked(netId)) {
         ALOGE("no such netId %u", netId);

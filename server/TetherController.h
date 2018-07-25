@@ -26,10 +26,9 @@
 
 #include "NetdConstants.h"
 
+
 namespace android {
 namespace net {
-
-using android::netdutils::StatusOr;
 
 class TetherController {
 private:
@@ -52,8 +51,21 @@ private:
     int                    mDaemonFd = -1;
     std::set<std::string>  mForwardingRequests;
 
-public:
+    struct DnsmasqState {
+        static int sendCmd(int daemonFd, const std::string& cmd);
 
+        // List of downstream interfaces on which to serve. The format used is:
+        //     update_ifaces|<ifname1>|<ifname2>|...
+        std::string update_ifaces_cmd;
+        // Forwarding (upstream) DNS configuration to use. The format used is:
+        //     update_dns|<hex_socket_mark>|<ip1>|<ip2>|...
+        std::string update_dns_cmd;
+
+        void clear();
+        int sendAllState(int daemonFd) const;
+    } mDnsmasqState{};
+
+  public:
     TetherController();
     ~TetherController() = default;
 
@@ -108,7 +120,7 @@ public:
 
     typedef std::vector<TetherStats> TetherStatsList;
 
-    StatusOr<TetherStatsList> getTetherStats();
+    netdutils::StatusOr<TetherStatsList> getTetherStats();
 
     /*
      * extraProcessingInfo: contains raw parsed data, and error info.
@@ -126,7 +138,7 @@ public:
     static constexpr const char* LOCAL_RAW_PREROUTING        = "tetherctrl_raw_PREROUTING";
     static constexpr const char* LOCAL_TETHER_COUNTERS_CHAIN = "tetherctrl_counters";
 
-    android::RWLock lock;
+    std::mutex lock;
 
 private:
     bool setIpFwdEnabled();

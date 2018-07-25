@@ -14,7 +14,22 @@
  * limitations under the License.
  */
 
+/*
+ * This h file together with bpf_kern.c is used for compiling the eBPF kernel
+ * program. To generate the bpf_kern.o file manually, use the clang prebuilt in
+ * this android tree to compile the files with --target=bpf options. For
+ * example, in system/netd/ directory, execute the following command:
+ * $: ANDROID_BASE_DIRECTORY/prebuilts/clang/host/linux-x86/clang-4691093/bin/clang  \
+ *    -I ANDROID_BASE_DIRECTORY/bionic/libc/kernel/uapi/ \
+ *    -I ANDROID_BASE_DIRECTORY/system/netd/bpfloader/ \
+ *    -I ANDROID_BASE_DIRECTORY/bionic/libc/kernel/android/uapi/ \
+ *    -I ANDROID_BASE_DIRECTORY/bionic/libc/include \
+ *    -I ANDROID_BASE_DIRECTORY/system/netd/libbpf/include  \
+ *    --target=bpf -O2 -c bpfloader/bpf_kern.c -o bpfloader/bpf_kern.o
+ */
+
 #include <linux/bpf.h>
+#include <linux/if.h>
 #include <linux/if_ether.h>
 #include <linux/in.h>
 #include <linux/in6.h>
@@ -53,8 +68,15 @@ static uint64_t (*get_socket_cookie)(struct __sk_buff* skb) = (void*)BPF_FUNC_ge
 static uint32_t (*get_socket_uid)(struct __sk_buff* skb) = (void*)BPF_FUNC_get_socket_uid;
 static int (*bpf_skb_load_bytes)(struct __sk_buff* skb, int off, void* to,
                                  int len) = (void*)BPF_FUNC_skb_load_bytes;
+
+// This is defined for cgroup bpf filter only.
 #define BPF_PASS 1
 #define BPF_DROP 0
+
+// This is used for xt_bpf program only.
+#define BPF_NOMATCH 0
+#define BPF_MATCH 1
+
 #define BPF_EGRESS 0
 #define BPF_INGRESS 1
 
@@ -63,6 +85,10 @@ static int (*bpf_skb_load_bytes)(struct __sk_buff* skb, int off, void* to,
 #define IPPROTO_IHL_OFF 0
 #define TCP_FLAG_OFF 13
 #define RST_OFFSET 2
+
+static __always_inline int is_system_uid(uint32_t uid) {
+    return (uid <= MAX_SYSTEM_UID) && (uid >= MIN_SYSTEM_UID);
+}
 
 static __always_inline inline void bpf_update_stats(struct __sk_buff* skb, uint64_t map,
                                                     int direction, void *key) {
@@ -171,16 +197,15 @@ static __always_inline inline int bpf_traffic_account(struct __sk_buff* skb, int
 
     struct stats_key key = {.uid = uid, .tag = tag, .counterSet = 0, .ifaceIndex = skb->ifindex};
 
-    uint32_t* counterSet;
-    counterSet = find_map_entry(UID_COUNTERSET_MAP, &uid);
-    if (counterSet) key.counterSet = *counterSet;
+    uint8_t* counterSet = find_map_entry(UID_COUNTERSET_MAP, &uid);
+    if (counterSet) key.counterSet = (uint32_t)*counterSet;
 
-    int ret;
     if (tag) {
         bpf_update_stats(skb, TAG_STATS_MAP, direction, &key);
     }
 
     key.tag = 0;
     bpf_update_stats(skb, UID_STATS_MAP, direction, &key);
+    bpf_update_stats(skb, APP_UID_STATS_MAP, direction, &uid);
     return match;
 }

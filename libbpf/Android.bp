@@ -54,6 +54,8 @@ cc_library {
     export_header_lib_headers: ["libbpf_headers"],
     local_include_dirs: ["include"],
 
+    // TODO: Enable this once sscanf errors have been fixed.
+    // defaults: ["netd_defaults"],
     cflags: [
         "-Werror",
         "-Wall",
@@ -65,7 +67,9 @@ cc_test {
     name: "libbpf_test",
     srcs: [
         "BpfNetworkStatsTest.cpp",
+        "BpfMapTest.cpp",
     ],
+    defaults: ["netd_defaults"],
     cflags: [
         "-Wall",
         "-Werror",
