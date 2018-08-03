@@ -70,7 +70,7 @@ binder::Status checkPermission(const char *permission) {
 
 #define ENFORCE_DEBUGGABLE() {                              \
     char value[PROPERTY_VALUE_MAX + 1];                     \
-    if (property_get("ro.debuggable", value, NULL) != 1     \
+    if (property_get("ro.debuggable", value, nullptr) != 1  \
             || value[0] != '1') {                           \
         return binder::Status::fromExceptionCode(           \
             binder::Status::EX_SECURITY,                    \
@@ -747,5 +747,33 @@ binder::Status NetdNativeService::trafficCheckBpfStatsEnable(bool* ret) {
     return binder::Status::ok();
 }
 
+binder::Status NetdNativeService::idletimerAddInterface(const std::string& ifName, int32_t timeout,
+                                                        const std::string& classLabel) {
+    NETD_LOCKING_RPC(NETWORK_STACK, gCtls->idletimerCtrl.lock);
+    auto entry = gLog.newEntry()
+                         .prettyFunction(__PRETTY_FUNCTION__)
+                         .arg(ifName)
+                         .arg(timeout)
+                         .arg(classLabel);
+    int res =
+            gCtls->idletimerCtrl.addInterfaceIdletimer(ifName.c_str(), timeout, classLabel.c_str());
+    gLog.log(entry.returns(res).withAutomaticDuration());
+    return statusFromErrcode(res);
+}
+
+binder::Status NetdNativeService::idletimerRemoveInterface(const std::string& ifName,
+                                                           int32_t timeout,
+                                                           const std::string& classLabel) {
+    NETD_LOCKING_RPC(NETWORK_STACK, gCtls->idletimerCtrl.lock);
+    auto entry = gLog.newEntry()
+                         .prettyFunction(__PRETTY_FUNCTION__)
+                         .arg(ifName)
+                         .arg(timeout)
+                         .arg(classLabel);
+    int res = gCtls->idletimerCtrl.removeInterfaceIdletimer(ifName.c_str(), timeout,
+                                                            classLabel.c_str());
+    gLog.log(entry.returns(res).withAutomaticDuration());
+    return statusFromErrcode(res);
+}
 }  // namespace net
 }  // namespace android
