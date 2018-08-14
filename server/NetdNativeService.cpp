@@ -88,7 +88,7 @@ binder::Status checkPermission(const char *permission) {
 
 #define NETD_LOCKING_RPC(permission, lock)                  \
     ENFORCE_PERMISSION(permission);                         \
-    std::lock_guard<std::mutex> _lock(lock);
+    std::lock_guard _lock(lock);
 
 #define NETD_BIG_LOCK_RPC(permission) NETD_LOCKING_RPC((permission), gBigNetdLock)
 
@@ -775,5 +775,29 @@ binder::Status NetdNativeService::idletimerRemoveInterface(const std::string& if
     gLog.log(entry.returns(res).withAutomaticDuration());
     return statusFromErrcode(res);
 }
+
+binder::Status NetdNativeService::strictUidCleartextPenalty(int32_t uid, int32_t policyPenalty) {
+    NETD_LOCKING_RPC(NETWORK_STACK, gCtls->strictCtrl.lock);
+    auto entry = gLog.newEntry().prettyFunction(__PRETTY_FUNCTION__).arg(uid).arg(policyPenalty);
+    StrictPenalty penalty;
+    switch (policyPenalty) {
+        case INetd::PENALTY_POLICY_REJECT:
+            penalty = REJECT;
+            break;
+        case INetd::PENALTY_POLICY_LOG:
+            penalty = LOG;
+            break;
+        case INetd::PENALTY_POLICY_ACCEPT:
+            penalty = ACCEPT;
+            break;
+        default:
+            return statusFromErrcode(-EINVAL);
+            break;
+    }
+    int res = gCtls->strictCtrl.setUidCleartextPenalty((uid_t) uid, penalty);
+    gLog.log(entry.returns(res).withAutomaticDuration());
+    return statusFromErrcode(res);
+}
+
 }  // namespace net
 }  // namespace android
