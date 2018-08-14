@@ -182,7 +182,8 @@ interface INetd {
     const int RESOLVER_PARAMS_SUCCESS_THRESHOLD = 1;
     const int RESOLVER_PARAMS_MIN_SAMPLES = 2;
     const int RESOLVER_PARAMS_MAX_SAMPLES = 3;
-    const int RESOLVER_PARAMS_COUNT = 4;
+    const int RESOLVER_PARAMS_BASE_TIMEOUT_MSEC = 4;
+    const int RESOLVER_PARAMS_COUNT = 5;
 
     /**
      * Sets the name servers, search domains and resolver params for the given network. Flushes the
@@ -591,4 +592,18 @@ interface INetd {
             in @utf8InCpp String ifName,
             int timeout,
             in @utf8InCpp String classLabel);
+
+    const int PENALTY_POLICY_ACCEPT = 1;
+    const int PENALTY_POLICY_LOG = 2;
+    const int PENALTY_POLICY_REJECT = 3;
+
+   /**
+    * Offers to detect sockets sending data not wrapped inside a layer of SSL/TLS encryption.
+    *
+    * @param uid Uid of the app
+    * @param policyPenalty The penalty policy of the app
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void strictUidCleartextPenalty(int uid, int policyPenalty);
 }
