@@ -169,8 +169,8 @@ NFLogListener::~NFLogListener() {
     expectOk(mListener->unsubscribe(kNFLogPacketMsgType));
     expectOk(mListener->unsubscribe(kNetlinkDoneMsgType));
     const auto sendFn = [this](const Slice msg) { return mListener->send(msg); };
-    for (auto pair : mDispatchMap) {
-        expectOk(cfgCmdUnbind(sendFn, pair.first));
+    for (const auto& [key, value] : mDispatchMap) {
+        expectOk(cfgCmdUnbind(sendFn, key));
     }
 }
 
@@ -216,7 +216,7 @@ StatusOr<std::unique_ptr<NFLogListener>> makeNFLogListener() {
     RETURN_IF_NOT_OK(sys.setsockopt<int32_t>(sock, SOL_SOCKET, SO_TIMESTAMP, 1));
 
     std::shared_ptr<NetlinkListenerInterface> listener =
-        std::make_unique<NetlinkListener>(std::move(event), std::move(sock));
+            std::make_unique<NetlinkListener>(std::move(event), std::move(sock), "NFLogListener");
     const auto sendFn = [&listener](const Slice msg) { return listener->send(msg); };
     RETURN_IF_NOT_OK(cfgCmdPfUnbind(sendFn));
     return std::unique_ptr<NFLogListener>(new NFLogListener(std::move(listener)));

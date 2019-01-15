@@ -16,8 +16,9 @@
 
 package android.net;
 
-import android.net.UidRange;
-import android.os.PersistableBundle;
+import android.net.UidRangeParcel;
+import android.net.TetherStatsParcel;
+import android.net.InterfaceConfigurationParcel;
 
 /** {@hide} */
 interface INetd {
@@ -61,33 +62,28 @@ interface INetd {
      */
     boolean bandwidthEnableDataSaver(boolean enable);
 
-    // Network permission values.
-    const String PERMISSION_NETWORK = "NETWORK";
-    const String PERMISSION_SYSTEM = "SYSTEM";
-
     /**
      * Creates a physical network (i.e., one containing physical interfaces.
      *
      * @param netId the networkId to create.
-     * @param permission the permission necessary to use the network. Must be one of the
-     *         PERMISSION_xxx values above.
+     * @param permission the permission necessary to use the network. Must be one of
+     *         PERMISSION_NONE/PERMISSION_NETWORK/PERMISSION_SYSTEM.
      *
      * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
      *         unix errno.
      */
-    void networkCreatePhysical(int netId, in @utf8InCpp String permission);
+    void networkCreatePhysical(int netId, int permission);
 
     /**
      * Creates a VPN network.
      *
      * @param netId the network to create.
-     * @param hasDns whether the VPN has DNS servers.
      * @param secure whether unprivileged apps are allowed to bypass the VPN.
      *
      * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
      *         unix errno.
      */
-    void networkCreateVpn(int netId, boolean hasDns, boolean secure);
+    void networkCreateVpn(int netId, boolean secure);
 
     /**
      * Destroys a network. Any interfaces added to the network are removed, and the network ceases
@@ -134,7 +130,7 @@ interface INetd {
      * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
      *         unix errno.
      */
-    void networkAddUidRanges(int netId, in UidRange[] uidRanges);
+    void networkAddUidRanges(int netId, in UidRangeParcel[] uidRanges);
 
     /**
      * Adds the specified UID ranges to the specified network. The network must be a VPN. Traffic
@@ -147,7 +143,7 @@ interface INetd {
      * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
      *         unix errno.
      */
-    void networkRemoveUidRanges(int netId, in UidRange[] uidRanges);
+    void networkRemoveUidRanges(int netId, in UidRangeParcel[] uidRanges);
 
     /**
      * Adds or removes one rule for each supplied UID range to prohibit all network activity outside
@@ -170,12 +166,12 @@ interface INetd {
      * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
      *         unix errno.
      */
-    void networkRejectNonSecureVpn(boolean add, in UidRange[] uidRanges);
+    void networkRejectNonSecureVpn(boolean add, in UidRangeParcel[] uidRanges);
 
     /**
      * Administratively closes sockets belonging to the specified UIDs.
      */
-    void socketDestroy(in UidRange[] uidRanges, in int[] exemptUids);
+    void socketDestroy(in UidRangeParcel[] uidRanges, in int[] exemptUids);
 
     // Array indices for resolver parameters.
     const int RESOLVER_PARAMS_SAMPLE_VALIDITY = 0;
@@ -224,6 +220,7 @@ interface INetd {
      * @param netId the network ID of the network for which information should be retrieved.
      * @param servers the DNS servers that are currently configured for the network.
      * @param domains the search domains currently configured.
+     * @param tlsServers the DNS-over-TLS servers that are currently configured for the network.
      * @param params the resolver parameters configured, i.e. the contents of __res_params in order.
      * @param stats the stats for each server in the order specified by RESOLVER_STATS_XXX
      *         constants, serialized as an int array. The contents of this array are the number of
@@ -240,9 +237,12 @@ interface INetd {
      *         RESOLVER_STATS_COUNT*N + RESOLVER_STATS_TIMEOUTS
      * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
      *         unix errno.
+     *
+     * TODO: Consider replacing stats and params with parcelables.
      */
     void getResolverInfo(int netId, out @utf8InCpp String[] servers,
-            out @utf8InCpp String[] domains, out int[] params, out int[] stats);
+            out @utf8InCpp String[] domains, out @utf8InCpp String[] tlsServers, out int[] params,
+            out int[] stats);
 
     /**
      * Instruct the tethering DNS server to reevaluated serving interfaces.
@@ -254,24 +254,16 @@ interface INetd {
      */
     boolean tetherApplyDnsInterfaces();
 
-    // Ordering of the elements in the arrays returned by tetherGetStats.
-    const int TETHER_STATS_RX_BYTES   = 0;
-    const int TETHER_STATS_RX_PACKETS = 1;
-    const int TETHER_STATS_TX_BYTES   = 2;
-    const int TETHER_STATS_TX_PACKETS = 3;
-    const int TETHER_STATS_ARRAY_SIZE = 4;
-
     /**
      * Return tethering statistics.
      *
-     * @return a PersistableBundle, where each entry maps the upstream interface name to an array
-     *         of longs representing stats. The array is TETHER_STATS_ARRAY_SIZE elements long and
-     *         the order of the elements is specified by the TETHER_STATS_{RX,TX}_{PACKETS,BYTES}
-     *         constants.
+     * @return an array of TetherStatsParcel, where each entry contains the upstream interface
+     *         name and its tethering statistics.
+     *         There will only ever be one entry for a given interface.
      * @throws ServiceSpecificException in case of failure, with an error code indicating the
      *         cause of the the failure.
      */
-    PersistableBundle tetherGetStats();
+    TetherStatsParcel[] tetherGetStats();
 
     /**
      * Add/Remove and IP address from an interface.
@@ -291,20 +283,24 @@ interface INetd {
     /**
      * Set and get /proc/sys/net interface configuration parameters.
      *
-     * @param family One of IPV4/IPV6 integers, indicating the desired address family directory.
+     * @param ipversion One of IPV4/IPV6 integers, indicating the desired IP version directory.
      * @param which One of CONF/NEIGH integers, indicating the desired parameter category directory.
      * @param ifname The interface name portion of the path; may also be "all" or "default".
      * @param parameter The parameter name portion of the path.
      * @param value The value string to be written into the assembled path.
+     *
+     * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
+     *         unix errno.
      */
 
     const int IPV4  = 4;
     const int IPV6  = 6;
     const int CONF  = 1;
     const int NEIGH = 2;
-    void setProcSysNet(int family, int which, in @utf8InCpp String ifname,
+    @utf8InCpp String getProcSysNet(int ipversion, int which, in @utf8InCpp String ifname,
+            in @utf8InCpp String parameter);
+    void setProcSysNet(int ipversion, int which, in @utf8InCpp String ifname,
             in @utf8InCpp String parameter, in @utf8InCpp String value);
-    // TODO: add corresponding getProcSysNet().
 
     /**
      * Get/Set metrics reporting level.
@@ -318,13 +314,13 @@ interface INetd {
     void setMetricsReportingLevel(int level);
 
    /**
-    * Sets owner of socket FileDescriptor to the new UID, checking to ensure that the caller's
+    * Sets owner of socket ParcelFileDescriptor to the new UID, checking to ensure that the caller's
     * uid is that of the old owner's, and that this is a UDP-encap socket
     *
-    * @param FileDescriptor socket Socket file descriptor
+    * @param ParcelFileDescriptor socket Socket file descriptor
     * @param int newUid UID of the new socket fd owner
     */
-    void ipSecSetEncapSocketOwner(in FileDescriptor socket, int newUid);
+    void ipSecSetEncapSocketOwner(in ParcelFileDescriptor socket, int newUid);
 
    /**
     * Reserve an SPI from the kernel
@@ -349,7 +345,8 @@ interface INetd {
     * @param mode either Transport or Tunnel mode
     * @param sourceAddress InetAddress as string for the sending endpoint
     * @param destinationAddress InetAddress as string for the receiving endpoint
-    * @param underlyingNetId the netId of the network to which the SA is applied
+    * @param underlyingNetId the netId of the network to which the SA is applied. Only accepted for
+    *        tunnel mode SAs.
     * @param spi a 32-bit unique ID allocated to the user
     * @param markValue a 32-bit unique ID chosen by the user
     * @param markMask a 32-bit mask chosen by the user
@@ -366,6 +363,8 @@ interface INetd {
     * @param encapType encapsulation type used (if any) for the udp encap socket
     * @param encapLocalPort the port number on the host to be used in encap packets
     * @param encapRemotePort the port number of the remote to be used for encap packets
+    * @param interfaceId the identifier for the IPsec tunnel interface.
+    *        Only accepted for tunnel mode SAs.
     */
     void ipSecAddSecurityAssociation(
             int transformId,
@@ -381,7 +380,8 @@ interface INetd {
             in @utf8InCpp String aeadAlgo, in byte[] aeadKey, in int aeadIcvBits,
             int encapType,
             int encapLocalPort,
-            int encapRemotePort);
+            int encapRemotePort,
+            int interfaceId);
 
    /**
     * Delete a previously created security association identified by the provided parameters
@@ -392,6 +392,7 @@ interface INetd {
     * @param spi a requested 32-bit unique ID allocated to the user
     * @param markValue a 32-bit unique ID chosen by the user
     * @param markMask a 32-bit mask chosen by the user
+    * @param interfaceId the identifier for the IPsec tunnel interface.
     */
     void ipSecDeleteSecurityAssociation(
             int transformId,
@@ -399,7 +400,8 @@ interface INetd {
             in @utf8InCpp String destinationAddress,
             int spi,
             int markValue,
-            int markMask);
+            int markMask,
+            int interfaceId);
 
    /**
     * Apply a previously created SA to a specified socket, starting IPsec on that socket
@@ -412,7 +414,7 @@ interface INetd {
     * @param spi a 32-bit unique ID allocated to the user (socket owner)
     */
     void ipSecApplyTransportModeTransform(
-            in FileDescriptor socket,
+            in ParcelFileDescriptor socket,
             int transformId,
             int direction,
             in @utf8InCpp String sourceAddress,
@@ -426,108 +428,123 @@ interface INetd {
     * @param socket a user-provided socket from which to remove any IPsec configuration
     */
     void ipSecRemoveTransportModeTransform(
-            in FileDescriptor socket);
+            in ParcelFileDescriptor socket);
 
    /**
     * Adds an IPsec global policy.
     *
     * @param transformId a unique identifier for allocated resources
+    * @param selAddrFamily the address family identifier for the selector
     * @param direction DIRECTION_IN or DIRECTION_OUT
-    * @param sourceAddress InetAddress as string for the sending endpoint
-    * @param destinationAddress InetAddress as string for the receiving endpoint
+    * @param tmplSrcAddress InetAddress as string for the sending endpoint
+    * @param tmplDstAddress InetAddress as string for the receiving endpoint
     * @param spi a 32-bit unique ID allocated to the user
     * @param markValue a 32-bit unique ID chosen by the user
     * @param markMask a 32-bit mask chosen by the user
+    * @param interfaceId the identifier for the IPsec tunnel interface.
     */
     void ipSecAddSecurityPolicy(
             int transformId,
+            int selAddrFamily,
             int direction,
-            in @utf8InCpp String sourceAddress,
-            in @utf8InCpp String destinationAddress,
+            in @utf8InCpp String tmplSrcAddress,
+            in @utf8InCpp String tmplDstAddress,
             int spi,
             int markValue,
-            int markMask);
+            int markMask,
+            int interfaceId);
 
    /**
     * Updates an IPsec global policy.
     *
     * @param transformId a unique identifier for allocated resources
+    * @param selAddrFamily the address family identifier for the selector
     * @param direction DIRECTION_IN or DIRECTION_OUT
-    * @param sourceAddress InetAddress as string for the sending endpoint
-    * @param destinationAddress InetAddress as string for the receiving endpoint
+    * @param tmplSrcAddress InetAddress as string for the sending endpoint
+    * @param tmplDstAddress InetAddress as string for the receiving endpoint
     * @param spi a 32-bit unique ID allocated to the user
     * @param markValue a 32-bit unique ID chosen by the user
     * @param markMask a 32-bit mask chosen by the user
+    * @param interfaceId the identifier for the IPsec tunnel interface.
     */
     void ipSecUpdateSecurityPolicy(
             int transformId,
+            int selAddrFamily,
             int direction,
-            in @utf8InCpp String sourceAddress,
-            in @utf8InCpp String destinationAddress,
+            in @utf8InCpp String tmplSrcAddress,
+            in @utf8InCpp String tmplDstAddress,
             int spi,
             int markValue,
-            int markMask);
+            int markMask,
+            int interfaceId);
 
    /**
     * Deletes an IPsec global policy.
     *
+    * Deletion of global policies does not do any matching based on the templates, thus
+    * template source/destination addresses are not needed (as opposed to add/update).
+    *
     * @param transformId a unique identifier for allocated resources
+    * @param selAddrFamily the address family identifier for the selector
     * @param direction DIRECTION_IN or DIRECTION_OUT
-    * @param sourceAddress InetAddress as string for the sending endpoint
-    * @param destinationAddress InetAddress as string for the receiving endpoint
     * @param markValue a 32-bit unique ID chosen by the user
     * @param markMask a 32-bit mask chosen by the user
+    * @param interfaceId the identifier for the IPsec tunnel interface.
     */
     void ipSecDeleteSecurityPolicy(
             int transformId,
+            int selAddrFamily,
             int direction,
-            in @utf8InCpp String sourceAddress,
-            in @utf8InCpp String destinationAddress,
             int markValue,
-            int markMask);
+            int markMask,
+            int interfaceId);
 
     // This could not be declared as @uft8InCpp; thus, when used in native code it must be
     // converted from a UTF-16 string to an ASCII string.
     const String IPSEC_INTERFACE_PREFIX = "ipsec";
 
    /**
-    * Add a Virtual Tunnel Interface.
+    * Add a IPsec Tunnel Interface.
     *
     * @param devName a unique identifier that represents the name of the device
     * @param localAddress InetAddress as string for the local endpoint
     * @param remoteAddress InetAddress as string for the remote endpoint
     * @param iKey, to match Policies and SAs for input packets.
     * @param oKey, to match Policies and SAs for output packets.
+    * @param interfaceId the identifier for the IPsec tunnel interface.
     */
-    void addVirtualTunnelInterface(
+    void ipSecAddTunnelInterface(
             in @utf8InCpp String deviceName,
             in @utf8InCpp String localAddress,
             in @utf8InCpp String remoteAddress,
             int iKey,
-            int oKey);
+            int oKey,
+            int interfaceId);
 
    /**
-    * Update a Virtual Tunnel Interface.
+    * Update a IPsec Tunnel Interface.
     *
     * @param devName a unique identifier that represents the name of the device
     * @param localAddress InetAddress as string for the local endpoint
     * @param remoteAddress InetAddress as string for the remote endpoint
     * @param iKey, to match Policies and SAs for input packets.
     * @param oKey, to match Policies and SAs for output packets.
+    * @param interfaceId the identifier for the IPsec tunnel interface.
     */
-    void updateVirtualTunnelInterface(
+    void ipSecUpdateTunnelInterface(
             in @utf8InCpp String deviceName,
             in @utf8InCpp String localAddress,
             in @utf8InCpp String remoteAddress,
             int iKey,
-            int oKey);
+            int oKey,
+            int interfaceId);
 
    /**
-    * Removes a Virtual Tunnel Interface.
+    * Removes a IPsec Tunnel Interface.
     *
     * @param devName a unique identifier that represents the name of the device
     */
-    void removeVirtualTunnelInterface(in @utf8InCpp String deviceName);
+    void ipSecRemoveTunnelInterface(in @utf8InCpp String deviceName);
 
    /**
     * Request notification of wakeup packets arriving on an interface. Notifications will be
@@ -625,4 +642,554 @@ interface INetd {
     */
     void clatdStop(in @utf8InCpp String ifName);
 
+   /**
+    * Get status of IP forwarding
+    *
+    * @return true if IP forwarding is enabled, false otherwise.
+    */
+    boolean ipfwdEnabled();
+
+   /**
+    * Enable IP forwarding for specific requester
+    *
+    * @param requester requester name to enable IP forwarding. It is a unique name which will be
+    *                  stored in Netd to make sure if any requester needs IP forwarding.
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void ipfwdEnableForwarding(in @utf8InCpp String requester);
+
+   /**
+    * Disable IP forwarding for specific requester
+    *
+    * @param requester requester name to disable IP forwarding. This name should match the
+    *                  names which are set by ipfwdEnableForwarding.
+    *                  IP forwarding would be disabled if it is the last requester.
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void ipfwdDisableForwarding(in @utf8InCpp String requester);
+
+   /**
+    * Add forwarding ip rule
+    *
+    * @param fromIface interface name to add forwarding ip rule
+    * @param toIface interface name to add forwarding ip rule
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void ipfwdAddInterfaceForward(in @utf8InCpp String fromIface, in @utf8InCpp String toIface);
+
+   /**
+    * Remove forwarding ip rule
+    *
+    * @param fromIface interface name to remove forwarding ip rule
+    * @param toIface interface name to remove forwarding ip rule
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void ipfwdRemoveInterfaceForward(in @utf8InCpp String fromIface, in @utf8InCpp String toIface);
+
+   /**
+    * Set quota for interface
+    *
+    * @param ifName Name of target interface
+    * @param bytes Quota value in bytes
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void bandwidthSetInterfaceQuota(in @utf8InCpp String ifName, long bytes);
+
+   /**
+    * Remove quota for interface
+    *
+    * @param ifName Name of target interface
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void bandwidthRemoveInterfaceQuota(in @utf8InCpp String ifName);
+
+   /**
+    * Set alert for interface
+    *
+    * @param ifName Name of target interface
+    * @param bytes Alert value in bytes
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void bandwidthSetInterfaceAlert(in @utf8InCpp String ifName, long bytes);
+
+   /**
+    * Remove alert for interface
+    *
+    * @param ifName Name of target interface
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void bandwidthRemoveInterfaceAlert(in @utf8InCpp String ifName);
+
+   /**
+    * Set global alert
+    *
+    * @param bytes Alert value in bytes
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void bandwidthSetGlobalAlert(long bytes);
+
+   /**
+    * Add naughty app bandwidth rule for specific app
+    *
+    * @param uid uid of target app
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void bandwidthAddNaughtyApp(int uid);
+
+   /**
+    * Remove naughty app bandwidth rule for specific app
+    *
+    * @param uid uid of target app
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void bandwidthRemoveNaughtyApp(int uid);
+
+   /**
+    * Add nice app bandwidth rule for specific app
+    *
+    * @param uid uid of target app
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void bandwidthAddNiceApp(int uid);
+
+   /**
+    * Remove nice app bandwidth rule for specific app
+    *
+    * @param uid uid of target app
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void bandwidthRemoveNiceApp(int uid);
+
+   /**
+    * Start tethering
+    *
+    * @param dhcpRanges dhcp ranges to set.
+    *                   dhcpRanges might contain many addresss {addr1, addr2, aadr3, addr4...}
+    *                   Netd splits them into ranges: addr1-addr2, addr3-addr4, etc.
+    *                   An odd number of addrs will fail.
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void tetherStart(in @utf8InCpp String[] dhcpRanges);
+
+   /**
+    * Stop tethering
+    *
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void tetherStop();
+
+   /**
+    * Get status of tethering
+    *
+    * @return true if tethering is enabled, false otherwise.
+    */
+    boolean tetherIsEnabled();
+
+   /**
+    * Setup interface for tethering
+    *
+    * @param ifName interface name to add
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void tetherInterfaceAdd(in @utf8InCpp String ifName);
+
+   /**
+    * Reset interface for tethering
+    *
+    * @param ifName interface name to remove
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void tetherInterfaceRemove(in @utf8InCpp String ifName);
+
+   /**
+    * Get the interface list which is stored in netd
+    * The list contains the interfaces managed by tetherInterfaceAdd/tetherInterfaceRemove
+    *
+    * @return An array of strings containing interface list result
+    */
+    @utf8InCpp String[] tetherInterfaceList();
+
+   /**
+    * Set DNS forwarder server
+    *
+    * @param netId the upstream network to forward DNS queries to
+    * @param dnsAddrs DNS server address to set
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void tetherDnsSet(int netId, in @utf8InCpp String[] dnsAddrs);
+
+   /**
+    * Return the DNS list set by tetherDnsSet
+    *
+    * @return An array of strings containing the list of DNS servers
+    */
+    @utf8InCpp String[] tetherDnsList();
+
+    const int LOCAL_NET_ID = 99;
+
+    // Route does not specify a next hop
+    const String NEXTHOP_NONE = "";
+    // Route next hop is unreachable
+    const String NEXTHOP_UNREACHABLE = "unreachable";
+    // Route next hop is throw
+    const String NEXTHOP_THROW = "throw";
+
+   /**
+    * Add a route for specific network
+    *
+    * @param netId the network to add the route to
+    * @param ifName the name of interface of the route.
+    *               This interface should be assigned to the netID.
+    * @param destination the destination of the route
+    * @param nextHop The route's next hop address,
+    *                or it could be either NEXTHOP_NONE, NEXTHOP_UNREACHABLE, NEXTHOP_THROW.
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void networkAddRoute(
+            int netId,
+            in @utf8InCpp String ifName,
+            in @utf8InCpp String destination,
+            in @utf8InCpp String nextHop);
+
+   /**
+    * Remove a route for specific network
+    *
+    * @param netId the network to remove the route from
+    * @param ifName the name of interface of the route.
+    *               This interface should be assigned to the netID.
+    * @param destination the destination of the route
+    * @param nextHop The route's next hop address,
+    *                or it could be either NEXTHOP_NONE, NEXTHOP_UNREACHABLE, NEXTHOP_THROW.
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void networkRemoveRoute(
+            int netId,
+            in @utf8InCpp String ifName,
+            in @utf8InCpp String destination,
+            in @utf8InCpp String nextHop);
+
+   /**
+    * Add a route to legacy routing table for specific network
+    *
+    * @param netId the network to add the route to
+    * @param ifName the name of interface of the route.
+    *               This interface should be assigned to the netID.
+    * @param destination the destination of the route
+    * @param nextHop The route's next hop address,
+    *                or it could be either NEXTHOP_NONE, NEXTHOP_UNREACHABLE, NEXTHOP_THROW.
+    * @param uid uid of the user
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void networkAddLegacyRoute(
+            int netId,
+            in @utf8InCpp String ifName,
+            in @utf8InCpp String destination,
+            in @utf8InCpp String nextHop,
+            int uid);
+
+   /**
+    * Remove a route from legacy routing table for specific network
+    *
+    * @param netId the network to remove the route from
+    * @param ifName the name of interface of the route.
+    *               This interface should be assigned to the netID.
+    * @param destination the destination of the route
+    * @param nextHop The route's next hop address,
+    *                or it could be either NEXTHOP_NONE, NEXTHOP_UNREACHABLE, NEXTHOP_THROW.
+    * @param uid uid of the user
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void networkRemoveLegacyRoute(
+            int netId,
+            in @utf8InCpp String ifName,
+            in @utf8InCpp String destination,
+            in @utf8InCpp String nextHop,
+            int uid);
+
+   /**
+    * Get default network
+    *
+    * @return netId of default network
+    */
+    int networkGetDefault();
+
+   /**
+    * Set network as default network
+    *
+    * @param netId the network to set as the default
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void networkSetDefault(int netId);
+
+   /**
+    * Clear default network
+    *
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void networkClearDefault();
+
+    /**
+     * PERMISSION_NONE is used for regular networks and apps
+     */
+    const int PERMISSION_NONE = 0;
+    /**
+     * PERMISSION_NETWORK indicates that the network is only accessible
+     * to apps that have the CHANGE_NETWORK_STATE permission.
+     */
+    const int PERMISSION_NETWORK = 1;
+    /**
+     * PERMISSION_SYSTEM is used for system UIDs and apps
+     * that have the CONNECTIVITY_USE_RESTRICTED_NETWORK permission
+     */
+    const int PERMISSION_SYSTEM = 2;
+
+   /**
+    * Sets the permission required to access a specific network.
+    *
+    * @param netId the network to set
+    * @param permission network permission to use
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void networkSetPermissionForNetwork(int netId, int permission);
+
+   /**
+    * Assigns network access permissions to the specified users.
+    *
+    * @param permission network permission to use
+    * @param uids uid of users to set permission
+    */
+    void networkSetPermissionForUser(int permission, in int[] uids);
+
+   /**
+    * Clears network access permissions for the specified users.
+    *
+    * @param uids uid of users to clear permission
+    */
+    void networkClearPermissionForUser(in int[] uids);
+
+   /**
+    * Gives the specified user permission to protect sockets from VPNs.
+    * Typically used by VPN apps themselves, to ensure that the sockets
+    * they use to communicate with the VPN server aren't routed through
+    * the VPN network.
+    *
+    * @param uid uid of user to set
+    */
+    void networkSetProtectAllow(int uid);
+
+   /**
+    * Removes the permission to protect sockets from VPN.
+    *
+    * @param uid uid of user to set
+    */
+    void networkSetProtectDeny(int uid);
+
+   /**
+    * Get the status of network protect for user
+    *
+    * @param uids uid of user
+    * @return true if the user can protect sockets from VPN, false otherwise.
+    */
+    boolean networkCanProtect(int uid);
+
+    // Whitelist only allows packets from specific UID/Interface
+    const int FIREWALL_WHITELIST = 0;
+    // Blacklist blocks packets from specific UID/Interface
+    const int FIREWALL_BLACKLIST = 1;
+
+   /**
+    * Set type of firewall
+    * Type whitelist only allows packets from specific UID/Interface
+    * Type blacklist blocks packets from specific UID/Interface
+    *
+    * @param firewalltype type of firewall, either FIREWALL_WHITELIST or FIREWALL_BLACKLIST
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void firewallSetFirewallType(int firewalltype);
+
+    // Specify allow Rule which allows packets
+    const int FIREWALL_RULE_ALLOW = 1;
+    // Specify deny Rule which drops packets
+    const int FIREWALL_RULE_DENY = 2;
+
+    // No specific chain is chosen, use general firewall chain(fw_input, fw_output)
+    const int FIREWALL_CHAIN_NONE = 0;
+    // Specify DOZABLE chain(fw_dozable) which is used in dozable mode
+    const int FIREWALL_CHAIN_DOZABLE = 1;
+    // Specify STANDBY chain(fw_standby) which is used in standby mode
+    const int FIREWALL_CHAIN_STANDBY = 2;
+    // Specify POWERSAVE chain(fw_powersave) which is used in power save mode
+    const int FIREWALL_CHAIN_POWERSAVE = 3;
+
+   /**
+    * Set firewall rule for interface
+    *
+    * @param ifName the interface to allow/deny
+    * @param firewallRule either FIREWALL_RULE_ALLOW or FIREWALL_RULE_DENY
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void firewallSetInterfaceRule(in @utf8InCpp String ifName, int firewallRule);
+
+   /**
+    * Set firewall rule for uid
+    *
+    * @param childChain target chain
+    * @param uid uid to allow/deny
+    * @param firewallRule either FIREWALL_RULE_ALLOW or FIREWALL_RULE_DENY
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void firewallSetUidRule(int childChain, int uid, int firewallRule);
+
+   /**
+    * Enable/Disable target firewall child chain
+    *
+    * @param childChain target chain to enable
+    * @param enable whether to enable or disable child chain.
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void firewallEnableChildChain(int childChain, boolean enable);
+
+   /**
+    * Get interface list
+    *
+    * @return An array of strings containing all the interfaces on the system.
+    * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
+    *         unix errno.
+    */
+    @utf8InCpp String[] interfaceGetList();
+
+    const String IF_STATE_UP = "up";
+    const String IF_STATE_DOWN = "down";
+    const String IF_FLAG_BROADCAST = "broadcast";
+    const String IF_FLAG_LOOPBACK = "loopback";
+    const String IF_FLAG_POINTOPOINT = "point-to-point";
+    const String IF_FLAG_RUNNING = "running";
+    const String IF_FLAG_MULTICAST = "multicast";
+
+   /**
+    * Get interface configuration
+    *
+    * @param ifName interface name
+    * @return An InterfaceConfigurationParcel for the specified interface.
+    * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
+    *         unix errno.
+    */
+    InterfaceConfigurationParcel interfaceGetCfg(in @utf8InCpp String ifName);
+
+   /**
+    * Set interface configuration
+    *
+    * @param cfg Interface configuration to set
+    * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
+    *         unix errno.
+    */
+    void interfaceSetCfg(in InterfaceConfigurationParcel cfg);
+
+   /**
+    * Set interface IPv6 privacy extensions
+    *
+    * @param ifName interface name
+    * @param enable whether to enable or disable this setting.
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void interfaceSetIPv6PrivacyExtensions(in @utf8InCpp String ifName, boolean enable);
+
+   /**
+    * Clear all IP addresses on the given interface
+    *
+    * @param ifName interface name
+    * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
+    *         POSIX errno.
+    */
+    void interfaceClearAddrs(in @utf8InCpp String ifName);
+
+   /**
+    * Enable or disable IPv6 on the given interface
+    *
+    * @param ifName interface name
+    * @param enable whether to enable or disable this setting.
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void interfaceSetEnableIPv6(in @utf8InCpp String ifName, boolean enable);
+
+   /**
+    * Set interface MTU
+    *
+    * @param ifName interface name
+    * @param mtu MTU value
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void interfaceSetMtu(in @utf8InCpp String ifName, int mtu);
+
+   /**
+    * Add forwarding rule/stats on given interface.
+    *
+    * @param intIface downstream interface
+    * @param extIface upstream interface
+    */
+    void tetherAddForward(in @utf8InCpp String intIface, in @utf8InCpp String extIface);
+
+   /**
+    * Remove forwarding rule/stats on given interface.
+    *
+    * @param intIface downstream interface
+    * @param extIface upstream interface
+    */
+    void tetherRemoveForward(in @utf8InCpp String intIface, in @utf8InCpp String extIface);
+
+   /**
+    * Set the values of tcp_{rmem,wmem}.
+    *
+    * @param rmemValues the target values of tcp_rmem, each value is separated by spaces
+    * @param wmemValues the target values of tcp_wmem, each value is separated by spaces
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void setTcpRWmemorySize(in @utf8InCpp String rmemValues, in @utf8InCpp String wmemValues);
+
+    /**
+     * Get NAT64 prefix in format Pref64::/n which is described in RFC6147 section 2. This
+     * interface is used for internal test only. Don't use it for other purposes because doing so
+     * would cause race conditions with the NAT64 prefix notifications.
+     *
+     * @param netId the network ID of the network to get the prefix
+     * @return the NAT64 prefix if the query operation was successful
+     * @throws ServiceSpecificException in case of failure, with an error code indicating the
+     *         cause of the the failure.
+     *
+     * TODO: Remove this once the tests have been updated to listen for onNat64PrefixEvent.
+     */
+    @utf8InCpp String getPrefix64(int netId);
 }

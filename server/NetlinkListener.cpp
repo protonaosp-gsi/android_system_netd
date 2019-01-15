@@ -16,6 +16,8 @@
 
 #define LOG_TAG "NetlinkListener"
 
+#include "NetlinkListener.h"
+
 #include <sstream>
 #include <vector>
 
@@ -24,8 +26,6 @@
 #include <log/log.h>
 #include <netdutils/Misc.h>
 #include <netdutils/Syscalls.h>
-
-#include "NetlinkListener.h"
 
 namespace android {
 namespace net {
@@ -57,14 +57,21 @@ const NetlinkListener::DispatchFn kDefaultDispatchFn = [](const nlmsghdr& nlmsg,
 
 }  // namespace
 
-NetlinkListener::NetlinkListener(UniqueFd event, UniqueFd sock)
-    : mEvent(std::move(event)), mSock(std::move(sock)), mWorker([this]() { run(); }) {
+NetlinkListener::NetlinkListener(UniqueFd event, UniqueFd sock, const std::string& name)
+    : mEvent(std::move(event)), mSock(std::move(sock)), mThreadName(name) {
     const auto rxErrorHandler = [](const nlmsghdr& nlmsg, const Slice msg) {
         std::stringstream ss;
         ss << nlmsg << " " << msg << " " << netdutils::toHex(msg, 32);
         ALOGE("unhandled netlink message: %s", ss.str().c_str());
     };
     expectOk(NetlinkListener::subscribe(kNetlinkMsgErrorType, rxErrorHandler));
+
+    mErrorHandler = [& name = mThreadName](const int fd, const int err) {
+        ALOGE("Error on NetlinkListener(%s) fd=%d: %s", name.c_str(), fd, strerror(err));
+    };
+
+    // Start the thread
+    mWorker = std::thread([this]() { run().ignoreError(); });
 }
 
 NetlinkListener::~NetlinkListener() {
@@ -96,6 +103,10 @@ Status NetlinkListener::unsubscribe(uint16_t type) {
     return ok;
 }
 
+void NetlinkListener::registerSkErrorHandler(const SkErrorHandler& handler) {
+    mErrorHandler = handler;
+}
+
 Status NetlinkListener::run() {
     std::vector<char> rxbuf(4096);
 
@@ -105,6 +116,12 @@ Status NetlinkListener::run() {
         fn(nlmsg, buf);
     };
 
+    if (mThreadName.length() > 0) {
+        int ret = pthread_setname_np(pthread_self(), mThreadName.c_str());
+        if (ret) {
+            ALOGE("thread name set failed, name: %s, ret: %s", mThreadName.c_str(), strerror(ret));
+        }
+    }
     const auto& sys = sSyscalls.get();
     const std::array<Fd, 2> fds{{{mEvent}, {mSock}}};
     const int events = POLLIN;
@@ -123,7 +140,7 @@ Status NetlinkListener::run() {
                 // nothing we can do about that. The recvfrom above will already have cleared the
                 // error indication and ensured we won't get EPOLLERR again.
                 // TODO: Consider using NETLINK_NO_ENOBUFS.
-                ALOGE("Failed to read from netlink socket: %s", strerror(err));
+                mErrorHandler(((Fd) mSock).get(), err);
                 continue;
             }
             forEachNetlinkMessage(rx.value(), rxHandler);

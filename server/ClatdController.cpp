@@ -13,6 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+#include "ClatdController.h"
+
 #include <map>
 #include <string>
 
@@ -24,13 +27,10 @@
 #define LOG_TAG "ClatdController"
 #include <log/log.h>
 
-#include <resolv_netid.h>
-
-#include "NetdConstants.h"
-#include "ClatdController.h"
 #include "Fwmark.h"
 #include "NetdConstants.h"
 #include "NetworkController.h"
+#include "netid_client.h"
 
 static const char* kClatdPath = "/system/bin/clatd";
 

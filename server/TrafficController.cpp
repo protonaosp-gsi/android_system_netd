@@ -92,7 +92,7 @@ const std::string uidMatchTypeToString(uint8_t match) {
     return matchType;
 }
 
-StatusOr<std::unique_ptr<NetlinkListenerInterface>> makeSkDestroyListener() {
+StatusOr<std::unique_ptr<NetlinkListenerInterface>> TrafficController::makeSkDestroyListener() {
     const auto& sys = sSyscalls.get();
     ASSIGN_OR_RETURN(auto event, sys.eventfd(0, EFD_CLOEXEC));
     const int domain = AF_NETLINK;
@@ -121,7 +121,7 @@ StatusOr<std::unique_ptr<NetlinkListenerInterface>> makeSkDestroyListener() {
     RETURN_IF_NOT_OK(sys.connect(sock, kernel));
 
     std::unique_ptr<NetlinkListenerInterface> listener =
-        std::make_unique<NetlinkListener>(std::move(event), std::move(sock));
+            std::make_unique<NetlinkListener>(std::move(event), std::move(sock), "SkDestroyListen");
 
     return listener;
 }
@@ -145,13 +145,6 @@ Status changeOwnerAndMode(const char* path, gid_t group, const char* debugName, 
 
 TrafficController::TrafficController() {
     ebpfSupported = hasBpfSupport();
-}
-
-Status initialOwnerMap(BpfMap<uint32_t, uint8_t>& map) {
-    map.clear();
-    uint32_t mapSettingKey = CONFIGURATION_KEY;
-    uint8_t defaultMapState = 0;
-    return map.writeValue(mapSettingKey, defaultMapState, BPF_NOEXIST);
 }
 
 Status TrafficController::initMaps() {
@@ -203,7 +196,35 @@ Status TrafficController::initMaps() {
     RETURN_IF_NOT_OK(
             mUidOwnerMap.getOrCreate(UID_OWNER_MAP_SIZE, UID_OWNER_MAP_PATH, BPF_MAP_TYPE_HASH));
     RETURN_IF_NOT_OK(changeOwnerAndMode(UID_OWNER_MAP_PATH, AID_ROOT, "UidOwnerMap", true));
-    mUidOwnerMap.clear();
+    RETURN_IF_NOT_OK(mUidOwnerMap.clear());
+    return netdutils::status::ok;
+}
+
+static Status attachProgramToCgroup(const char* programPath, const int cgroupFd,
+                                    bpf_attach_type type) {
+    unique_fd cgroupProg(bpfFdGet(programPath, 0));
+    if (cgroupProg == -1) {
+        int ret = errno;
+        ALOGE("Failed to get program from %s: %s", programPath, strerror(ret));
+        return statusFromErrno(ret, "cgroup program get failed");
+    }
+    if (android::bpf::attachProgram(type, cgroupProg, cgroupFd)) {
+        int ret = errno;
+        ALOGE("Program from %s attach failed: %s", programPath, strerror(ret));
+        return statusFromErrno(ret, "program attach failed");
+    }
+    return netdutils::status::ok;
+}
+
+static Status initPrograms() {
+    unique_fd cg_fd(open(CGROUP_ROOT_PATH, O_DIRECTORY | O_RDONLY | O_CLOEXEC));
+    if (cg_fd == -1) {
+        int ret = errno;
+        ALOGE("Failed to open the cgroup directory: %s", strerror(ret));
+        return statusFromErrno(ret, "Open the cgroup directory failed");
+    }
+    RETURN_IF_NOT_OK(attachProgramToCgroup(BPF_EGRESS_PROG_PATH, cg_fd, BPF_CGROUP_INET_EGRESS));
+    RETURN_IF_NOT_OK(attachProgramToCgroup(BPF_INGRESS_PROG_PATH, cg_fd, BPF_CGROUP_INET_INGRESS));
     return netdutils::status::ok;
 }
 
@@ -213,7 +234,7 @@ Status TrafficController::start() {
         return netdutils::status::ok;
     }
 
-    /* When netd restart from a crash without total system reboot, the program
+    /* When netd restarts from a crash without total system reboot, the program
      * is still attached to the cgroup, detach it so the program can be freed
      * and we can load and attach new program into the target cgroup.
      *
@@ -223,6 +244,8 @@ Status TrafficController::start() {
 
     RETURN_IF_NOT_OK(initMaps());
 
+    RETURN_IF_NOT_OK(initPrograms());
+
     // Fetch the list of currently-existing interfaces. At this point NetlinkHandler is
     // already running, so it will call addInterface() when any new interface appears.
     std::map<std::string, uint32_t> ifacePairs;
@@ -230,7 +253,6 @@ Status TrafficController::start() {
     for (const auto& ifacePair:ifacePairs) {
         addInterface(ifacePair.first.c_str(), ifacePair.second);
     }
-
 
     auto result = makeSkDestroyListener();
     if (!isOk(result)) {
@@ -242,13 +264,17 @@ Status TrafficController::start() {
     const auto rxHandler = [this](const nlmsghdr&, const Slice msg) {
         inet_diag_msg diagmsg = {};
         if (extract(msg, diagmsg) < sizeof(inet_diag_msg)) {
-            ALOGE("unrecognized netlink message: %s", toString(msg).c_str());
+            ALOGE("Unrecognized netlink message: %s", toString(msg).c_str());
             return;
         }
         uint64_t sock_cookie = static_cast<uint64_t>(diagmsg.id.idiag_cookie[0]) |
                                (static_cast<uint64_t>(diagmsg.id.idiag_cookie[1]) << 32);
 
-        mCookieTagMap.deleteValue(sock_cookie);
+        Status s = mCookieTagMap.deleteValue(sock_cookie);
+        if (!isOk(s) && s.code() != ENOENT) {
+            ALOGE("Failed to delete cookie %" PRIx64 ": %s", sock_cookie, toString(s).c_str());
+            return;
+        }
     };
     expectOk(mSkDestroyListener->subscribe(kSockDiagMsgType, rxHandler));
 
@@ -261,19 +287,6 @@ Status TrafficController::start() {
     };
     expectOk(mSkDestroyListener->subscribe(kSockDiagDoneMsgType, rxDoneHandler));
 
-    int* status = nullptr;
-
-    std::vector<const char*> prog_args{
-        "/system/bin/bpfloader",
-    };
-
-    prog_args.push_back(nullptr);
-    int ret = android_fork_execvp(prog_args.size(), (char**) prog_args.data(), status, false, true);
-    if (ret) {
-        ret = errno;
-        ALOGE("failed to execute %s: %s", prog_args[0], strerror(errno));
-        return statusFromErrno(ret, "run bpf loader failed");
-    }
     return netdutils::status::ok;
 }
 
@@ -345,7 +358,6 @@ int TrafficController::setCounterSet(int counterSetNum, uid_t uid) {
 }
 
 int TrafficController::deleteTagData(uint32_t tag, uid_t uid) {
-
     if (!ebpfSupported) {
         if (legacy_deleteTagData(tag, uid)) return -errno;
         return 0;
@@ -365,7 +377,7 @@ int TrafficController::deleteTagData(uint32_t tag, uid_t uid) {
         // Move forward to next cookie in the map.
         return netdutils::status::ok;
     };
-    mCookieTagMap.iterateWithValue(deleteMatchedCookieEntries);
+    mCookieTagMap.iterateWithValue(deleteMatchedCookieEntries).ignoreError();
     // Now we go through the Tag stats map and delete the data entry with correct uid and tag
     // combination. Or all tag stats under that uid if the target tag is 0.
     const auto deleteMatchedUidTagEntries = [uid, tag](const StatsKey& key,
@@ -381,7 +393,7 @@ int TrafficController::deleteTagData(uint32_t tag, uid_t uid) {
         }
         return netdutils::status::ok;
     };
-    mTagStatsMap.iterate(deleteMatchedUidTagEntries);
+    mTagStatsMap.iterate(deleteMatchedUidTagEntries).ignoreError();
     // If the tag is not zero, we already deleted all the data entry required. If tag is 0, we also
     // need to delete the stats stored in uidStatsMap and counterSet map.
     if (tag != 0) return 0;
@@ -391,7 +403,7 @@ int TrafficController::deleteTagData(uint32_t tag, uid_t uid) {
         ALOGE("Failed to delete counterSet data(uid=%u, tag=%u): %s\n", uid, tag,
               strerror(res.code()));
     }
-    mUidStatsMap.iterate(deleteMatchedUidTagEntries);
+    mUidStatsMap.iterate(deleteMatchedUidTagEntries).ignoreError();
 
     auto deleteAppUidStatsEntry = [uid](const uint32_t& key, BpfMap<uint32_t, StatsValue>& map) {
         if (key == uid) {
@@ -403,7 +415,7 @@ int TrafficController::deleteTagData(uint32_t tag, uid_t uid) {
         }
         return netdutils::status::ok;
     };
-    mAppUidStatsMap.iterate(deleteAppUidStatsEntry);
+    mAppUidStatsMap.iterate(deleteAppUidStatsEntry).ignoreError();
     return 0;
 }
 
@@ -471,7 +483,7 @@ Status TrafficController::addMatch(BpfMap<uint32_t, uint8_t>& map, uint32_t uid,
     auto oldMatch = map.readValue(uid);
     if (isOk(oldMatch)) {
         uint8_t newMatch = oldMatch.value() | match;
-        map.writeValue((uint32_t) uid, newMatch, BPF_ANY);
+        RETURN_IF_NOT_OK(map.writeValue((uint32_t) uid, newMatch, BPF_ANY));
     } else {
         RETURN_IF_NOT_OK(map.writeValue(uid, match, BPF_ANY));
     }

@@ -32,32 +32,28 @@
 #include <netdb.h>
 
 #include <arpa/inet.h>
-// NOTE: <resolv_netid.h> is a private C library header that provides
-//       declarations for _resolv_set_nameservers_for_net and
-//       _resolv_flush_cache_for_net
-#include <resolv_netid.h>
-#include <resolv_params.h>
-#include <resolv_stats.h>
 
 #include <android-base/strings.h>
 #include <android-base/thread_annotations.h>
 #include <android/net/INetd.h>
 #include <android/net/metrics/INetdEventListener.h>
 
+#include "Controllers.h"
 #include "DumpWriter.h"
 #include "EventReporter.h"
+#include "Fwmark.h"
 #include "NetdConstants.h"
+#include "Permission.h"
 #include "ResolverController.h"
 #include "ResolverStats.h"
-#include "dns/DnsTlsTransport.h"
-#include "dns/DnsTlsServer.h"
-#include "netdutils/BackoffSequence.h"
+#include "netd_resolv/params.h"
+#include "netd_resolv/resolv.h"
+#include "netd_resolv/resolv_stub.h"
+#include "netd_resolv/stats.h"
 
 namespace android {
-
-using netdutils::BackoffSequence;
-
 namespace net {
+
 namespace {
 
 std::string addrToString(const sockaddr_storage* addr) {
@@ -67,324 +63,57 @@ std::string addrToString(const sockaddr_storage* addr) {
     return std::string(out);
 }
 
-bool parseServer(const char* server, sockaddr_storage* parsed) {
-    addrinfo hints = {
-        .ai_family = AF_UNSPEC,
-        .ai_flags = AI_NUMERICHOST | AI_NUMERICSERV
-    };
-    addrinfo* res;
-
-    int err = getaddrinfo(server, "853", &hints, &res);
-    if (err != 0) {
-        ALOGW("Failed to parse server address (%s): %s", server, gai_strerror(err));
-        return false;
-    }
-
-    memcpy(parsed, res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
-    return true;
-}
-
 const char* getPrivateDnsModeString(PrivateDnsMode mode) {
     switch (mode) {
-        case PrivateDnsMode::OFF: return "OFF";
-        case PrivateDnsMode::OPPORTUNISTIC: return "OPPORTUNISTIC";
-        case PrivateDnsMode::STRICT: return "STRICT";
+        case PrivateDnsMode::OFF:
+            return "OFF";
+        case PrivateDnsMode::OPPORTUNISTIC:
+            return "OPPORTUNISTIC";
+        case PrivateDnsMode::STRICT:
+            return "STRICT";
     }
 }
 
-constexpr const char* validationStatusToString(ResolverController::Validation value) {
+constexpr const char* validationStatusToString(Validation value) {
     switch (value) {
-        case ResolverController::Validation::in_process:     return "in_process";
-        case ResolverController::Validation::success:        return "success";
-        case ResolverController::Validation::fail:           return "fail";
-        case ResolverController::Validation::unknown_server: return "unknown_server";
-        case ResolverController::Validation::unknown_netid:  return "unknown_netid";
-        default: return "unknown_status";
+        case Validation::in_process:
+            return "in_process";
+        case Validation::success:
+            return "success";
+        case Validation::fail:
+            return "fail";
+        case Validation::unknown_server:
+            return "unknown_server";
+        case Validation::unknown_netid:
+            return "unknown_netid";
+        default:
+            return "unknown_status";
     }
 }
 
-
-class PrivateDnsConfiguration {
-  public:
-    typedef ResolverController::PrivateDnsStatus PrivateDnsStatus;
-    typedef ResolverController::Validation Validation;
-    typedef std::map<DnsTlsServer, Validation, AddressComparator> PrivateDnsTracker;
-
-    int set(int32_t netId, const std::vector<std::string>& servers, const std::string& name,
-            const std::set<std::vector<uint8_t>>& fingerprints) {
+void onPrivateDnsValidation(unsigned netId, const char* server, const char* hostname,
+                            bool success) {
+    // Send a validation event to NetdEventListenerService.
+    const auto netdEventListener = net::gCtls->eventReporter.getNetdEventListener();
+    if (netdEventListener != nullptr) {
+        netdEventListener->onPrivateDnsValidationEvent(netId, android::String16(server),
+                                                       android::String16(hostname), success);
         if (DBG) {
-            ALOGD("PrivateDnsConfiguration::set(%u, %zu, %s, %zu)",
-                    netId, servers.size(), name.c_str(), fingerprints.size());
+            ALOGD("Sending validation %s event on netId %u for %s with hostname %s",
+                  success ? "success" : "failure", netId, server, hostname);
         }
 
-        const bool explicitlyConfigured = !name.empty() || !fingerprints.empty();
-
-        // Parse the list of servers that has been passed in
-        std::set<DnsTlsServer> tlsServers;
-        for (size_t i = 0; i < servers.size(); ++i) {
-            sockaddr_storage parsed;
-            if (!parseServer(servers[i].c_str(), &parsed)) {
-                return -EINVAL;
-            }
-            DnsTlsServer server(parsed);
-            server.name = name;
-            server.fingerprints = fingerprints;
-            tlsServers.insert(server);
-        }
-
-        std::lock_guard guard(mPrivateDnsLock);
-        if (explicitlyConfigured) {
-            mPrivateDnsModes[netId] = PrivateDnsMode::STRICT;
-        } else if (!tlsServers.empty()) {
-            mPrivateDnsModes[netId] = PrivateDnsMode::OPPORTUNISTIC;
-        } else {
-            mPrivateDnsModes[netId] = PrivateDnsMode::OFF;
-            mPrivateDnsTransports.erase(netId);
-            return 0;
-        }
-
-        // Create the tracker if it was not present
-        auto netPair = mPrivateDnsTransports.find(netId);
-        if (netPair == mPrivateDnsTransports.end()) {
-            // No TLS tracker yet for this netId.
-            bool added;
-            std::tie(netPair, added) = mPrivateDnsTransports.emplace(netId, PrivateDnsTracker());
-            if (!added) {
-                ALOGE("Memory error while recording private DNS for netId %d", netId);
-                return -ENOMEM;
-            }
-        }
-        auto& tracker = netPair->second;
-
-        // Remove any servers from the tracker that are not in |servers| exactly.
-        for (auto it = tracker.begin(); it != tracker.end();) {
-            if (tlsServers.count(it->first) == 0) {
-                it = tracker.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        // Add any new or changed servers to the tracker, and initiate async checks for them.
-        for (const auto& server : tlsServers) {
-            if (needsValidation(tracker, server)) {
-                validatePrivateDnsProvider(server, tracker, netId);
-            }
-        }
-        return 0;
+    } else {
+        ALOGE("Validation event not sent since NetdEventListenerService is unavailable.");
     }
+}
 
-    PrivateDnsStatus getStatus(unsigned netId) {
-        PrivateDnsStatus status{PrivateDnsMode::OFF, {}};
-
-        // This mutex is on the critical path of every DNS lookup.
-        //
-        // If the overhead of mutex acquisition proves too high, we could reduce
-        // it by maintaining an atomic_int32_t counter of TLS-enabled netids, or
-        // by using an RWLock.
-        std::lock_guard guard(mPrivateDnsLock);
-
-        const auto mode = mPrivateDnsModes.find(netId);
-        if (mode == mPrivateDnsModes.end()) return status;
-        status.mode = mode->second;
-
-        const auto netPair = mPrivateDnsTransports.find(netId);
-        if (netPair != mPrivateDnsTransports.end()) {
-            for (const auto& serverPair : netPair->second) {
-                if (serverPair.second == Validation::success) {
-                    status.validatedServers.push_back(serverPair.first);
-                }
-            }
-        }
-
-        return status;
+bool allIPv6Only(const std::vector<std::string>& servers) {
+    for (const auto& server : servers) {
+        if (server.find(':') == std::string::npos) return false;
     }
-
-    void clear(unsigned netId) {
-        if (DBG) {
-            ALOGD("PrivateDnsConfiguration::clear(%u)", netId);
-        }
-        std::lock_guard guard(mPrivateDnsLock);
-        mPrivateDnsModes.erase(netId);
-        mPrivateDnsTransports.erase(netId);
-    }
-
-    void dump(DumpWriter& dw, unsigned netId) {
-        std::lock_guard guard(mPrivateDnsLock);
-
-        const auto& mode = mPrivateDnsModes.find(netId);
-        dw.println("Private DNS mode: %s", getPrivateDnsModeString(
-                (mode != mPrivateDnsModes.end()) ? mode->second : PrivateDnsMode::OFF));
-        const auto& netPair = mPrivateDnsTransports.find(netId);
-        if (netPair == mPrivateDnsTransports.end()) {
-            dw.println("No Private DNS servers configured");
-        } else {
-            const auto& tracker = netPair->second;
-            dw.println("Private DNS configuration (%zu entries)", tracker.size());
-            dw.incIndent();
-            for (const auto& kv : tracker) {
-                const auto& server = kv.first;
-                const auto status = kv.second;
-                dw.println("%s name{%s} status{%s}",
-                        addrToString(&(server.ss)).c_str(),
-                        server.name.c_str(),
-                        validationStatusToString(status));
-            }
-            dw.decIndent();
-        }
-    }
-
-  private:
-    void validatePrivateDnsProvider(const DnsTlsServer& server, PrivateDnsTracker& tracker,
-            unsigned netId) REQUIRES(mPrivateDnsLock) {
-        if (DBG) {
-            ALOGD("validatePrivateDnsProvider(%s, %u)", addrToString(&(server.ss)).c_str(), netId);
-        }
-
-        tracker[server] = Validation::in_process;
-        if (DBG) {
-            ALOGD("Server %s marked as in_process.  Tracker now has size %zu",
-                    addrToString(&(server.ss)).c_str(), tracker.size());
-        }
-        // Note that capturing |server| and |netId| in this lambda create copies.
-        std::thread validate_thread([this, server, netId] {
-            // cat /proc/sys/net/ipv4/tcp_syn_retries yields "6".
-            //
-            // Start with a 1 minute delay and backoff to once per hour.
-            //
-            // Assumptions:
-            //     [1] Each TLS validation is ~10KB of certs+handshake+payload.
-            //     [2] Network typically provision clients with <=4 nameservers.
-            //     [3] Average month has 30 days.
-            //
-            // Each validation pass in a given hour is ~1.2MB of data. And 24
-            // such validation passes per day is about ~30MB per month, in the
-            // worst case. Otherwise, this will cost ~600 SYNs per month
-            // (6 SYNs per ip, 4 ips per validation pass, 24 passes per day).
-            auto backoff = BackoffSequence<>::Builder()
-                    .withInitialRetransmissionTime(std::chrono::seconds(60))
-                    .withMaximumRetransmissionTime(std::chrono::seconds(3600))
-                    .build();
-
-            while (true) {
-                // ::validate() is a blocking call that performs network operations.
-                // It can take milliseconds to minutes, up to the SYN retry limit.
-                const bool success = DnsTlsTransport::validate(server, netId);
-                if (DBG) {
-                    ALOGD("validateDnsTlsServer returned %d for %s", success,
-                            addrToString(&(server.ss)).c_str());
-                }
-
-                const bool needs_reeval = this->recordPrivateDnsValidation(server, netId, success);
-                if (!needs_reeval) {
-                    break;
-                }
-
-                if (backoff.hasNextTimeout()) {
-                    std::this_thread::sleep_for(backoff.getNextTimeout());
-                } else {
-                    break;
-                }
-            }
-        });
-        validate_thread.detach();
-    }
-
-    bool recordPrivateDnsValidation(const DnsTlsServer& server, unsigned netId, bool success) {
-        constexpr bool NEEDS_REEVALUATION = true;
-        constexpr bool DONT_REEVALUATE = false;
-
-        std::lock_guard guard(mPrivateDnsLock);
-
-        auto netPair = mPrivateDnsTransports.find(netId);
-        if (netPair == mPrivateDnsTransports.end()) {
-            ALOGW("netId %u was erased during private DNS validation", netId);
-            return DONT_REEVALUATE;
-        }
-
-        const auto mode = mPrivateDnsModes.find(netId);
-        if (mode == mPrivateDnsModes.end()) {
-            ALOGW("netId %u has no private DNS validation mode", netId);
-            return DONT_REEVALUATE;
-        }
-        const bool modeDoesReevaluation = (mode->second == PrivateDnsMode::STRICT);
-
-        bool reevaluationStatus =
-                (success || !modeDoesReevaluation) ? DONT_REEVALUATE : NEEDS_REEVALUATION;
-
-        auto& tracker = netPair->second;
-        auto serverPair = tracker.find(server);
-        if (serverPair == tracker.end()) {
-            ALOGW("Server %s was removed during private DNS validation",
-                    addrToString(&(server.ss)).c_str());
-            success = false;
-            reevaluationStatus = DONT_REEVALUATE;
-        } else if (!(serverPair->first == server)) {
-            // TODO: It doesn't seem correct to overwrite the tracker entry for
-            // |server| down below in this circumstance... Fix this.
-            ALOGW("Server %s was changed during private DNS validation",
-                    addrToString(&(server.ss)).c_str());
-            success = false;
-            reevaluationStatus = DONT_REEVALUATE;
-        }
-
-        // Send a validation event to NetdEventListenerService.
-        if (mNetdEventListener == nullptr) {
-            mNetdEventListener = mEventReporter.getNetdEventListener();
-        }
-        if (mNetdEventListener != nullptr) {
-            const String16 ipLiteral(addrToString(&(server.ss)).c_str());
-            const String16 hostname(server.name.empty() ? "" : server.name.c_str());
-            mNetdEventListener->onPrivateDnsValidationEvent(netId, ipLiteral, hostname, success);
-            if (DBG) {
-                ALOGD("Sending validation %s event on netId %u for %s with hostname %s",
-                        success ? "success" : "failure", netId,
-                        addrToString(&(server.ss)).c_str(), server.name.c_str());
-            }
-        } else {
-            ALOGE("Validation event not sent since NetdEventListenerService is unavailable.");
-        }
-
-        if (success) {
-            tracker[server] = Validation::success;
-            if (DBG) {
-                ALOGD("Validation succeeded for %s! Tracker now has %zu entries.",
-                        addrToString(&(server.ss)).c_str(), tracker.size());
-            }
-        } else {
-            // Validation failure is expected if a user is on a captive portal.
-            // TODO: Trigger a second validation attempt after captive portal login
-            // succeeds.
-            tracker[server] = (reevaluationStatus == NEEDS_REEVALUATION) ? Validation::in_process
-                                                                         : Validation::fail;
-            if (DBG) {
-                ALOGD("Validation failed for %s!", addrToString(&(server.ss)).c_str());
-            }
-        }
-
-        return reevaluationStatus;
-    }
-
-    // Start validation for newly added servers as well as any servers that have
-    // landed in Validation::fail state. Note that servers that have failed
-    // multiple validation attempts but for which there is still a validating
-    // thread running are marked as being Validation::in_process.
-    static bool needsValidation(const PrivateDnsTracker& tracker, const DnsTlsServer& server) {
-        const auto& iter = tracker.find(server);
-        return (iter == tracker.end()) || (iter->second == Validation::fail);
-    }
-
-    EventReporter mEventReporter;
-
-    std::mutex mPrivateDnsLock;
-    std::map<unsigned, PrivateDnsMode> mPrivateDnsModes GUARDED_BY(mPrivateDnsLock);
-    // Structure for tracking the validation status of servers on a specific netId.
-    // Using the AddressComparator ensures at most one entry per IP address.
-    std::map<unsigned, PrivateDnsTracker> mPrivateDnsTransports GUARDED_BY(mPrivateDnsLock);
-    android::sp<android::net::metrics::INetdEventListener>
-            mNetdEventListener GUARDED_BY(mPrivateDnsLock);
-} sPrivateDnsConfiguration;
+    return !servers.empty();
+}
 
 }  // namespace
 
@@ -393,30 +122,17 @@ int ResolverController::setDnsServers(unsigned netId, const char* searchDomains,
     if (DBG) {
         ALOGD("setDnsServers netId = %u, numservers = %d", netId, numservers);
     }
-    return -_resolv_set_nameservers_for_net(netId, servers, numservers, searchDomains, params);
-}
-
-ResolverController::PrivateDnsStatus
-ResolverController::getPrivateDnsStatus(unsigned netId) const {
-    return sPrivateDnsConfiguration.getStatus(netId);
+    return -RESOLV_STUB.resolv_set_nameservers_for_net(netId, servers, numservers, searchDomains,
+                                                       params);
 }
 
 int ResolverController::clearDnsServers(unsigned netId) {
-    _resolv_set_nameservers_for_net(netId, nullptr, 0, "", nullptr);
+    RESOLV_STUB.resolv_set_nameservers_for_net(netId, nullptr, 0, "", nullptr);
     if (DBG) {
         ALOGD("clearDnsServers netId = %u\n", netId);
     }
-    sPrivateDnsConfiguration.clear(netId);
-    return 0;
-}
-
-int ResolverController::flushDnsCache(unsigned netId) {
-    if (DBG) {
-        ALOGD("flushDnsCache netId = %u\n", netId);
-    }
-
-    _resolv_flush_cache_for_net(netId);
-
+    mDns64Configuration.stopPrefixDiscovery(netId);
+    RESOLV_STUB.resolv_delete_private_dns_for_net(netId);
     return 0;
 }
 
@@ -438,13 +154,13 @@ int ResolverController::getDnsInfo(unsigned netId, std::vector<std::string>* ser
     sockaddr_storage res_servers[MAXNS];
     int dcount = -1;
     char res_domains[MAXDNSRCH][MAXDNSRCHPATH];
-    __res_stats res_stats[MAXNS];
+    res_stats res_stats[MAXNS];
     servers->clear();
     domains->clear();
     *params = __res_params{};
     stats->clear();
-    int revision_id = android_net_res_stats_get_info_for_net(netId, &nscount, res_servers, &dcount,
-            res_domains, params, res_stats);
+    int revision_id = RESOLV_STUB.android_net_res_stats_get_info_for_net(
+            netId, &nscount, res_servers, &dcount, res_domains, params, res_stats);
 
     // If the netId is unknown (which can happen for valid net IDs for which no DNS servers have
     // yet been configured), there is no revision ID. In this case there is no data to return.
@@ -461,7 +177,7 @@ int ResolverController::getDnsInfo(unsigned netId, std::vector<std::string>* ser
     // Determine which servers are considered usable by the resolver.
     bool valid_servers[MAXNS];
     std::fill_n(valid_servers, MAXNS, false);
-    android_net_res_stats_get_usable_servers(params, res_stats, nscount, valid_servers);
+    RESOLV_STUB.android_net_res_stats_get_usable_servers(params, res_stats, nscount, valid_servers);
 
     // Convert the server sockaddr structures to std::string.
     stats->resize(nscount);
@@ -478,9 +194,9 @@ int ResolverController::getDnsInfo(unsigned netId, std::vector<std::string>* ser
         }
         servers->push_back(std::move(server_str));
         android::net::ResolverStats& cur_stats = (*stats)[i];
-        android_net_res_stats_aggregate(&res_stats[i], &cur_stats.successes, &cur_stats.errors,
-                &cur_stats.timeouts, &cur_stats.internal_errors, &cur_stats.rtt_avg,
-                &cur_stats.last_sample_time);
+        RESOLV_STUB.android_net_res_stats_aggregate(
+                &res_stats[i], &cur_stats.successes, &cur_stats.errors, &cur_stats.timeouts,
+                &cur_stats.internal_errors, &cur_stats.rtt_avg, &cur_stats.last_sample_time);
         cur_stats.usable = valid_servers[i];
     }
 
@@ -505,22 +221,49 @@ int ResolverController::setResolverConfiguration(int32_t netId,
         return -EINVAL;
     }
 
-    const int err = sPrivateDnsConfiguration.set(netId, tlsServers, tlsName, tlsFingerprints);
+    std::vector<const char*> server_ptrs;
+    size_t count = std::min<size_t>(MAXNS, tlsServers.size());
+    server_ptrs.reserve(count);
+    for (size_t i = 0; i < count; i++) {
+        server_ptrs.push_back(tlsServers[i].data());
+    }
+
+    std::vector<const uint8_t*> fingerprint_ptrs;
+    count = tlsFingerprints.size();
+    fingerprint_ptrs.reserve(count);
+    for (const auto& fp : tlsFingerprints) {
+        fingerprint_ptrs.push_back(fp.data());
+    }
+
+    // At private DNS validation time, we only know the netId, so we have to guess/compute the
+    // corresponding socket mark.
+    Fwmark fwmark;
+    fwmark.netId = netId;
+    fwmark.explicitlySelected = true;
+    fwmark.protectedFromVpn = true;
+    fwmark.permission = PERMISSION_SYSTEM;
+
+    const int err = RESOLV_STUB.resolv_set_private_dns_for_net(
+            netId, fwmark.intValue, server_ptrs.data(), server_ptrs.size(), tlsName.c_str(),
+            fingerprint_ptrs.data(), fingerprint_ptrs.size());
     if (err != 0) {
         return err;
     }
+    RESOLV_STUB.resolv_register_private_dns_callback(&onPrivateDnsValidation);
 
     // Convert network-assigned server list to bionic's format.
-    auto server_count = std::min<size_t>(MAXNS, servers.size());
-    std::vector<const char*> server_ptrs;
-    for (size_t i = 0 ; i < server_count ; ++i) {
+    server_ptrs.clear();
+    count = std::min<size_t>(MAXNS, servers.size());
+    server_ptrs.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
         server_ptrs.push_back(servers[i].c_str());
     }
 
     std::string domains_str;
     if (!domains.empty()) {
         domains_str = domains[0];
-        for (size_t i = 1 ; i < domains.size() ; ++i) {
+        count = std::min<size_t>(MAXDNSRCH, domains.size());
+        for (size_t i = 1; i < count; ++i) {
             domains_str += " " + domains[i];
         }
     }
@@ -533,13 +276,37 @@ int ResolverController::setResolverConfiguration(int32_t netId,
     if (params.size() > INetd::RESOLVER_PARAMS_BASE_TIMEOUT_MSEC) {
         res_params.base_timeout_msec = params[INetd::RESOLVER_PARAMS_BASE_TIMEOUT_MSEC];
     }
-    return setDnsServers(netId, domains_str.c_str(), server_ptrs.data(), server_ptrs.size(),
-            &res_params);
+
+    const auto rval = setDnsServers(netId, domains_str.c_str(), server_ptrs.data(),
+                                    server_ptrs.size(), &res_params);
+
+    if (rval == 0) {
+        // Start DNS64 discovery after successfully setting any new DNS servers
+        // as the cache may have been cleared (if the nameservers differ), and
+        // we might discover a different DNS64 prefix. If the cache has not been
+        // cleared, we may quickly rediscover the same prefix.
+        //
+        // Operators may choose to use a longer TTL in order to reduce repeated
+        // resolution (see also https://tools.ietf.org/html/rfc7050#section-5).
+        if (allIPv6Only(servers)) {
+            // TODO: Keep any existing discovered prefix around for use while
+            // re-discovery is in progress. Otherwise, whenever DNS servers are
+            // pushed to netd there can be gaps where it would appear there was
+            // no prefix64 when in fact we had previously discovered one (and
+            // are highly likely to rediscover the same one).
+            mDns64Configuration.startPrefixDiscovery(netId);
+        } else {
+            mDns64Configuration.stopPrefixDiscovery(netId);
+        }
+    }
+
+    return rval;
 }
 
 int ResolverController::getResolverInfo(int32_t netId, std::vector<std::string>* servers,
-        std::vector<std::string>* domains, std::vector<int32_t>* params,
-        std::vector<int32_t>* stats) {
+                                        std::vector<std::string>* domains,
+                                        std::vector<std::string>* tlsServers,
+                                        std::vector<int32_t>* params, std::vector<int32_t>* stats) {
     using android::net::ResolverStats;
     using android::net::INetd;
     __res_params res_params;
@@ -552,6 +319,13 @@ int ResolverController::getResolverInfo(int32_t netId, std::vector<std::string>*
     // Serialize the information for binder.
     ResolverStats::encodeAll(res_stats, stats);
 
+    ExternalPrivateDnsStatus privateDnsStatus = {PrivateDnsMode::OFF, 0, {}};
+    RESOLV_STUB.resolv_get_private_dns_status_for_net(netId, &privateDnsStatus);
+    for (int i = 0; i < privateDnsStatus.numServers; i++) {
+        std::string tlsServer_str = addrToString(&(privateDnsStatus.serverStatus[i].ss));
+        tlsServers->push_back(std::move(tlsServer_str));
+    }
+
     params->resize(INetd::RESOLVER_PARAMS_COUNT);
     (*params)[INetd::RESOLVER_PARAMS_SAMPLE_VALIDITY] = res_params.sample_validity;
     (*params)[INetd::RESOLVER_PARAMS_SUCCESS_THRESHOLD] = res_params.success_threshold;
@@ -559,6 +333,27 @@ int ResolverController::getResolverInfo(int32_t netId, std::vector<std::string>*
     (*params)[INetd::RESOLVER_PARAMS_MAX_SAMPLES] = res_params.max_samples;
     (*params)[INetd::RESOLVER_PARAMS_BASE_TIMEOUT_MSEC] = res_params.base_timeout_msec;
     return 0;
+}
+
+// TODO: use StatusOr<T> to wrap the result.
+int ResolverController::getPrefix64(unsigned netId, netdutils::IPPrefix* prefix) {
+    netdutils::IPPrefix p = mDns64Configuration.getPrefix64(netId);
+    if (p.family() != AF_INET6 || p.length() == 0) {
+        ALOGE("No valid NAT64 prefix (%d,%s)\n", netId, p.toString().c_str());
+        return -ENOENT;
+    }
+    *prefix = p;
+    return 0;
+}
+
+void ResolverController::sendNat64PrefixEvent(const Dns64Configuration::Nat64PrefixInfo& args) {
+    const auto netdEventListener = net::gCtls->eventReporter.getNetdEventListener();
+    if (netdEventListener == nullptr) {
+        gLog.error("getNetdEventListener() returned nullptr. dropping NAT64 prefix event");
+        return;
+    }
+    netdEventListener->onNat64PrefixEvent(args.netId, args.added, args.prefixString,
+                                          args.prefixLength);
 }
 
 void ResolverController::dump(DumpWriter& dw, unsigned netId) {
@@ -613,7 +408,25 @@ void ResolverController::dump(DumpWriter& dw, unsigned netId) {
                     static_cast<unsigned>(params.max_samples), params.base_timeout_msec);
         }
 
-        sPrivateDnsConfiguration.dump(dw, netId);
+        mDns64Configuration.dump(dw, netId);
+        ExternalPrivateDnsStatus privateDnsStatus = {PrivateDnsMode::OFF, 0, {}};
+        RESOLV_STUB.resolv_get_private_dns_status_for_net(netId, &privateDnsStatus);
+        dw.println("Private DNS mode: %s",
+                   getPrivateDnsModeString(static_cast<PrivateDnsMode>(privateDnsStatus.mode)));
+        if (!privateDnsStatus.numServers) {
+            dw.println("No Private DNS servers configured");
+        } else {
+            dw.println("Private DNS configuration (%u entries)", privateDnsStatus.numServers);
+            dw.incIndent();
+            for (int i = 0; i < privateDnsStatus.numServers; i++) {
+                dw.println("%s name{%s} status{%s}",
+                           addrToString(&(privateDnsStatus.serverStatus[i].ss)).c_str(),
+                           privateDnsStatus.serverStatus[i].hostname,
+                           validationStatusToString(static_cast<Validation>(
+                                   privateDnsStatus.serverStatus[i].validation)));
+            }
+            dw.decIndent();
+        }
     }
     dw.decIndent();
 }

@@ -20,54 +20,36 @@
 #include <list>
 #include <vector>
 
+#include "Dns64Configuration.h"
+#include "netdutils/InternetAddresses.h"
+
 struct __res_params;
-struct sockaddr_storage;
 
 namespace android {
 namespace net {
 
-struct DnsTlsServer;
 class DumpWriter;
 struct ResolverStats;
 
-enum class PrivateDnsMode {
-    OFF,
-    OPPORTUNISTIC,
-    STRICT,
-};
-
-
 class ResolverController {
-public:
-    ResolverController() {};
+  public:
+    ResolverController(const NetworkController& netCtrl)
+        : mDns64Configuration(netCtrl, std::bind(&ResolverController::sendNat64PrefixEvent, this,
+                                                 std::placeholders::_1)) {}
 
-    virtual ~ResolverController() {};
+    ~ResolverController() {}
 
     // TODO: delete this function
     int setDnsServers(unsigned netId, const char* searchDomains, const char** servers,
             int numservers, const __res_params* params);
 
-    // Validation status of a DNS over TLS server (on a specific netId).
-    enum class Validation : uint8_t { in_process, success, fail, unknown_server, unknown_netid };
-
-    struct PrivateDnsStatus {
-        PrivateDnsMode mode;
-        std::list<DnsTlsServer> validatedServers;
-    };
-
-    // Retrieve the Private DNS status for the given |netid|.
-    //
-    // If the requested |netid| is not known, the PrivateDnsStatus's mode has a
-    // default value of PrivateDnsMode::OFF, and validatedServers is empty.
-    PrivateDnsStatus getPrivateDnsStatus(unsigned netid) const;
-
     int clearDnsServers(unsigned netid);
-
-    int flushDnsCache(unsigned netid);
 
     int getDnsInfo(unsigned netId, std::vector<std::string>* servers,
             std::vector<std::string>* domains, __res_params* params,
             std::vector<android::net::ResolverStats>* stats);
+
+    int getPrefix64(unsigned netId, netdutils::IPPrefix* prefix);
 
     // Binder specific functions, which convert between the binder int/string arrays and the
     // actual data structures, and call setDnsServer() / getDnsInfo() for the actual processing.
@@ -77,13 +59,16 @@ public:
             const std::set<std::vector<uint8_t>>& tlsFingerprints);
 
     int getResolverInfo(int32_t netId, std::vector<std::string>* servers,
-            std::vector<std::string>* domains, std::vector<int32_t>* params,
-            std::vector<int32_t>* stats);
+                        std::vector<std::string>* domains, std::vector<std::string>* tlsServers,
+                        std::vector<int32_t>* params, std::vector<int32_t>* stats);
+
+    void sendNat64PrefixEvent(const net::Dns64Configuration::Nat64PrefixInfo& args);
 
     void dump(DumpWriter& dw, unsigned netId);
 
+  private:
+    Dns64Configuration mDns64Configuration;
 };
-
 }  // namespace net
 }  // namespace android
 

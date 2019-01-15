@@ -32,9 +32,9 @@ public:
     BandwidthController();
 
     int setupIptablesHooks();
-    static bool getBpfStatus();
+    void setBpfEnabled(bool isEnabled);
 
-    int enableBandwidthControl(bool force);
+    int enableBandwidthControl();
     int disableBandwidthControl();
     int enableDataSaver(bool enable);
 
@@ -46,10 +46,16 @@ public:
     int getInterfaceQuota(const std::string& iface, int64_t* bytes);
     int removeInterfaceQuota(const std::string& iface);
 
+    // TODO: Remove after removing these commands in CommandListener
     int addNaughtyApps(int numUids, const char* const appUids[]);
     int removeNaughtyApps(int numUids, const char* const appUids[]);
     int addNiceApps(int numUids, const char* const appUids[]);
     int removeNiceApps(int numUids, const char* const appUids[]);
+
+    int addNaughtyApps(const std::vector<std::string>& appStrUid);
+    int removeNaughtyApps(const std::vector<std::string>& appStrUid);
+    int addNiceApps(const std::vector<std::string>& appStrUid);
+    int removeNiceApps(const std::vector<std::string>& appStrUid);
 
     int setGlobalAlert(int64_t bytes);
     int removeGlobalAlert();
@@ -67,6 +73,7 @@ public:
     static const char LOCAL_OUTPUT[];
     static const char LOCAL_RAW_PREROUTING[];
     static const char LOCAL_MANGLE_POSTROUTING[];
+    static const char LOCAL_GLOBAL_ALERT[];
 
     enum IptJumpOp { IptJumpReject, IptJumpReturn, IptJumpNoAdd };
     enum IptOp { IptOpInsert, IptOpDelete };
@@ -125,20 +132,11 @@ public:
     static const char *opToString(IptOp op);
     static const char *jumpToString(IptJumpOp jumpHandling);
 
-    bool mBpfSupported;
+    bool mBpfSupported = false;
 
     int64_t mSharedQuotaBytes = 0;
     int64_t mSharedAlertBytes = 0;
     int64_t mGlobalAlertBytes = 0;
-    /*
-     * This tracks the number of tethers setup.
-     * The FORWARD chain is updated in the following cases:
-     *  - The 1st time a globalAlert is setup and there are tethers setup.
-     *  - Anytime a globalAlert is removed and there are tethers setup.
-     *  - The 1st tether is setup and there is a globalAlert active.
-     *  - The last tether is removed and there is a globalAlert active.
-     */
-    int mGlobalAlertTetherCount = 0;
 
     std::map<std::string, QuotaInfo> mQuotaIfaces;
     std::set<std::string> mSharedQuotaIfaces;

@@ -29,9 +29,11 @@
 #include "log/log.h"
 
 #include <android-base/strings.h>
+#include <netd_resolv/resolv.h>
+#include <netd_resolv/resolv_stub.h>
+#include "android/net/INetd.h"
 
 #include "cutils/misc.h"
-#include "resolv_netid.h"
 
 #include "Controllers.h"
 #include "DummyNetwork.h"
@@ -41,6 +43,7 @@
 #include "PhysicalNetwork.h"
 #include "RouteController.h"
 #include "VirtualNetwork.h"
+#include "netid_client.h"
 
 #define DBG 0
 
@@ -59,7 +62,7 @@ const unsigned NetworkController::MIN_OEM_ID   =  1;
 const unsigned NetworkController::MAX_OEM_ID   = 50;
 const unsigned NetworkController::DUMMY_NET_ID = 51;
 // NetIds 52..98 are reserved for future use.
-const unsigned NetworkController::LOCAL_NET_ID = 99;
+const unsigned NetworkController::LOCAL_NET_ID = INetd::LOCAL_NET_ID;
 
 // All calls to methods here are made while holding a write lock on mRWLock.
 // They are mostly not called directly from this class, but from methods in PhysicalNetwork.cpp.
@@ -219,7 +222,7 @@ uint32_t NetworkController::getNetworkForDnsLocked(unsigned* netId, uid_t uid) c
         // http://b/29498052
         Network *network = getNetworkLocked(*netId);
         if (network && network->getType() == Network::VIRTUAL &&
-                !static_cast<VirtualNetwork *>(network)->getHasDns()) {
+            !RESOLV_STUB.resolv_has_nameservers(*netId)) {
             *netId = mDefaultNetId;
         }
     } else {
@@ -228,7 +231,7 @@ uint32_t NetworkController::getNetworkForDnsLocked(unsigned* netId, uid_t uid) c
         // them). Otherwise, use the default network's DNS servers. We cannot set the explicit bit
         // because we need to be able to fall through a split tunnel to the default network.
         VirtualNetwork* virtualNetwork = getVirtualNetworkForUserLocked(uid);
-        if (virtualNetwork && virtualNetwork->getHasDns()) {
+        if (virtualNetwork && RESOLV_STUB.resolv_has_nameservers(virtualNetwork->getNetId())) {
             *netId = virtualNetwork->getNetId();
         } else {
             // TODO: return an error instead of silently doing the DNS lookup on the wrong network.
@@ -412,7 +415,7 @@ int NetworkController::createPhysicalOemNetwork(Permission permission, unsigned 
     return ret;
 }
 
-int NetworkController::createVirtualNetwork(unsigned netId, bool hasDns, bool secure) {
+int NetworkController::createVirtualNetwork(unsigned netId, bool secure) {
     ScopedWLock lock(mRWLock);
 
     if (!(MIN_NET_ID <= netId && netId <= MAX_NET_ID)) {
@@ -428,7 +431,7 @@ int NetworkController::createVirtualNetwork(unsigned netId, bool hasDns, bool se
     if (int ret = modifyFallthroughLocked(netId, true)) {
         return ret;
     }
-    mNetworks[netId] = new VirtualNetwork(netId, hasDns, secure);
+    mNetworks[netId] = new VirtualNetwork(netId, secure);
     return 0;
 }
 
@@ -470,7 +473,7 @@ int NetworkController::destroyNetwork(unsigned netId) {
     }
     mNetworks.erase(netId);
     delete network;
-    _resolv_delete_cache_for_net(netId);
+    RESOLV_STUB.resolv_delete_cache_for_net(netId);
 
     for (auto iter = mIfindexToLastNetId.begin(); iter != mIfindexToLastNetId.end();) {
         if (iter->second == netId) {
