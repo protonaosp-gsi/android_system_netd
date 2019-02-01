@@ -96,6 +96,9 @@ class NetdNativeService : public BinderService<NetdNativeService>, public BnNetd
     binder::Status networkGetDefault(int32_t* netId) override;
     binder::Status networkCanProtect(int32_t uid, bool* ret) override;
 
+    binder::Status trafficSetNetPermForUids(int32_t permission,
+                                            const std::vector<int32_t>& uids) override;
+
     // SOCK_DIAG commands.
     binder::Status socketDestroy(const std::vector<UidRangeParcel>& uids,
                                  const std::vector<int32_t>& skipUids) override;
@@ -152,10 +155,6 @@ class NetdNativeService : public BinderService<NetdNativeService>, public BnNetd
                                  const std::string& parameter, std::string* value) override;
     binder::Status setProcSysNet(int32_t ipversion, int32_t which, const std::string& ifname,
                                  const std::string& parameter, const std::string& value) override;
-
-    // Metrics reporting level set / get (internal use only).
-    binder::Status getMetricsReportingLevel(int *reportingLevel) override;
-    binder::Status setMetricsReportingLevel(const int reportingLevel) override;
 
     binder::Status ipSecSetEncapSocketOwner(const os::ParcelFileDescriptor& socket, int newUid);
 
@@ -252,6 +251,9 @@ class NetdNativeService : public BinderService<NetdNativeService>, public BnNetd
 
     // DNS64-related commands (internal use only)
     binder::Status getPrefix64(int netId, std::string* _aidl_return);
+
+    binder::Status registerUnsolicitedEventListener(
+            const android::sp<android::net::INetdUnsolicitedEventListener>& listener) override;
 
   private:
     std::vector<uid_t> intsToUids(const std::vector<int32_t>& intUids);

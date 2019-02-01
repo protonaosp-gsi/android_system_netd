@@ -18,6 +18,7 @@ package android.net;
 
 import android.net.UidRangeParcel;
 import android.net.TetherStatsParcel;
+import android.net.INetdUnsolicitedEventListener;
 import android.net.InterfaceConfigurationParcel;
 
 /** {@hide} */
@@ -301,17 +302,6 @@ interface INetd {
             in @utf8InCpp String parameter);
     void setProcSysNet(int ipversion, int which, in @utf8InCpp String ifname,
             in @utf8InCpp String parameter, in @utf8InCpp String value);
-
-    /**
-     * Get/Set metrics reporting level.
-     *
-     * Reporting level is one of:
-     *     0 (NONE)
-     *     1 (METRICS)
-     *     2 (FULL)
-     */
-    int getMetricsReportingLevel();
-    void setMetricsReportingLevel(int level);
 
    /**
     * Sets owner of socket ParcelFileDescriptor to the new UID, checking to ensure that the caller's
@@ -993,6 +983,34 @@ interface INetd {
     void networkClearPermissionForUser(in int[] uids);
 
    /**
+    * NO_PERMISSIONS indicate that the app is uninstalled and the permission need to be revoked or
+    * this app doesn't have either PERMISSION_INTERNET or PERMISSION_UPDATE_DEVICE_STATS
+    */
+    const int NO_PERMISSIONS = 0;
+
+   /**
+    * PERMISSION_INTERNET indicates that the app can create AF_INET and AF_INET6 sockets
+    */
+    const int PERMISSION_INTERNET = 1;
+
+   /**
+    * PERMISSION_UPDATE_DEVICE_STATS is used for system UIDs and privileged apps
+    * that have the UPDATE_DEVICE_STATS permission
+    */
+    const int PERMISSION_UPDATE_DEVICE_STATS = 2;
+
+   /**
+    * Assigns android.permission.INTERNET and/or android.permission.UPDATE_DEVICE_STATS to the uids
+    * specified. Or remove all permissions from the uids.
+    *
+    * @param permission The permission to grant, it could be either PERMISSION_INTERNET and/or
+    *                   PERMISSION_UPDATE_DEVICE_STATS. If the permission is NO_PERMISSIONS, then
+    *                   revoke all permissions for the uids.
+    * @param uids uid of users to grant permission
+    */
+    void trafficSetNetPermForUids(int permission, in int[] uids);
+
+   /**
     * Gives the specified user permission to protect sockets from VPNs.
     * Typically used by VPN apps themselves, to ensure that the sockets
     * they use to communicate with the VPN server aren't routed through
@@ -1192,4 +1210,16 @@ interface INetd {
      * TODO: Remove this once the tests have been updated to listen for onNat64PrefixEvent.
      */
     @utf8InCpp String getPrefix64(int netId);
+
+   /**
+    * Register unsolicited event listener
+    * Netd supports multiple unsolicited event listeners, but only one per pid
+    * A newer listener won't be registed if netd has an old one on the same pid.
+    *
+    * @param listener unsolicited event listener to register
+    * @throws ServiceSpecificException in case of failure, with an error code indicating the
+    *         cause of the the failure.
+    */
+    void registerUnsolicitedEventListener(INetdUnsolicitedEventListener listener);
+
 }

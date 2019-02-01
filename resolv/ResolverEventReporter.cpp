@@ -14,18 +14,20 @@
  * limitations under the License.
  */
 
-#ifndef NETD_CLIENT_NETID_H
-#define NETD_CLIENT_NETID_H
+#include <android/binder_manager.h>
 
-/*
- * Passing NETID_UNSET as the netId causes system/netd/resolv/DnsProxyListener.cpp to
- * fill in the appropriate default netId for the query.
- */
-#define NETID_UNSET 0u
+#include "netd_resolv/ResolverEventReporter.h"
 
-/*
- * MARK_UNSET represents the default (i.e. unset) value for a socket mark.
- */
-#define MARK_UNSET 0u
+using aidl::android::net::metrics::INetdEventListener;
 
-#endif  // NETD_CLIENT_NETID_H
+std::shared_ptr<INetdEventListener> ResolverEventReporter::getListener() {
+    // It should be initialized only once.
+    static ResolverEventReporter reporter;
+
+    return reporter.mListener;
+}
+
+ResolverEventReporter::ResolverEventReporter() {
+    ndk::SpAIBinder binder = ndk::SpAIBinder(AServiceManager_getService("netd_listener"));
+    mListener = INetdEventListener::fromBinder(binder);
+}

@@ -37,7 +37,6 @@
 
 #include "Controllers.h"
 #include "DumpWriter.h"
-#include "EventReporter.h"
 #include "InterfaceController.h"
 #include "NetdConstants.h"  // SHA256_SIZE
 #include "NetdNativeService.h"
@@ -202,6 +201,19 @@ status_t NetdNativeService::dump(int fd, const Vector<String16> &args) {
             dw.println("Log:");
             ScopedIndent indentLogEntries(dw);
             gLog.forEachEntry([&dw](const std::string& entry) mutable { dw.println(entry); });
+        }
+        dw.blankline();
+    }
+
+    {
+        ScopedIndent indentLog(dw);
+        if (contains(args, String16(OPT_SHORT))) {
+            dw.println("UnsolicitedLog: <omitted>");
+        } else {
+            dw.println("UnsolicitedLog:");
+            ScopedIndent indentLogEntries(dw);
+            gUnsolicitedLog.forEachEntry(
+                    [&dw](const std::string& entry) mutable { dw.println(entry); });
         }
         dw.blankline();
     }
@@ -720,27 +732,6 @@ binder::Status NetdNativeService::setProcSysNet(int32_t ipversion, int32_t which
                                                       parameter.c_str(), value.c_str());
     gLog.log(entry.returns(err).withAutomaticDuration());
     return statusFromErrcode(err);
-}
-
-binder::Status NetdNativeService::getMetricsReportingLevel(int *reportingLevel) {
-    // This function intentionally does not lock, since the only thing it does is one read from an
-    // atomic_int.
-    ENFORCE_PERMISSION(CONNECTIVITY_INTERNAL);
-    ENFORCE_DEBUGGABLE();
-
-    *reportingLevel = gCtls->eventReporter.getMetricsReportingLevel();
-    return binder::Status::ok();
-}
-
-binder::Status NetdNativeService::setMetricsReportingLevel(const int reportingLevel) {
-    // This function intentionally does not lock, since the only thing it does is one write to an
-    // atomic_int.
-    ENFORCE_PERMISSION(CONNECTIVITY_INTERNAL);
-    ENFORCE_DEBUGGABLE();
-
-    return (gCtls->eventReporter.setMetricsReportingLevel(reportingLevel) == 0)
-            ? binder::Status::ok()
-            : binder::Status::fromExceptionCode(binder::Status::EX_ILLEGAL_ARGUMENT);
 }
 
 binder::Status NetdNativeService::ipSecSetEncapSocketOwner(const ParcelFileDescriptor& socket,
@@ -1373,6 +1364,15 @@ binder::Status NetdNativeService::networkCanProtect(int32_t uid, bool* ret) {
     return binder::Status::ok();
 }
 
+binder::Status NetdNativeService::trafficSetNetPermForUids(int32_t permission,
+                                                           const std::vector<int32_t>& uids) {
+    ENFORCE_PERMISSION(NETWORK_STACK);
+    auto entry = gLog.newEntry().prettyFunction(__PRETTY_FUNCTION__).arg(permission).arg(uids);
+    gCtls->trafficCtrl.setPermissionForUids(permission, intsToUids(uids));
+    gLog.log(entry.withAutomaticDuration());
+    return binder::Status::ok();
+}
+
 namespace {
 std::string ruleToString(int32_t rule) {
     switch (rule) {
@@ -1512,6 +1512,15 @@ binder::Status NetdNativeService::getPrefix64(int netId, std::string* _aidl_retu
                 -err, String8::format("ResolverController error: %s", strerror(-err)));
     }
     *_aidl_return = prefix.toString();
+    return binder::Status::ok();
+}
+
+binder::Status NetdNativeService::registerUnsolicitedEventListener(
+        const android::sp<android::net::INetdUnsolicitedEventListener>& listener) {
+    ENFORCE_PERMISSION(NETWORK_STACK);
+    auto entry = gLog.newEntry().prettyFunction(__PRETTY_FUNCTION__);
+    gCtls->eventReporter.registerUnsolEventListener(listener);
+    gLog.log(entry.withAutomaticDuration());
     return binder::Status::ok();
 }
 

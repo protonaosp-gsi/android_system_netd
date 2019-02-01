@@ -17,37 +17,32 @@
 #ifndef _DNSPROXYLISTENER_H__
 #define _DNSPROXYLISTENER_H__
 
-#include <binder/IServiceManager.h>
+#include <sysutils/FrameworkCommand.h>
 #include <sysutils/FrameworkListener.h>
 
-#include "EventReporter.h"
-#include "NetdCommand.h"
-#include "netd_resolv/resolv.h"  // android_net_context
+#include "resolv.h"  // android_net_context
 
 namespace android {
 namespace net {
 
-class NetworkController;
-
 class DnsProxyListener : public FrameworkListener {
   public:
-    explicit DnsProxyListener(const NetworkController* netCtrl, EventReporter* eventReporter);
+    DnsProxyListener();
     virtual ~DnsProxyListener() {}
+
+    bool setCallbacks(const dnsproxylistener_callbacks& callbacks);
 
     static constexpr const char* SOCKET_NAME = "dnsproxyd";
 
+    // TODO: Considering putting this callbacks structure in its own file.
+    dnsproxylistener_callbacks mCallbacks{};
+
   private:
-    const NetworkController *mNetCtrl;
-    EventReporter *mEventReporter;
-
-    class GetAddrInfoCmd : public NetdCommand {
+    class GetAddrInfoCmd : public FrameworkCommand {
       public:
-        explicit GetAddrInfoCmd(DnsProxyListener* dnsProxyListener);
+        GetAddrInfoCmd();
         virtual ~GetAddrInfoCmd() {}
-        int runCommand(SocketClient *c, int argc, char** argv);
-
-      private:
-        DnsProxyListener* mDnsProxyListener;
+        int runCommand(SocketClient* c, int argc, char** argv) override;
     };
 
     /* ------ getaddrinfo ------*/
@@ -55,7 +50,7 @@ class DnsProxyListener : public FrameworkListener {
       public:
         // Note: All of host, service, and hints may be NULL
         GetAddrInfoHandler(SocketClient* c, char* host, char* service, addrinfo* hints,
-                           const android_net_context& netcontext, int reportingLevel);
+                           const android_net_context& netcontext);
         ~GetAddrInfoHandler();
 
         void run();
@@ -68,24 +63,20 @@ class DnsProxyListener : public FrameworkListener {
         char* mService;         // owned. TODO: convert to std::string.
         addrinfo* mHints;       // owned
         android_net_context mNetContext;
-        const int mReportingLevel;
     };
 
     /* ------ gethostbyname ------*/
-    class GetHostByNameCmd : public NetdCommand {
+    class GetHostByNameCmd : public FrameworkCommand {
       public:
-        explicit GetHostByNameCmd(DnsProxyListener* dnsProxyListener);
+        GetHostByNameCmd();
         virtual ~GetHostByNameCmd() {}
-        int runCommand(SocketClient *c, int argc, char** argv);
-
-      private:
-        DnsProxyListener* mDnsProxyListener;
+        int runCommand(SocketClient* c, int argc, char** argv) override;
     };
 
     class GetHostByNameHandler {
       public:
         GetHostByNameHandler(SocketClient* c, char* name, int af,
-                             const android_net_context& netcontext, int reportingLevel);
+                             const android_net_context& netcontext);
         ~GetHostByNameHandler();
 
         void run();
@@ -97,27 +88,20 @@ class DnsProxyListener : public FrameworkListener {
         char* mName;           // owned. TODO: convert to std::string.
         int mAf;
         android_net_context mNetContext;
-        const int mReportingLevel;
     };
 
     /* ------ gethostbyaddr ------*/
-    class GetHostByAddrCmd : public NetdCommand {
+    class GetHostByAddrCmd : public FrameworkCommand {
       public:
-        explicit GetHostByAddrCmd(const DnsProxyListener* dnsProxyListener);
+        GetHostByAddrCmd();
         virtual ~GetHostByAddrCmd() {}
-        int runCommand(SocketClient *c, int argc, char** argv);
-
-      private:
-        const DnsProxyListener* mDnsProxyListener;
+        int runCommand(SocketClient* c, int argc, char** argv) override;
     };
 
     class GetHostByAddrHandler {
       public:
-        GetHostByAddrHandler(SocketClient *c,
-                            void* address,
-                            int addressLen,
-                            int addressFamily,
-                            const android_net_context& netcontext);
+        GetHostByAddrHandler(SocketClient* c, void* address, int addressLen, int addressFamily,
+                             const android_net_context& netcontext);
         ~GetHostByAddrHandler();
 
         void run();
@@ -133,20 +117,17 @@ class DnsProxyListener : public FrameworkListener {
     };
 
     /* ------ resnsend ------*/
-    class ResNSendCommand : public NetdCommand {
+    class ResNSendCommand : public FrameworkCommand {
       public:
-        explicit ResNSendCommand(DnsProxyListener* dnsProxyListener);
+        ResNSendCommand();
         ~ResNSendCommand() override {}
-        int runCommand(SocketClient* c, int argc, char** argv);
-
-      private:
-        DnsProxyListener* mDnsProxyListener;
+        int runCommand(SocketClient* c, int argc, char** argv) override;
     };
 
     class ResNSendHandler {
       public:
-        ResNSendHandler(SocketClient* c, std::string msg, const android_net_context& netcontext,
-                        int reportingLevel);
+        ResNSendHandler(SocketClient* c, std::string msg, uint32_t flags,
+                        const android_net_context& netcontext);
         ~ResNSendHandler();
 
         void run();
@@ -154,8 +135,8 @@ class DnsProxyListener : public FrameworkListener {
       private:
         SocketClient* mClient;  // ref counted
         std::string mMsg;
+        uint32_t mFlags;
         android_net_context mNetContext;
-        const int mReportingLevel;
     };
 };
 

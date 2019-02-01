@@ -122,7 +122,7 @@ int netdClientSocket(int domain, int type, int protocol) {
     if (socketFd == -1) {
         return -1;
     }
-    unsigned netId = netIdForProcess;
+    unsigned netId = netIdForProcess & ~NETID_USE_LOCAL_NAMESERVERS;
     if (netId != NETID_UNSET && FwmarkClient::shouldSetFwmark(domain)) {
         if (int error = setNetworkForSocket(netId, socketFd)) {
             return closeFdAndSetErrno(socketFd, error);
@@ -165,7 +165,7 @@ int setNetworkForTarget(unsigned netId, std::atomic_uint* target) {
     }
     int error = setNetworkForSocket(netId, socketFd);
     if (!error) {
-        *target = (target == &netIdForResolv) ? requestedNetId : netId;
+        *target = requestedNetId;
     }
     close(socketFd);
     return error;
@@ -327,7 +327,7 @@ extern "C" int getNetworkForSocket(unsigned* netId, int socketFd) {
 }
 
 extern "C" unsigned getNetworkForProcess() {
-    return netIdForProcess;
+    return netIdForProcess & ~NETID_USE_LOCAL_NAMESERVERS;
 }
 
 extern "C" int setNetworkForSocket(unsigned netId, int socketFd) {
@@ -394,7 +394,7 @@ extern "C" int resNetworkQuery(unsigned netId, const char* dname, int ns_class, 
     return resNetworkSend(netId, buf.data(), len, flags);
 }
 
-extern "C" int resNetworkSend(unsigned netId, const uint8_t* msg, size_t msglen, uint32_t) {
+extern "C" int resNetworkSend(unsigned netId, const uint8_t* msg, size_t msglen, uint32_t flags) {
     // Encode
     // Base 64 encodes every 3 bytes into 4 characters, but then adds padding to the next
     // multiple of 4 and a \0
@@ -409,7 +409,8 @@ extern "C" int resNetworkSend(unsigned netId, const uint8_t* msg, size_t msglen,
     }
     // Send
     netId = getNetworkForResolv(netId);
-    const std::string cmd = "resnsend " + encodedQuery + " " + std::to_string(netId) + '\0';
+    const std::string cmd = "resnsend " + std::to_string(netId) + " " + std::to_string(flags) +
+                            " " + encodedQuery + '\0';
     if (cmd.size() > MAX_CMD_SIZE) {
         // Cmd size must less than buffer size of FrameworkListener
         return -EMSGSIZE;
