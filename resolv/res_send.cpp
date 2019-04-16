@@ -74,8 +74,7 @@
  * Send query to name server and wait for reply.
  */
 
-constexpr bool kVerboseLogging = false;
-#define LOG_TAG "res_send"
+#define LOG_TAG "resolv"
 
 #include <sys/param.h>
 #include <sys/socket.h>
@@ -92,13 +91,13 @@ constexpr bool kVerboseLogging = false;
 #include <netdb.h>
 #include <poll.h>
 #include <signal.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <android-base/logging.h>
+#include <android/multinetwork.h>  // ResNsendFlags
 
 #include <netdutils/Slice.h>
 #include "DnsTlsDispatcher.h"
@@ -115,42 +114,17 @@ constexpr bool kVerboseLogging = false;
 using namespace android::net;
 using android::netdutils::Slice;
 
-#define VLOG if (!kVerboseLogging) {} else LOG(INFO)
-
-#ifndef RESOLV_ALLOW_VERBOSE_LOGGING
-static_assert(kVerboseLogging == false,
-              "Verbose logging floods logs at high-rate and exposes privacy-sensitive information. "
-              "Do not enable in release builds.");
-#endif
-
-#ifndef DEBUG
-#define Dprint(cond, args)               /*empty*/
-#define DprintQ(cond, args, query, size) /*empty*/
-#else
-// TODO: convert to Android logging
-#define Dprint(cond, args) \
-    if (cond) {            \
-        fprintf args;      \
-    } else {               \
-    }
-#define DprintQ(cond, args, query, size)        \
-    if (cond) {                                 \
-        fprintf args;                           \
-        res_pquery(statp, query, size, stdout); \
-    } else {                                    \
-    }
-#endif  // DEBUG
-
 static DnsTlsDispatcher sDnsTlsDispatcher;
 
 static int get_salen(const struct sockaddr*);
 static struct sockaddr* get_nsaddr(res_state, size_t);
-static int send_vc(res_state, struct __res_params* params, const u_char*, int, u_char*, int, int*,
-                   int, time_t*, int*, int*);
-static int send_dg(res_state, struct __res_params* params, const u_char*, int, u_char*, int, int*,
-                   int, int*, int*, time_t*, int*, int*);
-static void Aerror(const res_state, FILE*, const char*, int, const struct sockaddr*, int);
-static void Perror(const res_state, FILE*, const char*, int);
+static int send_vc(res_state, res_params* params, const u_char*, int, u_char*, int, int*, int,
+                   time_t*, int*, int*);
+static int send_dg(res_state, res_params* params, const u_char*, int, u_char*, int, int*, int, int*,
+                   int*, time_t*, int*, int*);
+static void Aerror(const res_state, const char*, int, const struct sockaddr*, int);
+static void Perror(const res_state, const char*, int);
+
 static int sock_eq(struct sockaddr*, struct sockaddr*);
 static int connect_with_timeout(int sock, const struct sockaddr* nsap, socklen_t salen,
                                 const struct timespec timeout);
@@ -251,7 +225,7 @@ static int random_bind(int s, int family) {
     /* first try to bind to a random source port a few times */
     for (j = 0; j < 10; j++) {
         /* find a random port between 1025 .. 65534 */
-        int port = 1025 + (res_randomid() % (65535 - 1025));
+        int port = 1025 + (arc4random_uniform(65535 - 1025));
         if (family == AF_INET)
             u.sin.sin_port = htons(port);
         else
@@ -270,6 +244,15 @@ static int random_bind(int s, int family) {
     return bind(s, &u.sa, slen);
 }
 /* BIONIC-END */
+
+// Disables all nameservers other than selectedServer
+static void res_set_usable_server(int selectedServer, int nscount, bool usable_servers[]) {
+    int usableIndex = 0;
+    for (int ns = 0; ns < nscount; ns++) {
+        if (usable_servers[ns]) ++usableIndex;
+        if (usableIndex != selectedServer) usable_servers[ns] = false;
+    }
+}
 
 /* int
  * res_isourserver(ina)
@@ -338,9 +321,9 @@ int res_nameinquery(const char* name, int type, int cl, const u_char* buf, const
         if (n < 0) return (-1);
         cp += n;
         if (cp + 2 * INT16SZ > eom) return (-1);
-        int ttype = ns_get16(cp);
+        int ttype = ntohs(*reinterpret_cast<const uint16_t*>(cp));
         cp += INT16SZ;
-        int tclass = ns_get16(cp);
+        int tclass = ntohs(*reinterpret_cast<const uint16_t*>(cp));
         cp += INT16SZ;
         if (ttype == type && tclass == cl && ns_samename(tname, name) == 1) return (1);
     }
@@ -380,9 +363,9 @@ int res_queriesmatch(const u_char* buf1, const u_char* eom1, const u_char* buf2,
         if (n < 0) return (-1);
         cp += n;
         if (cp + 2 * INT16SZ > eom1) return (-1);
-        int ttype = ns_get16(cp);
+        int ttype = ntohs(*reinterpret_cast<const uint16_t*>(cp));
         cp += INT16SZ;
-        int tclass = ns_get16(cp);
+        int tclass = ntohs(*reinterpret_cast<const uint16_t*>(cp));
         cp += INT16SZ;
         if (!res_nameinquery(tname, ttype, tclass, buf2, eom2)) return (0);
     }
@@ -399,8 +382,9 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
         errno = EINVAL;
         return -EINVAL;
     }
-    DprintQ((statp->options & RES_DEBUG) || (statp->pfcode & RES_PRF_QUERY),
-            (stdout, ";; res_send()\n"), buf, buflen);
+    LOG(DEBUG) << __func__;
+    res_pquery(buf, buflen);
+
     v_circuit = (statp->options & RES_USEVC) || buflen > PACKETSZ;
     gotsomewhere = 0;
     terrno = ETIMEDOUT;
@@ -409,6 +393,8 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
     cache_status = _resolv_cache_lookup(statp->netid, buf, buflen, ans, anssiz, &anslen, flags);
 
     if (cache_status == RESOLV_CACHE_FOUND) {
+        HEADER* hp = (HEADER*)(void*)ans;
+        *rcode = hp->rcode;
         return anslen;
     } else if (cache_status != RESOLV_CACHE_UNSUPPORTED) {
         // had a cache miss for a known network, so populate the thread private
@@ -506,17 +492,32 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
         statp->_u._ext.nstimes[lastns] = nstime;
     }
 
+    res_stats stats[MAXNS];
+    res_params params;
+    int revision_id = resolv_cache_get_resolver_stats(statp->netid, &params, stats);
+    if (revision_id < 0) {
+        // TODO: Remove errno once callers stop using it
+        errno = ESRCH;
+        return -ESRCH;
+    }
+    bool usable_servers[MAXNS];
+    int usableServersCount = android_net_res_stats_get_usable_servers(
+            &params, stats, statp->nscount, usable_servers);
+
+    if ((flags & ANDROID_RESOLV_NO_RETRY) && usableServersCount > 1) {
+        auto hp = reinterpret_cast<const HEADER*>(buf);
+
+        // Select a random server based on the query id
+        int selectedServer = (hp->id % usableServersCount) + 1;
+        res_set_usable_server(selectedServer, statp->nscount, usable_servers);
+    }
+
     /*
      * Send request, RETRY times, or until successful.
      */
-    int retryTimes = (flags & ANDROID_RESOLV_NO_RETRY) ? 1 : statp->retry;
+    int retryTimes = (flags & ANDROID_RESOLV_NO_RETRY) ? 1 : params.retry_count;
 
     for (int attempt = 0; attempt < retryTimes; ++attempt) {
-        struct res_stats stats[MAXNS];
-        struct __res_params params;
-        int revision_id = resolv_cache_get_resolver_stats(statp->netid, &params, stats);
-        bool usable_servers[MAXNS];
-        android_net_res_stats_get_usable_servers(&params, stats, statp->nscount, usable_servers);
 
         for (int ns = 0; ns < statp->nscount; ns++) {
             if (!usable_servers[ns]) continue;
@@ -551,10 +552,10 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
 
             [[maybe_unused]] static const int niflags = NI_NUMERICHOST | NI_NUMERICSERV;
             [[maybe_unused]] char abuf[NI_MAXHOST];
-            Dprint(((statp->options & RES_DEBUG) &&
-                    getnameinfo(nsap, (socklen_t) nsaplen, abuf, sizeof(abuf), NULL, 0, niflags) ==
-                            0),
-                   (stdout, ";; Querying server (# %d) address = %s\n", ns + 1, abuf));
+
+            if (getnameinfo(nsap, (socklen_t)nsaplen, abuf, sizeof(abuf), NULL, 0, niflags) == 0)
+                LOG(DEBUG) << __func__ << ": Querying server (# " << ns + 1
+                           << ") address = " << abuf;
 
             if (v_circuit) {
                 /* Use VC; at most one attempt per server. */
@@ -576,7 +577,7 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
                                                             params.max_samples);
                 }
 
-                VLOG << "used send_vc " << n;
+                LOG(INFO) << __func__ << ": used send_vc " << n;
 
                 if (n < 0) {
                     _resolv_cache_query_failed(statp->netid, buf, buflen, flags);
@@ -587,7 +588,7 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
                 resplen = n;
             } else {
                 /* Use datagrams. */
-                VLOG << "using send_dg";
+                LOG(INFO) << __func__ << ": using send_dg";
 
                 n = send_dg(statp, &params, buf, buflen, ans, anssiz, &terrno, ns, &v_circuit,
                             &gotsomewhere, &now, rcode, &delay);
@@ -600,7 +601,7 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
                                                             params.max_samples);
                 }
 
-                VLOG << "used send_dg " << n;
+                LOG(INFO) << __func__ << ": used send_dg " << n;
 
                 if (n < 0) {
                     _resolv_cache_query_failed(statp->netid, buf, buflen, flags);
@@ -608,17 +609,12 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
                     return -terrno;
                 };
                 if (n == 0) goto next_ns;
-                VLOG << "time=" << time(NULL);
                 if (v_circuit) goto same_ns;
                 resplen = n;
             }
 
-            Dprint((statp->options & RES_DEBUG) ||
-                           ((statp->pfcode & RES_PRF_REPLY) && (statp->pfcode & RES_PRF_HEAD1)),
-                   (stdout, ";; got answer:\n"));
-
-            DprintQ((statp->options & RES_DEBUG) || (statp->pfcode & RES_PRF_REPLY),
-                    (stdout, "%s", ""), ans, (resplen > anssiz) ? anssiz : resplen);
+            LOG(DEBUG) << __func__ << ": got answer:";
+            res_pquery(ans, (resplen > anssiz) ? anssiz : resplen);
 
             if (cache_status == RESOLV_CACHE_NOTFOUND) {
                 _resolv_cache_add(statp->netid, buf, buflen, ans, resplen);
@@ -651,7 +647,6 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
         errno = terrno;
     }
     _resolv_cache_query_failed(statp->netid, buf, buflen, flags);
-
     return -terrno;
 }
 
@@ -687,25 +682,20 @@ static struct sockaddr* get_nsaddr(res_state statp, size_t n) {
     }
 }
 
-static struct timespec get_timeout(const res_state statp, const struct __res_params* params,
-                                   const int ns) {
+static struct timespec get_timeout(const res_state statp, const res_params* params, const int ns) {
     int msec;
-    if (params->base_timeout_msec != 0) {
-        // TODO: scale the timeout by retry attempt and maybe number of servers
-        msec = params->base_timeout_msec;
-    } else {
-        // Legacy algorithm which scales the timeout by nameserver number.
-        // For instance, with 4 nameservers: 5s, 2.5s, 5s, 10s
-        // This has no effect with 1 or 2 nameservers
-        msec = (statp->retrans * 1000) << ns;
-        if (ns > 0) {
-            msec /= statp->nscount;
-        }
-        if (msec < 1000) {
-            msec = 1000;  // Use at least 100ms
-        }
+    // Legacy algorithm which scales the timeout by nameserver number.
+    // For instance, with 4 nameservers: 5s, 2.5s, 5s, 10s
+    // This has no effect with 1 or 2 nameservers
+    msec = params->base_timeout_msec << ns;
+    if (ns > 0) {
+        msec /= statp->nscount;
     }
-    VLOG << "using timeout of " << msec << " msec";
+    // For safety, don't allow OEMs and experiments to configure a timeout shorter than 1s.
+    if (msec < 1000) {
+        msec = 1000;  // Use at least 1000ms
+    }
+    LOG(INFO) << __func__ << ": using timeout of " << msec << " msec";
 
     struct timespec result;
     result.tv_sec = msec / 1000;
@@ -713,21 +703,19 @@ static struct timespec get_timeout(const res_state statp, const struct __res_par
     return result;
 }
 
-static int send_vc(res_state statp, struct __res_params* params, const u_char* buf, int buflen,
-                   u_char* ans, int anssiz, int* terrno, int ns, time_t* at, int* rcode,
-                   int* delay) {
+static int send_vc(res_state statp, res_params* params, const u_char* buf, int buflen, u_char* ans,
+                   int anssiz, int* terrno, int ns, time_t* at, int* rcode, int* delay) {
     *at = time(NULL);
     *delay = 0;
     const HEADER* hp = (const HEADER*) (const void*) buf;
     HEADER* anhp = (HEADER*) (void*) ans;
     struct sockaddr* nsap;
     int nsaplen;
-    int truncating, connreset, resplen, n;
+    int truncating, connreset, n;
     struct iovec iov[2];
-    u_short len;
     u_char* cp;
 
-    VLOG << "using send_vc";
+    LOG(INFO) << __func__ << ": using send_vc";
 
     nsap = get_nsaddr(statp, (size_t) ns);
     nsaplen = get_salen(nsap);
@@ -762,11 +750,11 @@ same_ns:
                 case EPROTONOSUPPORT:
                 case EPFNOSUPPORT:
                 case EAFNOSUPPORT:
-                    Perror(statp, stderr, "socket(vc)", errno);
+                    Perror(statp, "socket(vc)", errno);
                     return 0;
                 default:
                     *terrno = errno;
-                    Perror(statp, stderr, "socket(vc)", errno);
+                    Perror(statp, "socket(vc)", errno);
                     return -1;
             }
         }
@@ -775,21 +763,21 @@ same_ns:
             if (setsockopt(statp->_vcsock, SOL_SOCKET, SO_MARK, &statp->_mark,
                            sizeof(statp->_mark)) < 0) {
                 *terrno = errno;
-                Perror(statp, stderr, "setsockopt", errno);
+                Perror(statp, "setsockopt", errno);
                 return -1;
             }
         }
         errno = 0;
         if (random_bind(statp->_vcsock, nsap->sa_family) < 0) {
             *terrno = errno;
-            Aerror(statp, stderr, "bind/vc", errno, nsap, nsaplen);
+            Aerror(statp, "bind/vc", errno, nsap, nsaplen);
             res_nclose(statp);
             return (0);
         }
         if (connect_with_timeout(statp->_vcsock, nsap, (socklen_t) nsaplen,
                                  get_timeout(statp, params, ns)) < 0) {
             *terrno = errno;
-            Aerror(statp, stderr, "connect/vc", errno, nsap, nsaplen);
+            Aerror(statp, "connect/vc", errno, nsap, nsaplen);
             res_nclose(statp);
             /*
              * The way connect_with_timeout() is implemented prevents us from reliably
@@ -808,12 +796,12 @@ same_ns:
     /*
      * Send length & message
      */
-    ns_put16((u_short) buflen, (u_char*) (void*) &len);
+    uint16_t len = htons(static_cast<uint16_t>(buflen));
     iov[0] = evConsIovec(&len, INT16SZ);
     iov[1] = evConsIovec((void*) buf, (size_t) buflen);
     if (writev(statp->_vcsock, iov, 2) != (INT16SZ + buflen)) {
         *terrno = errno;
-        Perror(statp, stderr, "write failed", errno);
+        Perror(statp, "write failed", errno);
         res_nclose(statp);
         return (0);
     }
@@ -829,7 +817,7 @@ read_len:
     }
     if (n <= 0) {
         *terrno = errno;
-        Perror(statp, stderr, "read failed", errno);
+        Perror(statp, "read failed", errno);
         res_nclose(statp);
         /*
          * A long running process might get its TCP
@@ -848,9 +836,9 @@ read_len:
         res_nclose(statp);
         return (0);
     }
-    resplen = ns_get16(ans);
+    uint16_t resplen = ntohs(*reinterpret_cast<const uint16_t*>(ans));
     if (resplen > anssiz) {
-        Dprint(statp->options & RES_DEBUG, (stdout, ";; response truncated\n"));
+        LOG(DEBUG) << __func__ << ": response truncated";
         truncating = 1;
         len = anssiz;
     } else
@@ -859,7 +847,7 @@ read_len:
         /*
          * Undersized message.
          */
-        Dprint(statp->options & RES_DEBUG, (stdout, ";; undersized: %d\n", len));
+        LOG(DEBUG) << __func__ << ": undersized: " << len;
         *terrno = EMSGSIZE;
         res_nclose(statp);
         return (0);
@@ -871,7 +859,7 @@ read_len:
     }
     if (n <= 0) {
         *terrno = errno;
-        Perror(statp, stderr, "read(vc)", errno);
+        Perror(statp, "read(vc)", errno);
         res_nclose(statp);
         return (0);
     }
@@ -900,9 +888,8 @@ read_len:
      * wait for the correct one.
      */
     if (hp->id != anhp->id) {
-        DprintQ((statp->options & RES_DEBUG) || (statp->pfcode & RES_PRF_REPLY),
-                (stdout, ";; old answer (unexpected):\n"), ans,
-                (resplen > anssiz) ? anssiz : resplen);
+        LOG(DEBUG) << __func__ << ": ld answer (unexpected):";
+        res_pquery(ans, (resplen > anssiz) ? anssiz : resplen);
         goto read_len;
     }
 
@@ -934,7 +921,7 @@ static int connect_with_timeout(int sock, const struct sockaddr* nsap, socklen_t
     if (res != 0) {
         struct timespec now = evNowTime();
         struct timespec finish = evAddTime(now, timeout);
-        VLOG << sock << " send_vc";
+        LOG(INFO) << __func__ << ": " << sock << " send_vc";
         res = retrying_poll(sock, POLLIN | POLLOUT, &finish);
         if (res <= 0) {
             res = -1;
@@ -942,7 +929,7 @@ static int connect_with_timeout(int sock, const struct sockaddr* nsap, socklen_t
     }
 done:
     fcntl(sock, F_SETFL, origflags);
-    VLOG << sock << " connect_with_const timeout returning " << res;
+    LOG(INFO) << __func__ << ": " << sock << " connect_with_const timeout returning " << res;
     return res;
 }
 
@@ -950,7 +937,7 @@ static int retrying_poll(const int sock, const short events, const struct timesp
     struct timespec now, timeout;
 
 retry:
-    VLOG << "  " << sock << " retrying_poll";
+    LOG(INFO) << __func__ << ": " << sock << " retrying_poll";
 
     now = evNowTime();
     if (evCmpTime(*finish, now) > 0)
@@ -960,13 +947,13 @@ retry:
     struct pollfd fds = {.fd = sock, .events = events};
     int n = ppoll(&fds, 1, &timeout, /*sigmask=*/NULL);
     if (n == 0) {
-        VLOG << "  " << sock << "retrying_poll timeout";
+        LOG(INFO) << __func__ << ": " << sock << "retrying_poll timeout";
         errno = ETIMEDOUT;
         return 0;
     }
     if (n < 0) {
         if (errno == EINTR) goto retry;
-        VLOG << "  " << sock << " retrying_poll got error " << n;
+        PLOG(INFO) << __func__ << ": " << sock << " retrying_poll failed";
         return n;
     }
     if (fds.revents & (POLLIN | POLLOUT | POLLERR)) {
@@ -974,17 +961,17 @@ retry:
         socklen_t len = sizeof(error);
         if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error) {
             errno = error;
-            VLOG << "  " << sock << " retrying_poll dot error2 " << errno;
+            PLOG(INFO) << __func__ << ": " << sock << " retrying_poll getsockopt failed";
             return -1;
         }
     }
-    VLOG << "  " << sock << " retrying_poll returning " << n;
+    LOG(INFO) << __func__ << ": " << sock << " retrying_poll returning " << n;
     return n;
 }
 
-static int send_dg(res_state statp, struct __res_params* params, const u_char* buf, int buflen,
-                   u_char* ans, int anssiz, int* terrno, int ns, int* v_circuit, int* gotsomewhere,
-                   time_t* at, int* rcode, int* delay) {
+static int send_dg(res_state statp, res_params* params, const u_char* buf, int buflen, u_char* ans,
+                   int anssiz, int* terrno, int ns, int* v_circuit, int* gotsomewhere, time_t* at,
+                   int* rcode, int* delay) {
     *at = time(NULL);
     *delay = 0;
     const HEADER* hp = (const HEADER*) (const void*) buf;
@@ -1005,11 +992,11 @@ static int send_dg(res_state statp, struct __res_params* params, const u_char* b
                 case EPROTONOSUPPORT:
                 case EPFNOSUPPORT:
                 case EAFNOSUPPORT:
-                    Perror(statp, stderr, "socket(dg)", errno);
+                    Perror(statp, "socket(dg)", errno);
                     return (0);
                 default:
                     *terrno = errno;
-                    Perror(statp, stderr, "socket(dg)", errno);
+                    Perror(statp, "socket(dg)", errno);
                     return (-1);
             }
         }
@@ -1035,36 +1022,34 @@ static int send_dg(res_state statp, struct __res_params* params, const u_char* b
          * the absence of a nameserver without timing out.
          */
         if (random_bind(statp->_u._ext.nssocks[ns], nsap->sa_family) < 0) {
-            Aerror(statp, stderr, "bind(dg)", errno, nsap, nsaplen);
+            Aerror(statp, "bind(dg)", errno, nsap, nsaplen);
             res_nclose(statp);
             return (0);
         }
         if (connect(statp->_u._ext.nssocks[ns], nsap, (socklen_t) nsaplen) < 0) {
-            Aerror(statp, stderr, "connect(dg)", errno, nsap, nsaplen);
+            Aerror(statp, "connect(dg)", errno, nsap, nsaplen);
             res_nclose(statp);
             return (0);
         }
 #endif /* !CANNOT_CONNECT_DGRAM */
-        Dprint(statp->options & RES_DEBUG, (stdout, ";; new DG socket\n"))
+        LOG(DEBUG) << __func__ << ": new DG socket";
     }
     s = statp->_u._ext.nssocks[ns];
 #ifndef CANNOT_CONNECT_DGRAM
     if (send(s, (const char*) buf, (size_t) buflen, 0) != buflen) {
-        Perror(statp, stderr, "send", errno);
+        Perror(statp, "send", errno);
         res_nclose(statp);
-        return (0);
+        return 0;
     }
 #else  /* !CANNOT_CONNECT_DGRAM */
     if (sendto(s, (const char*) buf, buflen, 0, nsap, nsaplen) != buflen) {
-        Aerror(statp, stderr, "sendto", errno, nsap, nsaplen);
+        Aerror(statp, "sendto", errno, nsap, nsaplen);
         res_nclose(statp);
-        return (0);
+        return 0;
     }
 #endif /* !CANNOT_CONNECT_DGRAM */
 
-    /*
-     * Wait for reply.
-     */
+    // Wait for reply.
     timeout = get_timeout(statp, params, ns);
     now = evNowTime();
     finish = evAddTime(now, timeout);
@@ -1073,33 +1058,33 @@ retry:
 
     if (n == 0) {
         *rcode = RCODE_TIMEOUT;
-        Dprint(statp->options & RES_DEBUG, (stdout, ";; timeout\n"));
+        LOG(DEBUG) << __func__ << ": timeout";
         *gotsomewhere = 1;
-        return (0);
+        return 0;
     }
     if (n < 0) {
-        Perror(statp, stderr, "poll", errno);
+        Perror(statp, "poll", errno);
         res_nclose(statp);
-        return (0);
+        return 0;
     }
     errno = 0;
     fromlen = sizeof(from);
     resplen = recvfrom(s, (char*) ans, (size_t) anssiz, 0, (struct sockaddr*) (void*) &from,
                        &fromlen);
     if (resplen <= 0) {
-        Perror(statp, stderr, "recvfrom", errno);
+        Perror(statp, "recvfrom", errno);
         res_nclose(statp);
-        return (0);
+        return 0;
     }
     *gotsomewhere = 1;
     if (resplen < HFIXEDSZ) {
         /*
          * Undersized message.
          */
-        Dprint(statp->options & RES_DEBUG, (stdout, ";; undersized: %d\n", resplen));
+        LOG(DEBUG) << __func__ << ": undersized: " << resplen;
         *terrno = EMSGSIZE;
         res_nclose(statp);
-        return (0);
+        return 0;
     }
     if (hp->id != anhp->id) {
         /*
@@ -1107,8 +1092,8 @@ retry:
          * XXX - potential security hazard could
          *	 be detected here.
          */
-        DprintQ((statp->options & RES_DEBUG) || (statp->pfcode & RES_PRF_REPLY),
-                (stdout, ";; old answer:\n"), ans, (resplen > anssiz) ? anssiz : resplen);
+        LOG(DEBUG) << __func__ << ": old answer:";
+        res_pquery(ans, (resplen > anssiz) ? anssiz : resplen);
         goto retry;
     }
     if (!(statp->options & RES_INSECURE1) &&
@@ -1118,8 +1103,8 @@ retry:
          * XXX - potential security hazard could
          *	 be detected here.
          */
-        DprintQ((statp->options & RES_DEBUG) || (statp->pfcode & RES_PRF_REPLY),
-                (stdout, ";; not our server:\n"), ans, (resplen > anssiz) ? anssiz : resplen);
+        LOG(DEBUG) << __func__ << ": not our server:";
+        res_pquery(ans, (resplen > anssiz) ? anssiz : resplen);
         goto retry;
     }
     if (anhp->rcode == FORMERR && (statp->options & RES_USE_EDNS0) != 0U) {
@@ -1128,12 +1113,12 @@ retry:
          * The case has to be captured here, as FORMERR packet do not
          * carry query section, hence res_queriesmatch() returns 0.
          */
-        DprintQ(statp->options & RES_DEBUG, (stdout, "server rejected query with EDNS0:\n"), ans,
-                (resplen > anssiz) ? anssiz : resplen);
+        LOG(DEBUG) << __func__ << ": server rejected query with EDNS0:";
+        res_pquery(ans, (resplen > anssiz) ? anssiz : resplen);
         /* record the error */
         statp->_flags |= RES_F_EDNS0ERR;
         res_nclose(statp);
-        return (0);
+        return 0;
     }
     if (!(statp->options & RES_INSECURE2) &&
         !res_queriesmatch(buf, buf + buflen, ans, ans + anssiz)) {
@@ -1142,32 +1127,28 @@ retry:
          * XXX - potential security hazard could
          *	 be detected here.
          */
-        DprintQ((statp->options & RES_DEBUG) || (statp->pfcode & RES_PRF_REPLY),
-                (stdout, ";; wrong query name:\n"), ans, (resplen > anssiz) ? anssiz : resplen);
+        LOG(DEBUG) << __func__ << ": wrong query name:";
+        res_pquery(ans, (resplen > anssiz) ? anssiz : resplen);
         goto retry;
-        ;
     }
     done = evNowTime();
     *delay = _res_stats_calculate_rtt(&done, &now);
     if (anhp->rcode == SERVFAIL || anhp->rcode == NOTIMP || anhp->rcode == REFUSED) {
-        DprintQ(statp->options & RES_DEBUG, (stdout, "server rejected query:\n"), ans,
-                (resplen > anssiz) ? anssiz : resplen);
+        LOG(DEBUG) << __func__ << ": server rejected query:";
+        res_pquery(ans, (resplen > anssiz) ? anssiz : resplen);
         res_nclose(statp);
-        /* don't retry if called from dig */
-        if (!statp->pfcode) {
-            *rcode = anhp->rcode;
-            return (0);
-        }
+        *rcode = anhp->rcode;
+        return 0;
     }
     if (!(statp->options & RES_IGNTC) && anhp->tc) {
         /*
          * To get the rest of answer,
          * use TCP with same server.
          */
-        Dprint(statp->options & RES_DEBUG, (stdout, ";; truncated answer\n"));
+        LOG(DEBUG) << __func__ << ": truncated answer";
         *v_circuit = 1;
         res_nclose(statp);
-        return (1);
+        return 1;
     }
     /*
      * All is well, or the error is fatal.  Signal that the
@@ -1176,13 +1157,11 @@ retry:
     if (resplen > 0) {
         *rcode = anhp->rcode;
     }
-    return (resplen);
+    return resplen;
 }
 
-static void Aerror(const res_state statp, FILE* file, const char* string, int error,
+static void Aerror(const res_state statp, const char* string, int error,
                    const struct sockaddr* address, int alen) {
-    if (!kVerboseLogging) return;
-
     const int save = errno;
     char hbuf[NI_MAXHOST];
     char sbuf[NI_MAXSERV];
@@ -1196,18 +1175,16 @@ static void Aerror(const res_state statp, FILE* file, const char* string, int er
             strncpy(sbuf, "?", sizeof(sbuf) - 1);
             sbuf[sizeof(sbuf) - 1] = '\0';
         }
-        fprintf(file, "res_send: %s ([%s].%s): %s\n", string, hbuf, sbuf, strerror(error));
+        LOG(DEBUG) << __func__ << ": " << string << " ([" << hbuf << "]." << sbuf
+                   << "): " << strerror(error);
     }
     errno = save;
 }
 
-static void Perror(const res_state statp, FILE* file, const char* string, int error) {
-    if (!kVerboseLogging) return;
-
-    const int save = errno;
-    if ((statp->options & RES_DEBUG) != 0U)
-        fprintf(file, "res_send: %s: %s\n", string, strerror(error));
-    errno = save;
+static void Perror(const res_state statp, const char* string, int error) {
+    if ((statp->options & RES_DEBUG) != 0U) {
+        LOG(DEBUG) << __func__ << ": " << string << ": " << strerror(error);
+    }
 }
 
 static int sock_eq(struct sockaddr* a, struct sockaddr* b) {
@@ -1276,12 +1253,12 @@ static int res_tls_send(res_state statp, const Slice query, const Slice answer, 
         }
     }
 
-    VLOG << __func__ << ": performing query over TLS";
+    LOG(INFO) << __func__ << ": performing query over TLS";
 
     const auto response = sDnsTlsDispatcher.query(privateDnsStatus.validatedServers, mark, query,
                                                   answer, &resplen);
 
-    VLOG << __func__ << ": TLS query result: " << static_cast<int>(response);
+    LOG(INFO) << __func__ << ": TLS query result: " << static_cast<int>(response);
 
     if (privateDnsStatus.mode == PrivateDnsMode::OPPORTUNISTIC) {
         // In opportunistic mode, handle falling back to cleartext in some

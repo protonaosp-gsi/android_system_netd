@@ -29,23 +29,24 @@
 #include "log/log.h"
 
 #include <android-base/strings.h>
+#include <cutils/misc.h>  // FIRST_APPLICATION_UID
 #include <netd_resolv/resolv.h>
 #include <netd_resolv/resolv_stub.h>
 #include "android/net/INetd.h"
 
-#include "cutils/misc.h"
-
 #include "Controllers.h"
 #include "DummyNetwork.h"
-#include "DumpWriter.h"
 #include "Fwmark.h"
 #include "LocalNetwork.h"
 #include "PhysicalNetwork.h"
 #include "RouteController.h"
 #include "VirtualNetwork.h"
+#include "netdutils/DumpWriter.h"
 #include "netid_client.h"
 
 #define DBG 0
+
+using android::netdutils::DumpWriter;
 
 namespace android {
 namespace net {
@@ -473,7 +474,6 @@ int NetworkController::destroyNetwork(unsigned netId) {
     }
     mNetworks.erase(netId);
     delete network;
-    RESOLV_STUB.resolv_delete_cache_for_net(netId);
 
     for (auto iter = mIfindexToLastNetId.begin(); iter != mIfindexToLastNetId.end();) {
         if (iter->second == netId) {
@@ -701,7 +701,6 @@ void NetworkController::dump(DumpWriter& dw) {
             dw.println("Required permission: %s", permissionToName(permission));
             dw.decIndent();
         }
-        android::net::gCtls->resolverCtrl.dump(dw, i.first);
         dw.blankline();
     }
     dw.decIndent();

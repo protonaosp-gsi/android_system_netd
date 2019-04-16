@@ -32,6 +32,7 @@
 
 #include "NetdConstants.h"
 #include "android-base/unique_fd.h"
+#include "netdutils/DumpWriter.h"
 #include "netdutils/Slice.h"
 #include "netdutils/Status.h"
 #include "sysutils/SocketClient.h"
@@ -51,7 +52,6 @@ extern const uint8_t REPLAY_WINDOW_SIZE;
 // Suggest we avoid the smallest and largest ints
 class XfrmMessage;
 class TransportModeSecurityAssociation;
-class DumpWriter;
 
 class XfrmSocket {
 public:
@@ -132,6 +132,67 @@ struct XfrmSpInfo : XfrmSaInfo {
     int selAddrFamily;  // AF_INET or AF_INET6
 };
 
+/*
+ * This is a workaround for a kernel bug in the 32bit netlink compat layer
+ * that has been present on x86_64 kernels since 2010 with no fix on the
+ * horizon.
+ *
+ * Below is a redefinition of the xfrm_usersa_info struct that is part
+ * of the Linux uapi <linux/xfrm.h> to align the structures to a 64-bit
+ * boundary.
+ *
+ * Note that we turn this on for all x86 32bit targets, under the assumption
+ * that nowadays all x86 targets are running 64bit kernels.
+ */
+#if defined(__i386__)
+// Shadow the kernel definition of xfrm_usersa_info with a 64-bit aligned version
+struct xfrm_usersa_info : ::xfrm_usersa_info {
+} __attribute__((aligned(8)));
+// Shadow the kernel's version, using the aligned version of xfrm_usersa_info
+struct xfrm_userspi_info {
+    struct xfrm_usersa_info info;
+    __u32 min;
+    __u32 max;
+};
+struct xfrm_userpolicy_info : ::xfrm_userpolicy_info {
+} __attribute__((aligned(8)));
+
+/*
+ * Anyone who encounters a failure when sending netlink messages should look here
+ * first. Hitting the static_assert() below should be a strong hint that Android
+ * IPsec will probably not work with your current settings.
+ *
+ * Again, experimentally determined, the "flags" field should be the first byte in
+ * the final word of the xfrm_usersa_info struct. The check validates the size of
+ * the padding to be 7.
+ *
+ * This padding is verified to be correct on gcc/x86_64 kernel, and clang/x86 userspace.
+ */
+static_assert(sizeof(::xfrm_usersa_info) % 8 != 0,
+              "struct xfrm_usersa_info has changed "
+              "alignment. Please consider whether this "
+              "patch is needed.");
+static_assert(sizeof(xfrm_usersa_info) - offsetof(xfrm_usersa_info, flags) == 8,
+              "struct xfrm_usersa_info probably misaligned with kernel struct.");
+static_assert(sizeof(xfrm_usersa_info) % 8 == 0,
+              "struct xfrm_usersa_info_t is not 64-bit  "
+              "aligned. Please consider whether this patch "
+              "is needed.");
+static_assert(sizeof(::xfrm_userspi_info) - sizeof(::xfrm_usersa_info) ==
+                      sizeof(xfrm_userspi_info) - sizeof(xfrm_usersa_info),
+              "struct xfrm_userspi_info has changed and does not match the kernel struct.");
+static_assert(sizeof(::xfrm_userpolicy_info) % 8 != 0,
+              "struct xfrm_userpolicy_info has changed "
+              "alignment. Please consider whether this "
+              "patch is needed.");
+static_assert(sizeof(xfrm_userpolicy_info) - offsetof(xfrm_userpolicy_info, share) == 5,
+              "struct xfrm_userpolicy_info probably misaligned with kernel struct.");
+static_assert(sizeof(xfrm_userpolicy_info) % 8 == 0,
+              "struct xfrm_userpolicy_info is not 64-bit "
+              "aligned. Please consider whether this patch "
+              "is needed.");
+#endif
+
 class XfrmController {
 public:
     XfrmController();
@@ -198,7 +259,7 @@ public:
 
     static netdutils::Status ipSecRemoveTunnelInterface(const std::string& deviceName);
 
-    void dump(DumpWriter& dw);
+    void dump(netdutils::DumpWriter& dw);
 
     // Some XFRM netlink attributes comprise a header, a struct, and some data
     // after the struct. We wrap all of those in one struct for easier
@@ -274,65 +335,6 @@ public:
     };
 
   private:
-/*
- * This is a workaround for a kernel bug in the 32bit netlink compat layer
- * that has been present on x86_64 kernels since 2010 with no fix on the
- * horizon.
- *
- * Below is a redefinition of the xfrm_usersa_info struct that is part
- * of the Linux uapi <linux/xfrm.h> to align the structures to a 64-bit
- * boundary.
- *
- * Note that we turn this on for all x86 32bit targets, under the assumption
- * that nowadays all x86 targets are running 64bit kernels.
- */
-#if defined(__i386__)
-    // Shadow the kernel definition of xfrm_usersa_info with a 64-bit aligned version
-    struct xfrm_usersa_info : ::xfrm_usersa_info {
-    } __attribute__((aligned(8)));
-    // Shadow the kernel's version, using the aligned version of xfrm_usersa_info
-    struct xfrm_userspi_info {
-        struct xfrm_usersa_info info;
-        __u32 min;
-        __u32 max;
-    };
-    struct xfrm_userpolicy_info : ::xfrm_userpolicy_info {
-    } __attribute__((aligned(8)));
-
-    /*
-     * Anyone who encounters a failure when sending netlink messages should look here
-     * first. Hitting the static_assert() below should be a strong hint that Android
-     * IPsec will probably not work with your current settings.
-     *
-     * Again, experimentally determined, the "flags" field should be the first byte in
-     * the final word of the xfrm_usersa_info struct. The check validates the size of
-     * the padding to be 7.
-     *
-     * This padding is verified to be correct on gcc/x86_64 kernel, and clang/x86 userspace.
-     */
-    static_assert(sizeof(::xfrm_usersa_info) % 8 != 0, "struct xfrm_usersa_info has changed "
-                                                       "alignment. Please consider whether this "
-                                                       "patch is needed.");
-    static_assert(sizeof(xfrm_usersa_info) - offsetof(xfrm_usersa_info, flags) == 8,
-                  "struct xfrm_usersa_info probably misaligned with kernel struct.");
-    static_assert(sizeof(xfrm_usersa_info) % 8 == 0, "struct xfrm_usersa_info_t is not 64-bit  "
-                                                     "aligned. Please consider whether this patch "
-                                                     "is needed.");
-    static_assert(sizeof(::xfrm_userspi_info) - sizeof(::xfrm_usersa_info) ==
-                      sizeof(xfrm_userspi_info) - sizeof(xfrm_usersa_info),
-                  "struct xfrm_userspi_info has changed and does not match the kernel struct.");
-    static_assert(sizeof(::xfrm_userpolicy_info) % 8 != 0,
-                  "struct xfrm_userpolicy_info has changed "
-                  "alignment. Please consider whether this "
-                  "patch is needed.");
-    static_assert(sizeof(xfrm_userpolicy_info) - offsetof(xfrm_userpolicy_info, share) == 5,
-                  "struct xfrm_userpolicy_info probably misaligned with kernel struct.");
-    static_assert(sizeof(xfrm_userpolicy_info) % 8 == 0,
-                  "struct xfrm_userpolicy_info is not 64-bit "
-                  "aligned. Please consider whether this patch "
-                  "is needed.");
-#endif
-
     static bool isXfrmIntfSupported();
 
     // helper functions for filling in the XfrmCommonInfo (and XfrmSaInfo) structure

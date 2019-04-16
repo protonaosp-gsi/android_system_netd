@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#define LOG_TAG "libnetd_resolv_test"
+#define LOG_TAG "resolv"
 
 #include <gtest/gtest.h>
 
@@ -79,12 +79,13 @@ class TestBase : public ::testing::Test {
     }
 
     const char* mDefaultSearchDomains = "example.com";
-    const __res_params mDefaultParams_Binder = {
+    const res_params mDefaultParams_Binder = {
             .sample_validity = 300,
             .success_threshold = 25,
             .min_samples = 8,
             .max_samples = 8,
-            .base_timeout_msec = 100,
+            .base_timeout_msec = 1000,
+            .retry_count = 2,
     };
     const android_net_context mNetcontext = {
             .app_netid = TEST_NETID,

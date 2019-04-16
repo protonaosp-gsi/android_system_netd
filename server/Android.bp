@@ -3,12 +3,10 @@ aidl_interface {
     name: "netd_event_listener_interface",
     local_include_dir: "binder",
     srcs: [
-        "binder/android/net/metrics/INetdEventListener.aidl"
+        "binder/android/net/metrics/INetdEventListener.aidl",
     ],
     api_dir: "binder/api",
 }
-
-
 
 // These are used in netd_integration_test
 // TODO: fold these into a cc_library_static after converting netd/server to Android.bp
@@ -38,10 +36,14 @@ aidl_interface {
     api_dir: "binder/api",
     // NDK doesn't support array now.
     backend: {
+        cpp: {
+            gen_log: true,
+        },
         ndk: {
             enabled: false,
         },
     },
+    versions: ["1"],
 }
 
 // Modules common to both netd and netd_unit_test
@@ -54,8 +56,9 @@ cc_library_static {
     ],
     srcs: [
         "BandwidthController.cpp",
+        "ClatdController.cpp",
+        "ClatUtils.cpp",
         "Controllers.cpp",
-        "Dns64Configuration.cpp",
         "NetdConstants.cpp",
         "FirewallController.cpp",
         "IdletimerController.cpp",
@@ -112,11 +115,11 @@ cc_binary {
         "libbase",
         "libbinder",
         "libbpf_android",
-        "libcrypto",
         "libcutils",
         "libdl",
         "libhidlbase",
         "libhidltransport",
+        "libjsoncpp",
         "liblog",
         "liblogwrap",
         "libmdnssd",
@@ -139,10 +142,8 @@ cc_binary {
         "libnetd_resolv_headers",
     ],
     srcs: [
-        "ClatdController.cpp",
         "CommandListener.cpp",
         "DummyNetwork.cpp",
-        "DumpWriter.cpp",
         "EventReporter.cpp",
         "FwmarkServer.cpp",
         "LocalNetwork.cpp",
@@ -157,7 +158,6 @@ cc_binary {
         "PppController.cpp",
         "Process.cpp",
         "ResolvStub.cpp",
-        "ResolverController.cpp",
         "VirtualNetwork.cpp",
         "main.cpp",
         "oem_iptables_hook.cpp",
@@ -183,6 +183,8 @@ cc_test {
     ],
     srcs: [
         "BandwidthControllerTest.cpp",
+        "ClatdControllerTest.cpp",
+        "ClatUtilsTest.cpp",
         "ControllersTest.cpp",
         "FirewallControllerTest.cpp",
         "IdletimerControllerTest.cpp",

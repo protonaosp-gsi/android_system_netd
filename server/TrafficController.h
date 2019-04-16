@@ -27,6 +27,7 @@
 #include "android-base/unique_fd.h"
 #include "bpf/BpfMap.h"
 #include "netdbpf/bpf_shared.h"
+#include "netdutils/DumpWriter.h"
 #include "netdutils/StatusOr.h"
 #include "utils/String16.h"
 
@@ -38,8 +39,6 @@ using android::bpf::UidTag;
 
 namespace android {
 namespace net {
-
-class DumpWriter;
 
 class TrafficController {
   public:
@@ -86,7 +85,12 @@ class TrafficController {
      * Check if the current device have the bpf traffic stats accounting service
      * running.
      */
-    bool checkBpfStatsEnable();
+    bpf::BpfLevel getBpfLevel();
+
+    /*
+     * Swap the stats map config from current active stats map to the idle one.
+     */
+    netdutils::Status swapActiveStatsMap();
 
     /*
      * Add the interface name and index pair into the eBPF map.
@@ -103,9 +107,12 @@ class TrafficController {
     netdutils::Status updateOwnerMapEntry(UidOwnerMatchType match, uid_t uid, FirewallRule rule,
                                           FirewallType type);
 
-    void dump(DumpWriter& dw, bool verbose);
+    void dump(netdutils::DumpWriter& dw, bool verbose);
 
-    netdutils::Status replaceUidsInMap(UidOwnerMatchType match, const std::vector<int32_t>& uids);
+    netdutils::Status replaceRulesInMap(UidOwnerMatchType match, const std::vector<int32_t>& uids);
+
+    netdutils::Status addUidInterfaceRules(const int ifIndex, const std::vector<int32_t>& uids);
+    netdutils::Status removeUidInterfaceRules(const std::vector<int32_t>& uids);
 
     netdutils::Status updateUidOwnerMap(const std::vector<std::string>& appStrUids,
                                         BandwidthController::IptJumpOp jumpHandling,
@@ -189,7 +196,7 @@ class TrafficController {
     /*
      * mUidOwnerMap: Store uids that are used for bandwidth control uid match.
      */
-    BpfMap<uint32_t, uint8_t> mUidOwnerMap GUARDED_BY(mOwnerMatchMutex);
+    BpfMap<uint32_t, UidOwnerValue> mUidOwnerMap GUARDED_BY(mOwnerMatchMutex);
 
     /*
      * mUidOwnerMap: Store uids that are used for INTERNET permission check.
@@ -198,13 +205,13 @@ class TrafficController {
 
     std::unique_ptr<NetlinkListenerInterface> mSkDestroyListener;
 
-    netdutils::Status removeMatch(BpfMap<uint32_t, uint8_t>& map, uint32_t uid,
-                                  UidOwnerMatchType match) REQUIRES(mOwnerMatchMutex);
+    netdutils::Status removeRule(BpfMap<uint32_t, UidOwnerValue>& map, uint32_t uid,
+                                 UidOwnerMatchType match) REQUIRES(mOwnerMatchMutex);
 
-    netdutils::Status addMatch(BpfMap<uint32_t, uint8_t>& map, uint32_t uid,
-                               UidOwnerMatchType match) REQUIRES(mOwnerMatchMutex);
+    netdutils::Status addRule(BpfMap<uint32_t, UidOwnerValue>& map, uint32_t uid,
+                              UidOwnerMatchType match, uint32_t iif = 0) REQUIRES(mOwnerMatchMutex);
 
-    bool ebpfSupported;
+    bpf::BpfLevel mBpfLevel;
 
     std::mutex mOwnerMatchMutex;
 

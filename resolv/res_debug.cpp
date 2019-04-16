@@ -95,6 +95,8 @@
  * IF IBM IS APPRISED OF THE POSSIBILITY OF SUCH DAMAGES.
  */
 
+#define LOG_TAG "resolv"
+
 #include <sys/param.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -103,11 +105,12 @@
 #include <arpa/nameser.h>
 #include <netinet/in.h>
 
+#include <android-base/logging.h>
+#include <android-base/stringprintf.h>
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
 #include <netdb.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -115,125 +118,122 @@
 
 #include "resolv_private.h"
 
+// Default to disabling verbose logging unless overridden by Android.bp
+// for debuggable builds.
+//
+// NOTE: Verbose resolver logs could contain PII -- do NOT enable in production builds
+#ifndef RESOLV_ALLOW_VERBOSE_LOGGING
+#define RESOLV_ALLOW_VERBOSE_LOGGING 0
+#endif
+
+using android::base::StringAppendF;
+
 struct res_sym {
     int number;            /* Identifying number, like T_MX */
     const char* name;      /* Its symbolic name, like "MX" */
     const char* humanname; /* Its fun name, like "mail exchanger" */
 };
 
-static void do_section(const res_state statp, ns_msg* handle, ns_sect section, int pflag,
-                       FILE* file) {
-    int n, sflag, rrnum;
+static void do_section(ns_msg* handle, ns_sect section) {
+    int n, rrnum = 0;
     int buflen = 2048;
-    ns_opcode opcode;
     ns_rr rr;
+    std::string s;
 
     /*
      * Print answer records.
      */
-    sflag = (int) (statp->pfcode & pflag);
-    if (statp->pfcode && !sflag) return;
-
-    char* buf = (char*) malloc((size_t) buflen);
-    if (buf == NULL) {
-        fprintf(file, ";; memory allocation failure\n");
-        return;
-    }
-
-    opcode = (ns_opcode) ns_msg_getflag(*handle, ns_f_opcode);
-    rrnum = 0;
+    auto buf = std::make_unique<char[]>(buflen);
     for (;;) {
         if (ns_parserr(handle, section, rrnum, &rr)) {
-            if (errno != ENODEV)
-                fprintf(file, ";; ns_parserr: %s\n", strerror(errno));
-            else if (rrnum > 0 && sflag != 0 && (statp->pfcode & RES_PRF_HEAD1))
-                putc('\n', file);
-            goto cleanup;
+            if (errno != ENODEV) StringAppendF(&s, "ns_parserr: %s", strerror(errno));
+            LOG(VERBOSE) << s;
+            return;
         }
-        if (rrnum == 0 && sflag != 0 && (statp->pfcode & RES_PRF_HEAD1))
-            fprintf(file, ";; %s SECTION:\n", p_section(section, opcode));
         if (section == ns_s_qd)
-            fprintf(file, ";;\t%s, type = %s, class = %s\n", ns_rr_name(rr), p_type(ns_rr_type(rr)),
-                    p_class(ns_rr_class(rr)));
+            StringAppendF(&s, ";;\t%s, type = %s, class = %s\n", ns_rr_name(rr),
+                          p_type(ns_rr_type(rr)), p_class(ns_rr_class(rr)));
         else if (section == ns_s_ar && ns_rr_type(rr) == ns_t_opt) {
             size_t rdatalen, ttl;
             uint16_t optcode, optlen;
 
             rdatalen = ns_rr_rdlen(rr);
             ttl = ns_rr_ttl(rr);
-            fprintf(file, "; EDNS: version: %zu, udp=%u, flags=%04zx\n", (ttl >> 16) & 0xff,
-                    ns_rr_class(rr), ttl & 0xffff);
-            while (rdatalen >= 4) {
-                const u_char* cp = ns_rr_rdata(rr);
+            StringAppendF(&s, "; EDNS: version: %zu, udp=%u, flags=%04zx\n", (ttl >> 16) & 0xff,
+                          ns_rr_class(rr), ttl & 0xffff);
+            const u_char* cp = ns_rr_rdata(rr);
+            while (rdatalen <= ns_rr_rdlen(rr) && rdatalen >= 4) {
                 int i;
 
                 GETSHORT(optcode, cp);
                 GETSHORT(optlen, cp);
 
                 if (optcode == NS_OPT_NSID) {
-                    fputs("; NSID: ", file);
+                    StringAppendF(&s, "; NSID: ");
                     if (optlen == 0) {
-                        fputs("; NSID\n", file);
+                        StringAppendF(&s, "; NSID\n");
                     } else {
-                        fputs("; NSID: ", file);
-                        for (i = 0; i < optlen; i++) fprintf(file, "%02x ", cp[i]);
-                        fputs(" (", file);
-                        for (i = 0; i < optlen; i++)
-                            fprintf(file, "%c", isprint(cp[i]) ? cp[i] : '.');
-                        fputs(")\n", file);
+                        StringAppendF(&s, "; NSID: ");
+                        for (i = 0; i < optlen; i++) {
+                            StringAppendF(&s, "%02x ", cp[i]);
+                        }
+                        StringAppendF(&s, " (");
+                        for (i = 0; i < optlen; i++) {
+                            StringAppendF(&s, "%c", isprint(cp[i]) ? cp[i] : '.');
+                        }
+                        StringAppendF(&s, ")\n");
                     }
                 } else {
                     if (optlen == 0) {
-                        fprintf(file, "; OPT=%u\n", optcode);
+                        StringAppendF(&s, "; OPT=%u\n", optcode);
                     } else {
-                        fprintf(file, "; OPT=%u: ", optcode);
-                        for (i = 0; i < optlen; i++) fprintf(file, "%02x ", cp[i]);
-                        fputs(" (", file);
-                        for (i = 0; i < optlen; i++)
-                            fprintf(file, "%c", isprint(cp[i]) ? cp[i] : '.');
-                        fputs(")\n", file);
+                        StringAppendF(&s, "; OPT=%u: ", optcode);
+                        for (i = 0; i < optlen; i++) {
+                            StringAppendF(&s, "%02x ", cp[i]);
+                        }
+                        StringAppendF(&s, " (");
+                        for (i = 0; i < optlen; i++) {
+                            StringAppendF(&s, "%c", isprint(cp[i]) ? cp[i] : '.');
+                        }
+                        StringAppendF(&s, ")\n");
                     }
                 }
                 rdatalen -= 4 + optlen;
+                cp += optlen;
             }
         } else {
-            n = ns_sprintrr(handle, &rr, NULL, NULL, buf, (u_int) buflen);
+            n = ns_sprintrr(handle, &rr, NULL, NULL, buf.get(), (u_int)buflen);
             if (n < 0) {
                 if (errno == ENOSPC) {
-                    free(buf);
-                    buf = NULL;
                     if (buflen < 131072) {
-                        buf = (char*) malloc((size_t)(buflen += 1024));
-                    }
-                    if (buf == NULL) {
-                        fprintf(file, ";; memory allocation failure\n");
-                        return;
+                        buf = std::make_unique<char[]>(buflen += 1024);
                     }
                     continue;
                 }
-                fprintf(file, ";; ns_sprintrr: %s\n", strerror(errno));
-                goto cleanup;
+                StringAppendF(&s, "ns_sprintrr failed");
+                PLOG(VERBOSE) << s;
+                return;
             }
-            fputs(buf, file);
-            fputc('\n', file);
+            StringAppendF(&s, ";; %s\n", buf.get());
         }
         rrnum++;
     }
-cleanup:
-    free(buf);
+    LOG(VERBOSE) << s;
 }
 
 /*
  * Print the contents of a query.
  * This is intended to be primarily a debugging routine.
  */
-void res_pquery(const res_state statp, const u_char* msg, int len, FILE* file) {
+void res_pquery(const u_char* msg, int len) {
+    if (!WOULD_LOG(VERBOSE)) return;
+
     ns_msg handle;
     int qdcount, ancount, nscount, arcount;
     u_int opcode, rcode, id;
 
     if (ns_initparse(msg, len, &handle) < 0) {
-        fprintf(file, ";; ns_initparse: %s\n", strerror(errno));
+        PLOG(VERBOSE) << "ns_initparse failed";
         return;
     }
     opcode = ns_msg_getflag(handle, ns_f_opcode);
@@ -247,84 +247,32 @@ void res_pquery(const res_state statp, const u_char* msg, int len, FILE* file) {
     /*
      * Print header fields.
      */
-    if ((!statp->pfcode) || (statp->pfcode & RES_PRF_HEADX) || rcode)
-        fprintf(file, ";; ->>HEADER<<- opcode: %s, status: %s, id: %d\n", _res_opcodes[opcode],
-                p_rcode((int) rcode), id);
-    if ((!statp->pfcode) || (statp->pfcode & RES_PRF_HEADX)) putc(';', file);
-    if ((!statp->pfcode) || (statp->pfcode & RES_PRF_HEAD2)) {
-        fprintf(file, "; flags:");
-        if (ns_msg_getflag(handle, ns_f_qr)) fprintf(file, " qr");
-        if (ns_msg_getflag(handle, ns_f_aa)) fprintf(file, " aa");
-        if (ns_msg_getflag(handle, ns_f_tc)) fprintf(file, " tc");
-        if (ns_msg_getflag(handle, ns_f_rd)) fprintf(file, " rd");
-        if (ns_msg_getflag(handle, ns_f_ra)) fprintf(file, " ra");
-        if (ns_msg_getflag(handle, ns_f_z)) fprintf(file, " ??");
-        if (ns_msg_getflag(handle, ns_f_ad)) fprintf(file, " ad");
-        if (ns_msg_getflag(handle, ns_f_cd)) fprintf(file, " cd");
-    }
-    if ((!statp->pfcode) || (statp->pfcode & RES_PRF_HEAD1)) {
-        fprintf(file, "; %s: %d", p_section(ns_s_qd, (int) opcode), qdcount);
-        fprintf(file, ", %s: %d", p_section(ns_s_an, (int) opcode), ancount);
-        fprintf(file, ", %s: %d", p_section(ns_s_ns, (int) opcode), nscount);
-        fprintf(file, ", %s: %d", p_section(ns_s_ar, (int) opcode), arcount);
-    }
-    if ((!statp->pfcode) || (statp->pfcode & (RES_PRF_HEADX | RES_PRF_HEAD2 | RES_PRF_HEAD1))) {
-        putc('\n', file);
-    }
+    std::string s;
+    StringAppendF(&s, ";; ->>HEADER<<- opcode: %s, status: %s, id: %d\n", _res_opcodes[opcode],
+                  p_rcode((int)rcode), id);
+    StringAppendF(&s, ";; flags:");
+    if (ns_msg_getflag(handle, ns_f_qr)) StringAppendF(&s, " qr");
+    if (ns_msg_getflag(handle, ns_f_aa)) StringAppendF(&s, " aa");
+    if (ns_msg_getflag(handle, ns_f_tc)) StringAppendF(&s, " tc");
+    if (ns_msg_getflag(handle, ns_f_rd)) StringAppendF(&s, " rd");
+    if (ns_msg_getflag(handle, ns_f_ra)) StringAppendF(&s, " ra");
+    if (ns_msg_getflag(handle, ns_f_z)) StringAppendF(&s, " ??");
+    if (ns_msg_getflag(handle, ns_f_ad)) StringAppendF(&s, " ad");
+    if (ns_msg_getflag(handle, ns_f_cd)) StringAppendF(&s, " cd");
+    StringAppendF(&s, "; %s: %d", p_section(ns_s_qd, (int)opcode), qdcount);
+    StringAppendF(&s, ", %s: %d", p_section(ns_s_an, (int)opcode), ancount);
+    StringAppendF(&s, ", %s: %d", p_section(ns_s_ns, (int)opcode), nscount);
+    StringAppendF(&s, ", %s: %d", p_section(ns_s_ar, (int)opcode), arcount);
+
+    LOG(VERBOSE) << s;
+
     /*
      * Print the various sections.
      */
-    do_section(statp, &handle, ns_s_qd, RES_PRF_QUES, file);
-    do_section(statp, &handle, ns_s_an, RES_PRF_ANS, file);
-    do_section(statp, &handle, ns_s_ns, RES_PRF_AUTH, file);
-    do_section(statp, &handle, ns_s_ar, RES_PRF_ADD, file);
-    if (qdcount == 0 && ancount == 0 && nscount == 0 && arcount == 0) putc('\n', file);
-}
-
-const u_char* p_cdnname(const u_char* cp, const u_char* msg, int len, FILE* file) {
-    char name[MAXDNAME];
-    int n;
-
-    if ((n = dn_expand(msg, msg + len, cp, name, (int) sizeof name)) < 0) return (NULL);
-    if (name[0] == '\0')
-        putc('.', file);
-    else
-        fputs(name, file);
-    return (cp + n);
-}
-
-const u_char* p_cdname(const u_char* cp, const u_char* msg, FILE* file) {
-    return (p_cdnname(cp, msg, PACKETSZ, file));
-}
-
-/* Return a fully-qualified domain name from a compressed name (with
-   length supplied).  */
-
-const u_char* p_fqnname(const u_char* cp, const u_char* msg, int msglen, char* name, int namelen) {
-    int n;
-    size_t newlen;
-
-    if ((n = dn_expand(msg, cp + msglen, cp, name, namelen)) < 0) return (NULL);
-    newlen = strlen(name);
-    if (newlen == 0 || name[newlen - 1] != '.') {
-        if ((int) newlen + 1 >= namelen) /* Lack space for final dot */
-            return (NULL);
-        else
-            strcpy(name + newlen, ".");
-    }
-    return (cp + n);
-}
-
-/* XXX:	the rest of these functions need to become length-limited, too. */
-
-const u_char* p_fqname(const u_char* cp, const u_char* msg, FILE* file) {
-    char name[MAXDNAME];
-    const u_char* n;
-
-    n = p_fqnname(cp, msg, MAXCDNAME, name, (int) sizeof name);
-    if (n == NULL) return (NULL);
-    fputs(name, file);
-    return (n);
+    do_section(&handle, ns_s_qd);
+    do_section(&handle, ns_s_an);
+    do_section(&handle, ns_s_ns);
+    do_section(&handle, ns_s_ar);
 }
 
 /*
@@ -515,4 +463,28 @@ const char* p_class(int cl) {
  */
 const char* p_rcode(int rcode) {
     return (sym_ntos(p_rcode_syms, rcode, (int*) 0));
+}
+
+android::base::LogSeverity logSeverityStrToEnum(const std::string& logSeverityStr) {
+    android::base::LogSeverity logSeverityEnum;
+
+    if (logSeverityStr == "VERBOSE") {
+        // *** enable verbose logging only when DBG is set. It prints sensitive data ***
+        logSeverityEnum =
+                RESOLV_ALLOW_VERBOSE_LOGGING ? android::base::VERBOSE : android::base::DEBUG;
+    } else if (logSeverityStr == "DEBUG") {
+        logSeverityEnum = android::base::DEBUG;
+    } else if (logSeverityStr == "INFO") {
+        logSeverityEnum = android::base::INFO;
+    } else if (logSeverityStr == "WARNING") {
+        logSeverityEnum = android::base::WARNING;
+    } else if (logSeverityStr == "ERROR") {
+        logSeverityEnum = android::base::ERROR;
+    } else {
+        // Invalid parameter is treated as WARNING (default setting)
+        LOG(ERROR) << "Invalid parameter is treated as WARNING by default.";
+        logSeverityEnum = android::base::WARNING;
+    }
+    LOG(INFO) << __func__ << ": " << logSeverityEnum;
+    return logSeverityEnum;
 }

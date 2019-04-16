@@ -41,16 +41,12 @@
 
 #include <android-base/stringprintf.h>
 #include <benchmark/benchmark.h>
-#include <utils/String16.h>
-#include <utils/StrongPointer.h>
 
 #include "NetdClient.h"
-#include "android/net/metrics/INetdEventListener.h"
 #include "dns_responder_client.h"
 #include "netd_resolv/params.h"  // MAXNS
 
 using android::base::StringPrintf;
-using android::net::metrics::INetdEventListener;
 
 constexpr int MIN_THREADS = 1;
 constexpr int MAX_THREADS = 32;
@@ -73,7 +69,7 @@ public:
 
             dns.SetupDNSServers(MAXNS, mappings, &mDns, &servers);
 
-            const std::vector<int> mDefaultParams_Binder = {300, 25, 8, 8, 100};
+            const std::vector<int> mDefaultParams_Binder = {300, 25, 8, 8, 1000};
             dns.SetResolversForNetwork(servers, domains, mDefaultParams_Binder);
         }
     }

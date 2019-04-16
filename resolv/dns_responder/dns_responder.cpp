@@ -20,13 +20,13 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <set>
 
 #include <iostream>
 #include <vector>
@@ -723,6 +723,13 @@ void DNSResponder::requestHandler() {
         size_t response_len = sizeof(response);
         if (handleDNSRequest(buffer, len, response, &response_len) &&
             response_len > 0) {
+            // place wait_for after handleDNSRequest() so we can check the number of queries in
+            // test case before it got responded.
+            std::unique_lock guard(cv_mutex_for_deferred_resp_);
+            cv_for_deferred_resp_.wait(guard, [this]() REQUIRES(cv_mutex_for_deferred_resp_) {
+                return !deferred_resp_;
+            });
+
             len = sendto(socket_, response, response_len, 0,
                          reinterpret_cast<const sockaddr*>(&sa), sa_len);
             std::string host_str =
@@ -820,11 +827,12 @@ bool DNSResponder::handleDNSRequest(const char* buffer, ssize_t len,
             return makeErrorResponse(&header, ns_rcode::ns_r_notimpl, response,
                                      response_len);
         }
+
         if (!addAnswerRecords(question, &header.answers)) {
-            return makeErrorResponse(&header, ns_rcode::ns_r_servfail, response,
-                                     response_len);
+            return makeErrorResponse(&header, ns_rcode::ns_r_servfail, response, response_len);
         }
     }
+
     header.qr = true;
     char* response_cur = header.write(response, response + *response_len);
     if (response_cur == nullptr) {
@@ -837,45 +845,73 @@ bool DNSResponder::handleDNSRequest(const char* buffer, ssize_t len,
 bool DNSResponder::addAnswerRecords(const DNSQuestion& question,
                                     std::vector<DNSRecord>* answers) const {
     std::lock_guard guard(mappings_mutex_);
-    auto it = mappings_.find(QueryKey(question.qname.name, question.qtype));
-    if (it == mappings_.end()) {
+    std::string rname = question.qname.name;
+    std::vector<int> rtypes;
+
+    if (question.qtype == ns_type::ns_t_a || question.qtype == ns_type::ns_t_aaaa)
+        rtypes.push_back(ns_type::ns_t_cname);
+    rtypes.push_back(question.qtype);
+    for (int rtype : rtypes) {
+        std::set<std::string> cnames_Loop;
+        std::unordered_map<QueryKey, std::string, QueryKeyHash>::const_iterator it;
+        while ((it = mappings_.find(QueryKey(rname, rtype))) != mappings_.end()) {
+            if (rtype == ns_type::ns_t_cname) {
+                // When detect CNAME infinite loops by cnames_Loop, it won't save the duplicate one.
+                // As following, the query will stop on loop3 by detecting the same cname.
+                // loop1.{"a.xxx.com", ns_type::ns_t_cname, "b.xxx.com"}(insert in answer record)
+                // loop2.{"b.xxx.com", ns_type::ns_t_cname, "a.xxx.com"}(insert in answer record)
+                // loop3.{"a.xxx.com", ns_type::ns_t_cname, "b.xxx.com"}(When the same cname record
+                //   is found in cnames_Loop already, break the query loop.)
+                if (cnames_Loop.find(it->first.name) != cnames_Loop.end()) break;
+                cnames_Loop.insert(it->first.name);
+            }
+            DNSRecord record{
+                    .name = {.name = it->first.name},
+                    .rtype = it->first.type,
+                    .rclass = ns_class::ns_c_in,
+                    .ttl = 5,  // seconds
+            };
+            fillAnswerRdata(it->second, record);
+            answers->push_back(std::move(record));
+            if (rtype != ns_type::ns_t_cname) break;
+            rname = it->second;
+        }
+    }
+
+    if (answers->size() == 0) {
         // TODO(imaipi): handle correctly
         ALOGI("no mapping found for %s %s, lazily refusing to add an answer",
-            question.qname.name.c_str(), dnstype2str(question.qtype));
-        return true;
+              question.qname.name.c_str(), dnstype2str(question.qtype));
     }
-    DBGLOG("mapping found for %s %s: %s", question.qname.name.c_str(), dnstype2str(question.qtype),
-           it->second.c_str());
-    DNSRecord record;
-    record.name = question.qname;
-    record.rtype = question.qtype;
-    record.rclass = ns_class::ns_c_in;
-    record.ttl = 5;  // seconds
-    if (question.qtype == ns_type::ns_t_a) {
+
+    return true;
+}
+
+bool DNSResponder::fillAnswerRdata(const std::string& rdatastr, DNSRecord& record) const {
+    if (record.rtype == ns_type::ns_t_a) {
         record.rdata.resize(4);
-        if (inet_pton(AF_INET, it->second.c_str(), record.rdata.data()) != 1) {
-            ALOGI("inet_pton(AF_INET, %s) failed", it->second.c_str());
+        if (inet_pton(AF_INET, rdatastr.c_str(), record.rdata.data()) != 1) {
+            ALOGI("inet_pton(AF_INET, %s) failed", rdatastr.c_str());
             return false;
         }
-    } else if (question.qtype == ns_type::ns_t_aaaa) {
+    } else if (record.rtype == ns_type::ns_t_aaaa) {
         record.rdata.resize(16);
-        if (inet_pton(AF_INET6, it->second.c_str(), record.rdata.data()) != 1) {
-            ALOGI("inet_pton(AF_INET6, %s) failed", it->second.c_str());
+        if (inet_pton(AF_INET6, rdatastr.c_str(), record.rdata.data()) != 1) {
+            ALOGI("inet_pton(AF_INET6, %s) failed", rdatastr.c_str());
             return false;
         }
-    } else if (question.qtype == ns_type::ns_t_ptr) {
+    } else if ((record.rtype == ns_type::ns_t_ptr) || (record.rtype == ns_type::ns_t_cname)) {
         constexpr char delimiter = '.';
-        std::string name = it->second;
+        std::string name = rdatastr;
         std::vector<char> rdata;
 
-        // PTRDNAME field
+        // Generating PTRDNAME field(section 3.3.12) or CNAME field(section 3.3.1) in rfc1035.
         // The "name" should be an absolute domain name which ends in a dot.
         if (name.back() != delimiter) {
             ALOGI("invalid absolute domain name");
             return false;
         }
         name.pop_back();  // remove the dot in tail
-
         for (const std::string& label : android::base::Split(name, {delimiter})) {
             // The length of label is limited to 63 octets or less. See RFC 1035 section 3.1.
             if (label.length() == 0 || label.length() > 63) {
@@ -895,10 +931,9 @@ bool DNSResponder::addAnswerRecords(const DNSQuestion& question,
         }
         record.rdata = move(rdata);
     } else {
-        ALOGI("unhandled qtype %s", dnstype2str(question.qtype));
+        ALOGI("unhandled qtype %s", dnstype2str(record.rtype));
         return false;
     }
-    answers->push_back(std::move(record));
     return true;
 }
 
@@ -914,6 +949,14 @@ bool DNSResponder::makeErrorResponse(DNSHeader* header, ns_rcode rcode,
     if (response_cur == nullptr) return false;
     *response_len = response_cur - response;
     return true;
+}
+
+void DNSResponder::setDeferredResp(bool deferred_resp) {
+    std::lock_guard<std::mutex> guard(cv_mutex_for_deferred_resp_);
+    deferred_resp_ = deferred_resp;
+    if (!deferred_resp_) {
+        cv_for_deferred_resp_.notify_one();
+    }
 }
 
 }  // namespace test

@@ -70,21 +70,19 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#define LOG_TAG "resolv"
+
 #include <algorithm>  // std::min()
 
 #include <arpa/nameser.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
 
-#include "resolv_private.h"
+#include <android-base/logging.h>
 
-/* Options.  Leave them on. */
-#ifndef DEBUG
-#define DEBUG
-#endif
+#include "resolv_private.h"
 
 // Queries will be padded to a multiple of this length when EDNS0 is active.
 constexpr uint16_t kEdns0Padding = 128;
@@ -114,18 +112,16 @@ int res_nmkquery(res_state statp, int op,    /* opcode of query */
     int n;
     u_char *dnptrs[20], **dpp, **lastdnptr;
 
-#ifdef DEBUG
-    if (statp->options & RES_DEBUG)
-        printf(";; res_nmkquery(%s, %s, %s, %s)\n", _res_opcodes[op], dname, p_class(cl),
-               p_type(type));
-#endif
+    LOG(DEBUG) << __func__ << ": (" << _res_opcodes[op] << ", " << p_class(cl) << ", "
+               << p_type(type) << ")";
+
     /*
      * Initialize header fields.
      */
     if ((buf == NULL) || (buflen < HFIXEDSZ)) return (-1);
     memset(buf, 0, HFIXEDSZ);
     hp = (HEADER*) (void*) buf;
-    hp->id = htons(res_randomid());
+    hp->id = htons(arc4random_uniform(65536));
     hp->opcode = op;
     hp->rd = (statp->options & RES_RECURSE) != 0U;
     hp->ad = (statp->options & RES_USE_DNSSEC) != 0U;
@@ -146,9 +142,9 @@ int res_nmkquery(res_state statp, int op,    /* opcode of query */
             if (ep - cp < QFIXEDSZ) return (-1);
             if ((n = dn_comp(dname, cp, ep - cp - QFIXEDSZ, dnptrs, lastdnptr)) < 0) return (-1);
             cp += n;
-            ns_put16(type, cp);
+            *reinterpret_cast<uint16_t*>(cp) = htons(type);
             cp += INT16SZ;
-            ns_put16(cl, cp);
+            *reinterpret_cast<uint16_t*>(cp) = htons(cl);
             cp += INT16SZ;
             hp->qdcount = htons(1);
             if (op == QUERY || data == NULL) break;
@@ -159,13 +155,13 @@ int res_nmkquery(res_state statp, int op,    /* opcode of query */
             n = dn_comp((const char*) data, cp, ep - cp - RRFIXEDSZ, dnptrs, lastdnptr);
             if (n < 0) return (-1);
             cp += n;
-            ns_put16(ns_t_null, cp);
+            *reinterpret_cast<uint16_t*>(cp) = htons(ns_t_null);
             cp += INT16SZ;
-            ns_put16(cl, cp);
+            *reinterpret_cast<uint16_t*>(cp) = htons(cl);
             cp += INT16SZ;
-            ns_put32(0, cp);
+            *reinterpret_cast<uint32_t*>(cp) = htonl(0);
             cp += INT32SZ;
-            ns_put16(0, cp);
+            *reinterpret_cast<uint16_t*>(cp) = htons(0);
             cp += INT16SZ;
             hp->arcount = htons(1);
             break;
@@ -176,13 +172,13 @@ int res_nmkquery(res_state statp, int op,    /* opcode of query */
              */
             if (ep - cp < 1 + RRFIXEDSZ + datalen) return (-1);
             *cp++ = '\0'; /* no domain name */
-            ns_put16(type, cp);
+            *reinterpret_cast<uint16_t*>(cp) = htons(type);
             cp += INT16SZ;
-            ns_put16(cl, cp);
+            *reinterpret_cast<uint16_t*>(cp) = htons(cl);
             cp += INT16SZ;
-            ns_put32(0, cp);
+            *reinterpret_cast<uint32_t*>(cp) = htonl(0);
             cp += INT32SZ;
-            ns_put16(datalen, cp);
+            *reinterpret_cast<uint16_t*>(cp) = htons(datalen);
             cp += INT16SZ;
             if (datalen) {
                 memcpy(cp, data, (size_t) datalen);
@@ -206,9 +202,7 @@ int res_nopt(res_state statp, int n0, /* current offset in buffer */
     u_char *cp, *ep;
     u_int16_t flags = 0;
 
-#ifdef DEBUG
-    if ((statp->options & RES_DEBUG) != 0U) printf(";; res_nopt()\n");
-#endif
+    LOG(DEBUG) << __func__;
 
     hp = (HEADER*) (void*) buf;
     cp = buf + n0;
@@ -219,20 +213,18 @@ int res_nopt(res_state statp, int n0, /* current offset in buffer */
     *cp++ = 0; /* "." */
 
     // Attach OPT pseudo-RR, as documented in RFC2671 (EDNS0).
-    ns_put16(ns_t_opt, cp); /* TYPE */
+    *reinterpret_cast<uint16_t*>(cp) = htons(ns_t_opt); /* TYPE */
     cp += INT16SZ;
     if (anslen > 0xffff) anslen = 0xffff;
-    ns_put16(anslen, cp); /* CLASS = UDP payload size */
+    *reinterpret_cast<uint16_t*>(cp) = htons(anslen); /* CLASS = UDP payload size */
     cp += INT16SZ;
     *cp++ = NOERROR; /* extended RCODE */
     *cp++ = 0;       /* EDNS version */
     if (statp->options & RES_USE_DNSSEC) {
-#ifdef DEBUG
-        if (statp->options & RES_DEBUG) printf(";; res_opt()... ENDS0 DNSSEC\n");
-#endif
+        LOG(DEBUG) << __func__ << ": ENDS0 DNSSEC";
         flags |= NS_OPT_DNSSEC_OK;
     }
-    ns_put16(flags, cp);
+    *reinterpret_cast<uint16_t*>(cp) = htons(flags);
     cp += INT16SZ;
 
     // EDNS0 padding
@@ -243,11 +235,11 @@ int res_nopt(res_state statp, int n0, /* current offset in buffer */
         return -1;
     }
     padlen = std::min(padlen, static_cast<uint16_t>(buflen - minlen));
-    ns_put16(padlen + 2 * INT16SZ, cp); /* RDLEN */
+    *reinterpret_cast<uint16_t*>(cp) = htons(padlen + 2 * INT16SZ); /* RDLEN */
     cp += INT16SZ;
-    ns_put16(NS_OPT_PADDING, cp); /* OPTION-CODE */
+    *reinterpret_cast<uint16_t*>(cp) = htons(NS_OPT_PADDING); /* OPTION-CODE */
     cp += INT16SZ;
-    ns_put16(padlen, cp); /* OPTION-LENGTH */
+    *reinterpret_cast<uint16_t*>(cp) = htons(padlen); /* OPTION-LENGTH */
     cp += INT16SZ;
     memset(cp, 0, padlen);
     cp += padlen;

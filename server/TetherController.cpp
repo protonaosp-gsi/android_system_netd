@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <netdb.h>
+#include <spawn.h>
 #include <string.h>
 
 #include <sys/socket.h>
@@ -35,26 +36,28 @@
 #include <vector>
 
 #define LOG_TAG "TetherController"
-#include <android-base/strings.h>
 #include <android-base/stringprintf.h>
+#include <android-base/strings.h>
+#include <android-base/unique_fd.h>
 #include <cutils/properties.h>
 #include <log/log.h>
 #include <netdutils/StatusOr.h>
 
 #include "Controllers.h"
 #include "Fwmark.h"
-#include "NetdConstants.h"
-#include "Permission.h"
 #include "InterfaceController.h"
+#include "NetdConstants.h"
 #include "NetworkController.h"
-#include "ResponseCode.h"
+#include "Permission.h"
 #include "TetherController.h"
 
 namespace android {
 namespace net {
 
 using android::base::Join;
+using android::base::Pipe;
 using android::base::StringPrintf;
+using android::base::unique_fd;
 using android::netdutils::statusFromErrno;
 using android::netdutils::StatusOr;
 
@@ -111,6 +114,22 @@ bool inBpToolsMode() {
     char bootmode[PROPERTY_VALUE_MAX] = {0};
     property_get("ro.bootmode", bootmode, "unknown");
     return !strcmp(BP_TOOLS_MODE, bootmode);
+}
+
+int setPosixSpawnFileActionsAddDup2(posix_spawn_file_actions_t* fa, int fd, int new_fd) {
+    int res = posix_spawn_file_actions_init(fa);
+    if (res) {
+        return res;
+    }
+    return posix_spawn_file_actions_adddup2(fa, fd, new_fd);
+}
+
+int setPosixSpawnAttrFlags(posix_spawnattr_t* attr, short flags) {
+    int res = posix_spawnattr_init(attr);
+    if (res) {
+        return res;
+    }
+    return posix_spawnattr_setflags(attr, flags);
 }
 
 }  // namespace
@@ -182,8 +201,8 @@ bool TetherController::disableForwarding(const char* requester) {
     return setIpFwdEnabled();
 }
 
-size_t TetherController::forwardingRequestCount() {
-    return mForwardingRequests.size();
+const std::set<std::string>& TetherController::getIpfwdRequesterList() const {
+    return mForwardingRequests;
 }
 
 int TetherController::startTethering(int num_addrs, char **dhcp_ranges) {
@@ -195,47 +214,23 @@ int TetherController::startTethering(int num_addrs, char **dhcp_ranges) {
 
     ALOGD("Starting tethering services");
 
-    pid_t pid;
-    int pipefd[2];
-
-    if (pipe(pipefd) < 0) {
+    unique_fd pipeRead, pipeWrite;
+    if (!Pipe(&pipeRead, &pipeWrite, O_CLOEXEC)) {
         int res = errno;
-        ALOGE("pipe failed (%s)", strerror(errno));
+        ALOGE("pipe2() failed (%s)", strerror(errno));
         return -res;
     }
 
-    /*
-     * TODO: Create a monitoring thread to handle and restart
-     * the daemon if it exits prematurely
-     */
-    if ((pid = fork()) < 0) {
-        int res = errno;
-        ALOGE("fork failed (%s)", strerror(errno));
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return -res;
-    }
+    // Set parameters
+    Fwmark fwmark;
+    fwmark.netId = NetworkController::LOCAL_NET_ID;
+    fwmark.explicitlySelected = true;
+    fwmark.protectedFromVpn = true;
+    fwmark.permission = PERMISSION_SYSTEM;
+    char markStr[UINT32_HEX_STRLEN];
+    snprintf(markStr, sizeof(markStr), "0x%x", fwmark.intValue);
 
-    if (!pid) {
-        close(pipefd[1]);
-        if (pipefd[0] != STDIN_FILENO) {
-            if (dup2(pipefd[0], STDIN_FILENO) != STDIN_FILENO) {
-                int res = errno;
-                ALOGE("dup2 failed (%s)", strerror(errno));
-                return -res;
-            }
-            close(pipefd[0]);
-        }
-
-        Fwmark fwmark;
-        fwmark.netId = NetworkController::LOCAL_NET_ID;
-        fwmark.explicitlySelected = true;
-        fwmark.protectedFromVpn = true;
-        fwmark.permission = PERMISSION_SYSTEM;
-        char markStr[UINT32_HEX_STRLEN];
-        snprintf(markStr, sizeof(markStr), "0x%x", fwmark.intValue);
-
-        std::vector<const std::string> argVector = {
+    std::vector<const std::string> argVector = {
             "/system/bin/dnsmasq",
             "--keep-in-foreground",
             "--no-resolv",
@@ -244,34 +239,60 @@ int TetherController::startTethering(int num_addrs, char **dhcp_ranges) {
             // TODO: pipe through metered status from ConnService
             "--dhcp-option-force=43,ANDROID_METERED",
             "--pid-file",
-            "--listen-mark", markStr,
-            "--user", kDnsmasqUsername,
-        };
+            "--listen-mark",
+            markStr,
+            "--user",
+            kDnsmasqUsername,
+    };
 
-        // DHCP server will be disabled if num_addrs == 0 and no --dhcp-range is passed.
-        for (int addrIndex = 0; addrIndex < num_addrs; addrIndex += 2) {
-            argVector.push_back(StringPrintf("--dhcp-range=%s,%s,1h", dhcp_ranges[addrIndex],
-                                             dhcp_ranges[addrIndex + 1]));
-        }
-
-        auto args = (char**)std::calloc(argVector.size() + 1, sizeof(char*));
-        for (unsigned i = 0; i < argVector.size(); i++) {
-            args[i] = (char*)argVector[i].c_str();
-        }
-
-        if (execv(args[0], args)) {
-            ALOGE("execv failed (%s)", strerror(errno));
-        }
-        ALOGE("Should never get here!");
-        _exit(-1);
-    } else {
-        close(pipefd[0]);
-        mDaemonPid = pid;
-        mDaemonFd = pipefd[1];
-        configureForTethering(true);
-        applyDnsInterfaces();
-        ALOGD("Tethering services running");
+    // DHCP server will be disabled if num_addrs == 0 and no --dhcp-range is
+    // passed.
+    for (int addrIndex = 0; addrIndex < num_addrs; addrIndex += 2) {
+        argVector.push_back(StringPrintf("--dhcp-range=%s,%s,1h", dhcp_ranges[addrIndex],
+                                         dhcp_ranges[addrIndex + 1]));
     }
+
+    std::vector<char*> args(argVector.size() + 1);
+    for (unsigned i = 0; i < argVector.size(); i++) {
+        args[i] = (char*)argVector[i].c_str();
+    }
+
+    /*
+     * TODO: Create a monitoring thread to handle and restart
+     * the daemon if it exits prematurely
+     */
+
+    // Note that don't modify any memory between vfork and execv.
+    // Changing state of file descriptors would be fine. See posix_spawn_file_actions_add*
+    // dup2 creates fd without CLOEXEC, dnsmasq will receive commands through the
+    // duplicated fd.
+    posix_spawn_file_actions_t fa;
+    int res = setPosixSpawnFileActionsAddDup2(&fa, pipeRead.get(), STDIN_FILENO);
+    if (res) {
+        ALOGE("posix_spawn set fa failed (%s)", strerror(res));
+        return -res;
+    }
+
+    posix_spawnattr_t attr;
+    res = setPosixSpawnAttrFlags(&attr, POSIX_SPAWN_USEVFORK);
+    if (res) {
+        ALOGE("posix_spawn set attr flag failed (%s)", strerror(res));
+        return -res;
+    }
+
+    pid_t pid;
+    res = posix_spawn(&pid, args[0], &fa, &attr, &args[0], nullptr);
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&fa);
+    if (res) {
+        ALOGE("posix_spawn failed (%s)", strerror(res));
+        return -res;
+    }
+    mDaemonPid = pid;
+    mDaemonFd = pipeWrite.release();
+    configureForTethering(true);
+    applyDnsInterfaces();
+    ALOGD("Tethering services running");
 
     return 0;
 }
@@ -325,7 +346,7 @@ bool TetherController::isTetheringStarted() {
 // dnsmasq reads up to 1023 bytes.
 const size_t MAX_CMD_SIZE = 1023;
 
-// TODO: convert callers to the overload taking a vector<string>
+// TODO: Remove overload function and update this after NDC migration.
 int TetherController::setDnsForwarders(unsigned netId, char **servers, int numServers) {
     Fwmark fwmark;
     fwmark.netId = netId;
@@ -372,14 +393,6 @@ int TetherController::setDnsForwarders(unsigned netId, char **servers, int numSe
 }
 
 int TetherController::setDnsForwarders(unsigned netId, const std::vector<std::string>& servers) {
-    struct in_addr v4_addr;
-    struct in6_addr v6_addr;
-    for (const auto& server : servers) {
-        if (!inet_pton(AF_INET, server.c_str(), &v4_addr) &&
-            !inet_pton(AF_INET6, server.c_str(), &v6_addr)) {
-            return -EINVAL;
-        }
-    }
     auto dnsServers = toCstrVec(servers);
     return setDnsForwarders(netId, dnsServers.data(), dnsServers.size());
 }

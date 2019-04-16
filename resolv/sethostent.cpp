@@ -36,7 +36,6 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <resolv.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
@@ -61,6 +60,8 @@ static void endhostent_r(FILE** hf) {
     }
 }
 
+// TODO: Consider returning a boolean result as files_getaddrinfo() does because the error code
+// does not currently return to netd.
 int _hf_gethtbyname2(const char* name, int af, getnamaddr* info) {
     struct hostent *hp, hent;
     char *buf, *ptr;
@@ -71,9 +72,11 @@ int _hf_gethtbyname2(const char* name, int af, getnamaddr* info) {
     FILE* hf = NULL;
     sethostent_r(&hf);
     if (hf == NULL) {
-        errno = EINVAL;
-        // TODO: Consider to remap error code without relying on errno.
-        return EAI_SYSTEM;
+        // TODO: Consider converting to a private extended EAI_* error code.
+        // Currently, the EAI_* value has no corresponding error code for invalid argument socket
+        // length. In order to not rely on errno, convert the original error code pair, EAI_SYSTEM
+        // and EINVAL, to EAI_FAIL.
+        return EAI_FAIL;
     }
 
     if ((ptr = buf = (char*) malloc(len = info->buflen)) == NULL) {
@@ -89,10 +92,10 @@ int _hf_gethtbyname2(const char* name, int af, getnamaddr* info) {
         info->hp->h_addrtype = af;
         info->hp->h_length = 0;
 
-        int herrno;
-        hp = netbsd_gethostent_r(hf, info->hp, info->buf, info->buflen, &herrno);
+        int he;
+        hp = netbsd_gethostent_r(hf, info->hp, info->buf, info->buflen, &he);
         if (hp == NULL) {
-            if (herrno == NETDB_INTERNAL && errno == ENOSPC) {
+            if (he == NETDB_INTERNAL && errno == ENOSPC) {
                 goto nospc;  // glibc compatibility.
             }
             break;
@@ -165,10 +168,11 @@ int _hf_gethtbyname2(const char* name, int af, getnamaddr* info) {
     return 0;
 nospc:
     free(buf);
-    errno = ENOSPC;
     return EAI_MEMORY;
 }
 
+// TODO: Consider returning a boolean result as files_getaddrinfo() does because the error code
+// does not currently return to netd.
 int _hf_gethtbyaddr(const unsigned char* uaddr, int len, int af, getnamaddr* info) {
     info->hp->h_length = len;
     info->hp->h_addrtype = af;
@@ -176,12 +180,15 @@ int _hf_gethtbyaddr(const unsigned char* uaddr, int len, int af, getnamaddr* inf
     FILE* hf = NULL;
     sethostent_r(&hf);
     if (hf == NULL) {
-        // TODO: Consider to remap error code without relying on errno.
-        return EAI_SYSTEM;
+        // TODO: Consider converting to a private extended EAI_* error code.
+        // Currently, the EAI_* value has no corresponding error code for invalid argument socket
+        // length. In order to not rely on errno, convert the original error code pair, EAI_SYSTEM
+        // and EINVAL, to EAI_FAIL.
+        return EAI_FAIL;
     }
     struct hostent* hp;
-    int herrno;
-    while ((hp = netbsd_gethostent_r(hf, info->hp, info->buf, info->buflen, &herrno)) != NULL)
+    int he;
+    while ((hp = netbsd_gethostent_r(hf, info->hp, info->buf, info->buflen, &he)) != NULL)
         if (!memcmp(hp->h_addr_list[0], uaddr, (size_t) hp->h_length)) break;
     endhostent_r(&hf);
 
