@@ -72,12 +72,19 @@ using netdutils::status::ok;
 
 constexpr int kSockDiagMsgType = SOCK_DIAG_BY_FAMILY;
 constexpr int kSockDiagDoneMsgType = NLMSG_DONE;
-constexpr int PER_UID_STATS_ENTRY_LIMIT = 1024;
+constexpr int PER_UID_STATS_ENTRIES_LIMIT = 500;
+// At most 90% of the stats map may be used by tagged traffic entries. This ensures
+// that 10% of the map is always available to count untagged traffic, one entry per UID.
+// Otherwise, apps would be able to avoid data usage accounting entirely by filling up the
+// map with tagged traffic entries.
+constexpr int TOTAL_UID_STATS_ENTRIES_LIMIT = STATS_MAP_SIZE * 0.9;
 
 static_assert(BPF_PERMISSION_INTERNET == INetd::PERMISSION_INTERNET,
               "Mismatch between BPF and AIDL permissions: PERMISSION_INTERNET");
 static_assert(BPF_PERMISSION_UPDATE_DEVICE_STATS == INetd::PERMISSION_UPDATE_DEVICE_STATS,
               "Mismatch between BPF and AIDL permissions: PERMISSION_UPDATE_DEVICE_STATS");
+static_assert(STATS_MAP_SIZE - TOTAL_UID_STATS_ENTRIES_LIMIT > 100,
+              "The limit for stats map is to high, stats data may be lost due to overflow");
 
 #define FLAG_MSG_TRANS(result, flag, value)            \
     do {                                               \
@@ -110,8 +117,8 @@ bool TrafficController::hasUpdateDeviceStatsPermission(uid_t uid) {
 }
 
 const std::string UidPermissionTypeToString(uint8_t permission) {
-    if (permission == INetd::NO_PERMISSIONS) {
-        return "NO_PERMISSIONS";
+    if (permission == INetd::PERMISSION_NONE) {
+        return "PERMISSION_NONE";
     }
     if (permission == INetd::PERMISSION_UNINSTALLED) {
         // This should never appear in the map, complain loudly if it does.
@@ -177,10 +184,18 @@ Status changeOwnerAndMode(const char* path, gid_t group, const char* debugName, 
     return netdutils::status::ok;
 }
 
-TrafficController::TrafficController() : mBpfLevel(getBpfSupportLevel()) {}
+TrafficController::TrafficController()
+    : mBpfLevel(getBpfSupportLevel()),
+      mPerUidStatsEntriesLimit(PER_UID_STATS_ENTRIES_LIMIT),
+      mTotalUidStatsEntriesLimit(TOTAL_UID_STATS_ENTRIES_LIMIT) {}
+
+TrafficController::TrafficController(uint32_t perUidLimit, uint32_t totalLimit)
+    : mBpfLevel(getBpfSupportLevel()),
+      mPerUidStatsEntriesLimit(perUidLimit),
+      mTotalUidStatsEntriesLimit(totalLimit) {}
 
 Status TrafficController::initMaps() {
-    std::lock_guard ownerMapGuard(mOwnerMatchMutex);
+    std::lock_guard guard(mMutex);
     RETURN_IF_NOT_OK(mCookieTagMap.init(COOKIE_TAG_MAP_PATH));
     RETURN_IF_NOT_OK(changeOwnerAndMode(COOKIE_TAG_MAP_PATH, AID_NET_BW_ACCT, "CookieTagMap",
                                         false));
@@ -301,6 +316,7 @@ Status TrafficController::start() {
     }
     // Rx handler extracts nfgenmsg looks up and invokes registered dispatch function.
     const auto rxHandler = [this](const nlmsghdr&, const Slice msg) {
+        std::lock_guard guard(mMutex);
         inet_diag_msg diagmsg = {};
         if (extract(msg, diagmsg) < sizeof(inet_diag_msg)) {
             ALOGE("Unrecognized netlink message: %s", toString(msg).c_str());
@@ -330,7 +346,7 @@ Status TrafficController::start() {
 }
 
 int TrafficController::tagSocket(int sockFd, uint32_t tag, uid_t uid, uid_t callingUid) {
-    std::lock_guard guard(mOwnerMatchMutex);
+    std::lock_guard guard(mMutex);
     if (uid != callingUid && !hasUpdateDeviceStatsPermission(callingUid)) {
         return -EPERM;
     }
@@ -345,16 +361,18 @@ int TrafficController::tagSocket(int sockFd, uint32_t tag, uid_t uid, uid_t call
     UidTag newKey = {.uid = (uint32_t)uid, .tag = tag};
 
     uint32_t totalEntryCount = 0;
+    uint32_t perUidEntryCount = 0;
     // Now we go through the stats map and count how many entries are associated
     // with target uid. If the uid entry hit the limit for each uid, we block
     // the request to prevent the map from overflow. It is safe here to iterate
-    // over the map since when mOwnerMatchMutex is hold, system server cannot toggle
+    // over the map since when mMutex is hold, system server cannot toggle
     // the live stats map and clean it. So nobody can delete entries from the map.
-    const auto countUidStatsEntries = [uid, &totalEntryCount](const StatsKey& key,
-                                                              BpfMap<StatsKey, StatsValue>&) {
+    const auto countUidStatsEntries = [uid, &totalEntryCount, &perUidEntryCount](
+                                              const StatsKey& key, BpfMap<StatsKey, StatsValue>&) {
         if (key.uid == uid) {
-            totalEntryCount++;
+            perUidEntryCount++;
         }
+        totalEntryCount++;
         return netdutils::status::ok;
     };
     auto configuration = mConfigurationMap.readValue(CURRENT_STATS_MAP_CONFIGURATION_KEY);
@@ -363,17 +381,25 @@ int TrafficController::tagSocket(int sockFd, uint32_t tag, uid_t uid, uid_t call
               strerror(configuration.status().code()), mConfigurationMap.getMap().get());
         return -configuration.status().code();
     }
-    if (configuration.value() == SELECT_MAP_A) {
-        mStatsMapA.iterate(countUidStatsEntries).ignoreError();
-    } else if (configuration.value() == SELECT_MAP_B) {
-        mStatsMapB.iterate(countUidStatsEntries).ignoreError();
-    } else {
+    if (configuration.value() != SELECT_MAP_A && configuration.value() != SELECT_MAP_B) {
         ALOGE("unknown configuration value: %d", configuration.value());
         return -EINVAL;
     }
-    if (totalEntryCount > PER_UID_STATS_ENTRY_LIMIT) {
-        ALOGE("Too many stats entry for this uid: %u, block tag request to prevent map overflow",
-              uid);
+
+    BpfMap<StatsKey, StatsValue>& currentMap =
+            (configuration.value() == SELECT_MAP_A) ? mStatsMapA : mStatsMapB;
+    Status res = currentMap.iterate(countUidStatsEntries);
+    if (!isOk(res)) {
+        ALOGE("Failed to count the stats entry in map %d: %s", currentMap.getMap().get(),
+              strerror(res.code()));
+        return -res.code();
+    }
+
+    if (totalEntryCount > mTotalUidStatsEntriesLimit ||
+        perUidEntryCount > mPerUidStatsEntriesLimit) {
+        ALOGE("Too many stats entries in the map, total count: %u, uid(%u) count: %u, blocking tag"
+              " request to prevent map overflow",
+              totalEntryCount, uid, perUidEntryCount);
         return -EMFILE;
     }
     // Update the tag information of a socket to the cookieUidMap. Use BPF_ANY
@@ -381,7 +407,7 @@ int TrafficController::tagSocket(int sockFd, uint32_t tag, uid_t uid, uid_t call
     // yet. And update the tag if there is already a tag stored. Since the eBPF
     // program in kernel only read this map, and is protected by rcu read lock. It
     // should be fine to cocurrently update the map while eBPF program is running.
-    Status res = mCookieTagMap.writeValue(sock_cookie, newKey, BPF_ANY);
+    res = mCookieTagMap.writeValue(sock_cookie, newKey, BPF_ANY);
     if (!isOk(res)) {
         ALOGE("Failed to tag the socket: %s, fd: %d", strerror(res.code()),
               mCookieTagMap.getMap().get());
@@ -390,6 +416,7 @@ int TrafficController::tagSocket(int sockFd, uint32_t tag, uid_t uid, uid_t call
 }
 
 int TrafficController::untagSocket(int sockFd) {
+    std::lock_guard guard(mMutex);
     if (mBpfLevel == BpfLevel::NONE) {
         if (legacy_untagSocket(sockFd)) return -errno;
         return 0;
@@ -407,6 +434,7 @@ int TrafficController::untagSocket(int sockFd) {
 int TrafficController::setCounterSet(int counterSetNum, uid_t uid, uid_t callingUid) {
     if (counterSetNum < 0 || counterSetNum >= OVERFLOW_COUNTERSET) return -EINVAL;
 
+    std::lock_guard guard(mMutex);
     if (!hasUpdateDeviceStatsPermission(callingUid)) return -EPERM;
 
     if (mBpfLevel == BpfLevel::NONE) {
@@ -439,6 +467,7 @@ int TrafficController::setCounterSet(int counterSetNum, uid_t uid, uid_t calling
 // is called inside removeUidsLocked() while holding mStatsLock. So it is safe
 // to iterate and modify the stats maps.
 int TrafficController::deleteTagData(uint32_t tag, uid_t uid, uid_t callingUid) {
+    std::lock_guard guard(mMutex);
     if (!hasUpdateDeviceStatsPermission(callingUid)) return -EPERM;
 
     if (mBpfLevel == BpfLevel::NONE) {
@@ -522,7 +551,7 @@ int TrafficController::addInterface(const char* name, uint32_t ifaceIndex) {
 
 Status TrafficController::updateOwnerMapEntry(UidOwnerMatchType match, uid_t uid, FirewallRule rule,
                                               FirewallType type) {
-    std::lock_guard guard(mOwnerMatchMutex);
+    std::lock_guard guard(mMutex);
     if ((rule == ALLOW && type == WHITELIST) || (rule == DENY && type == BLACKLIST)) {
         RETURN_IF_NOT_OK(addRule(mUidOwnerMap, uid, match));
     } else if ((rule == ALLOW && type == BLACKLIST) || (rule == DENY && type == WHITELIST)) {
@@ -585,7 +614,7 @@ Status TrafficController::addRule(BpfMap<uint32_t, UidOwnerValue>& map, uint32_t
 Status TrafficController::updateUidOwnerMap(const std::vector<std::string>& appStrUids,
                                             BandwidthController::IptJumpOp jumpHandling,
                                             BandwidthController::IptOp op) {
-    std::lock_guard guard(mOwnerMatchMutex);
+    std::lock_guard guard(mMutex);
     UidOwnerMatchType match = jumpOpToMatch(jumpHandling);
     if (match == NO_MATCH) {
         return statusFromErrno(
@@ -642,7 +671,7 @@ int TrafficController::changeUidOwnerRule(ChildChain chain, uid_t uid, FirewallR
 
 Status TrafficController::replaceRulesInMap(const UidOwnerMatchType match,
                                             const std::vector<int32_t>& uids) {
-    std::lock_guard guard(mOwnerMatchMutex);
+    std::lock_guard guard(mMutex);
     std::set<int32_t> uidSet(uids.begin(), uids.end());
     std::vector<uint32_t> uidsToDelete;
     auto getUidsToDelete = [&uidsToDelete, &uidSet](const uint32_t& key,
@@ -673,7 +702,7 @@ Status TrafficController::addUidInterfaceRules(const int iif,
     if (!iif) {
         return statusFromErrno(EINVAL, "Interface rule must specify interface");
     }
-    std::lock_guard guard(mOwnerMatchMutex);
+    std::lock_guard guard(mMutex);
 
     for (auto uid : uidsToAdd) {
         netdutils::Status result = addRule(mUidOwnerMap, uid, IIF_MATCH, iif);
@@ -689,7 +718,7 @@ Status TrafficController::removeUidInterfaceRules(const std::vector<int32_t>& ui
         ALOGW("UID ingress interface filtering not possible without BPF owner match");
         return statusFromErrno(EOPNOTSUPP, "eBPF not supported");
     }
-    std::lock_guard guard(mOwnerMatchMutex);
+    std::lock_guard guard(mMutex);
 
     for (auto uid : uidsToDelete) {
         netdutils::Status result = removeRule(mUidOwnerMap, uid, IIF_MATCH);
@@ -730,7 +759,7 @@ int TrafficController::replaceUidOwnerMap(const std::string& name, bool isWhitel
 }
 
 int TrafficController::toggleUidOwnerMap(ChildChain chain, bool enable) {
-    std::lock_guard guard(mOwnerMatchMutex);
+    std::lock_guard guard(mMutex);
     uint32_t key = UID_RULES_CONFIGURATION_KEY;
     auto oldConfiguration = mConfigurationMap.readValue(key);
     if (!isOk(oldConfiguration)) {
@@ -768,7 +797,7 @@ BpfLevel TrafficController::getBpfLevel() {
 }
 
 Status TrafficController::swapActiveStatsMap() {
-    std::lock_guard guard(mOwnerMatchMutex);
+    std::lock_guard guard(mMutex);
 
     if (mBpfLevel == BpfLevel::NONE) {
         return statusFromErrno(EOPNOTSUPP, "This device doesn't have eBPF support");
@@ -810,12 +839,19 @@ Status TrafficController::swapActiveStatsMap() {
 }
 
 void TrafficController::setPermissionForUids(int permission, const std::vector<uid_t>& uids) {
+    std::lock_guard guard(mMutex);
     if (permission == INetd::PERMISSION_UNINSTALLED) {
         for (uid_t uid : uids) {
             // Clean up all permission information for the related uid if all the
             // packages related to it are uninstalled.
             mPrivilegedUser.erase(uid);
-            Status ret = mUidPermissionMap.deleteValue(uid);
+            if (mBpfLevel > BpfLevel::NONE) {
+                Status ret = mUidPermissionMap.deleteValue(uid);
+                if (!isOk(ret) && ret.code() != ENONET) {
+                    ALOGE("Failed to clean up the permission for %u: %s", uid,
+                          strerror(ret.code()));
+                }
+            }
         }
         return;
     }
@@ -823,6 +859,16 @@ void TrafficController::setPermissionForUids(int permission, const std::vector<u
     bool privileged = (permission & INetd::PERMISSION_UPDATE_DEVICE_STATS);
 
     for (uid_t uid : uids) {
+        if (privileged) {
+            mPrivilegedUser.insert(uid);
+        } else {
+            mPrivilegedUser.erase(uid);
+        }
+
+        // Skip the bpf map operation if not supported.
+        if (mBpfLevel == BpfLevel::NONE) {
+            continue;
+        }
         // The map stores all the permissions that the UID has, except if the only permission
         // the UID has is the INTERNET permission, then the UID should not appear in the map.
         if (permission != INetd::PERMISSION_INTERNET) {
@@ -836,12 +882,6 @@ void TrafficController::setPermissionForUids(int permission, const std::vector<u
             if (!isOk(ret) && ret.code() != ENOENT) {
                 ALOGE("Failed to remove uid %u from permission map: %s", uid, strerror(ret.code()));
             }
-        }
-
-        if (privileged) {
-            mPrivilegedUser.insert(uid);
-        } else {
-            mPrivilegedUser.erase(uid);
         }
     }
 }
@@ -879,7 +919,7 @@ void dumpBpfMap(const std::string& mapName, DumpWriter& dw, const std::string& h
 const String16 TrafficController::DUMP_KEYWORD = String16("trafficcontroller");
 
 void TrafficController::dump(DumpWriter& dw, bool verbose) {
-    std::lock_guard ownerMapGuard(mOwnerMatchMutex);
+    std::lock_guard guard(mMutex);
     ScopedIndent indentTop(dw);
     dw.println("TrafficController");
 

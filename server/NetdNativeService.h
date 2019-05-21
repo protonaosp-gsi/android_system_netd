@@ -29,6 +29,7 @@ namespace net {
 
 class NetdNativeService : public BinderService<NetdNativeService>, public BnNetd {
   public:
+    NetdNativeService();
     static status_t start();
     static char const* getServiceName() { return "netd"; }
     virtual status_t dump(int fd, const Vector<String16> &args) override;
@@ -245,6 +246,8 @@ class NetdNativeService : public BinderService<NetdNativeService>, public BnNetd
 
     binder::Status registerUnsolicitedEventListener(
             const android::sp<android::net::INetdUnsolicitedEventListener>& listener) override;
+
+    binder::Status getOemNetd(android::sp<android::IBinder>* listener) override;
 
   private:
     std::vector<uid_t> intsToUids(const std::vector<int32_t>& intUids);

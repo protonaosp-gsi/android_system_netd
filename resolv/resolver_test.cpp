@@ -95,7 +95,6 @@ class ResolverTest : public ::testing::Test {
 
     void SetUp() { mDnsClient.SetUp(); }
     void TearDown() {
-        mDnsClient.resolvService()->stopPrefix64Discovery(TEST_NETID);
         mDnsClient.TearDown();
     }
 
@@ -270,8 +269,6 @@ class ResolverTest : public ::testing::Test {
         ASSERT_TRUE(GetResolverInfo(&res_servers, &res_domains, &res_tls_servers, &res_params,
                                     &res_stats, &wait_for_pending_req_timeout_count));
         EXPECT_EQ(0, wait_for_pending_req_timeout_count);
-
-        ASSERT_NO_FATAL_FAILURE(mDnsClient.ShutdownDNSServers(&dns));
     }
 
     void StartDns(test::DNSResponder& dns, const std::vector<DnsRecord>& records) {
@@ -556,8 +553,6 @@ TEST_F(ResolverTest, GetHostByName_Binder) {
 
     EXPECT_THAT(res_servers, testing::UnorderedElementsAreArray(servers));
     EXPECT_THAT(res_domains, testing::UnorderedElementsAreArray(domains));
-
-    ASSERT_NO_FATAL_FAILURE(mDnsClient.ShutdownDNSServers(&dns));
 }
 
 TEST_F(ResolverTest, GetAddrInfo) {
@@ -816,7 +811,6 @@ TEST_F(ResolverTest, MultidomainResolution) {
     ASSERT_FALSE(result->h_addr_list[0] == nullptr);
     EXPECT_EQ("1.2.3.3", ToString(result));
     EXPECT_TRUE(result->h_addr_list[1] == nullptr);
-    dns.stopServer();
 }
 
 TEST_F(ResolverTest, GetAddrInfoV6_numeric) {
@@ -1075,13 +1069,6 @@ static void setupTlsServers(const std::vector<std::string>& servers,
     }
 }
 
-static void shutdownTlsServers(std::vector<std::unique_ptr<test::DnsTlsFrontend>>* tls) {
-    for (const auto& t : *tls) {
-        t->stopServer();
-    }
-    tls->clear();
-}
-
 TEST_F(ResolverTest, MaxServerPrune_Binder) {
     std::vector<std::string> domains;
     std::vector<std::unique_ptr<test::DNSResponder>> dns;
@@ -1115,9 +1102,6 @@ TEST_F(ResolverTest, MaxServerPrune_Binder) {
     EXPECT_TRUE(std::equal(servers.begin(), servers.begin() + MAXNS, res_servers.begin()));
     EXPECT_TRUE(std::equal(servers.begin(), servers.begin() + MAXNS, res_tls_servers.begin()));
     EXPECT_TRUE(std::equal(domains.begin(), domains.begin() + MAXDNSRCH, res_domains.begin()));
-
-    ASSERT_NO_FATAL_FAILURE(mDnsClient.ShutdownDNSServers(&dns));
-    ASSERT_NO_FATAL_FAILURE(shutdownTlsServers(&tls));
 }
 
 TEST_F(ResolverTest, ResolverStats) {
@@ -2039,9 +2023,12 @@ TEST_F(ResolverTest, Async_MalformedQuery) {
 TEST_F(ResolverTest, Async_CacheFlags) {
     constexpr char listen_addr[] = "127.0.0.4";
     constexpr char host_name[] = "howdy.example.com.";
+    constexpr char another_host_name[] = "howdy.example2.com.";
     const std::vector<DnsRecord> records = {
             {host_name, ns_type::ns_t_a, "1.2.3.4"},
             {host_name, ns_type::ns_t_aaaa, "::1.2.3.4"},
+            {another_host_name, ns_type::ns_t_a, "1.2.3.5"},
+            {another_host_name, ns_type::ns_t_aaaa, "::1.2.3.5"},
     };
 
     test::DNSResponder dns(listen_addr);
@@ -2130,6 +2117,37 @@ TEST_F(ResolverTest, Async_CacheFlags) {
 
     // Cache hits, expect still 2 queries
     EXPECT_EQ(2U, GetNumQueries(dns, host_name));
+
+    // Test both ANDROID_RESOLV_NO_CACHE_STORE and ANDROID_RESOLV_NO_CACHE_LOOKUP are set
+    dns.clearQueries();
+
+    // Make sure that the cache of "howdy.example2.com" exists.
+    fd1 = resNetworkQuery(TEST_NETID, "howdy.example2.com", ns_c_in, ns_t_aaaa, 0);
+    EXPECT_TRUE(fd1 != -1);
+    expectAnswersValid(fd1, AF_INET6, "::1.2.3.5");
+    EXPECT_EQ(1U, GetNumQueries(dns, another_host_name));
+
+    // Re-query with testFlags
+    const int testFlag = ANDROID_RESOLV_NO_CACHE_STORE | ANDROID_RESOLV_NO_CACHE_LOOKUP;
+    fd1 = resNetworkQuery(TEST_NETID, "howdy.example2.com", ns_c_in, ns_t_aaaa, testFlag);
+    EXPECT_TRUE(fd1 != -1);
+    expectAnswersValid(fd1, AF_INET6, "::1.2.3.5");
+    // Expect cache lookup is skipped.
+    EXPECT_EQ(2U, GetNumQueries(dns, another_host_name));
+
+    // Do another query with testFlags
+    fd1 = resNetworkQuery(TEST_NETID, "howdy.example2.com", ns_c_in, ns_t_a, testFlag);
+    EXPECT_TRUE(fd1 != -1);
+    expectAnswersValid(fd1, AF_INET, "1.2.3.5");
+    // Expect cache lookup is skipped.
+    EXPECT_EQ(3U, GetNumQueries(dns, another_host_name));
+
+    // Re-query with no flags
+    fd1 = resNetworkQuery(TEST_NETID, "howdy.example2.com", ns_c_in, ns_t_a, 0);
+    EXPECT_TRUE(fd1 != -1);
+    expectAnswersValid(fd1, AF_INET, "1.2.3.5");
+    // Expect no cache hit because cache storing is also skipped in previous query.
+    EXPECT_EQ(4U, GetNumQueries(dns, another_host_name));
 }
 
 TEST_F(ResolverTest, Async_NoRetryFlag) {
@@ -2402,8 +2420,6 @@ TEST_F(ResolverTest, BrokenEdns) {
         tls.stopServer();
         dns.clearQueries();
     }
-
-    dns.stopServer();
 }
 
 // DNS-over-TLS validation success, but server does not respond to TLS query after a while.
@@ -3241,4 +3257,50 @@ TEST_F(ResolverTest, GetHostByName2_Dns64QuerySpecialUseIPv4Addresses) {
 
         dns.clearQueries();
     }
+}
+
+TEST_F(ResolverTest, PrefixDiscoveryBypassTls) {
+    constexpr char listen_addr[] = "::1";
+    constexpr char cleartext_port[] = "53";
+    constexpr char tls_port[] = "853";
+    constexpr char dns64_name[] = "ipv4only.arpa.";
+    const std::vector<std::string> servers = {listen_addr};
+
+    test::DNSResponder dns(listen_addr);
+    StartDns(dns, {{dns64_name, ns_type::ns_t_aaaa, "64:ff9b::192.0.0.170"}});
+    test::DnsTlsFrontend tls(listen_addr, tls_port, listen_addr, cleartext_port);
+    ASSERT_TRUE(tls.startServer());
+
+    // Setup OPPORTUNISTIC mode and wait for the validation complete.
+    ASSERT_TRUE(
+            mDnsClient.SetResolversWithTls(servers, kDefaultSearchDomains, kDefaultParams, "", {}));
+    EXPECT_TRUE(tls.waitForQueries(1, 5000));
+    tls.clearQueries();
+
+    // Start NAT64 prefix discovery and wait for it complete.
+    EXPECT_TRUE(mDnsClient.resolvService()->startPrefix64Discovery(TEST_NETID).isOk());
+    EXPECT_TRUE(WaitForPrefix64Detected(TEST_NETID, 1000));
+
+    // Verify it bypassed TLS even though there's a TLS server available.
+    EXPECT_EQ(0, tls.queries());
+    EXPECT_EQ(1U, GetNumQueries(dns, dns64_name));
+
+    // Restart the testing network to reset the cache.
+    mDnsClient.TearDown();
+    mDnsClient.SetUp();
+    dns.clearQueries();
+
+    // Setup STRICT mode and wait for the validation complete.
+    ASSERT_TRUE(mDnsClient.SetResolversWithTls(servers, kDefaultSearchDomains, kDefaultParams, "",
+                                               {base64Encode(tls.fingerprint())}));
+    EXPECT_TRUE(tls.waitForQueries(1, 5000));
+    tls.clearQueries();
+
+    // Start NAT64 prefix discovery and wait for it to complete.
+    EXPECT_TRUE(mDnsClient.resolvService()->startPrefix64Discovery(TEST_NETID).isOk());
+    EXPECT_TRUE(WaitForPrefix64Detected(TEST_NETID, 1000));
+
+    // Verify it bypassed TLS despite STRICT mode.
+    EXPECT_EQ(0, tls.queries());
+    EXPECT_EQ(1U, GetNumQueries(dns, dns64_name));
 }

@@ -28,38 +28,7 @@
 #include "netd_resolv/resolv.h"
 #include "netdutils/BackoffSequence.h"
 
-using aidl::android::net::metrics::INetdEventListener;
-
-int resolv_set_private_dns_for_net(unsigned netid, uint32_t mark, const char** servers,
-                                   const int numServers, const char* tlsName,
-                                   const uint8_t** fingerprints, const int numFingerprint) {
-    std::vector<std::string> tlsServers;
-    for (int i = 0; i < numServers; i++) {
-        tlsServers.push_back(std::string(servers[i]));
-    }
-
-    std::set<std::vector<uint8_t>> tlsFingerprints;
-    for (int i = 0; i < numFingerprint; i++) {
-        // Each fingerprint stored are 32(SHA256_SIZE) bytes long.
-        tlsFingerprints.emplace(std::vector<uint8_t>(fingerprints[i], fingerprints[i] + 32));
-    }
-
-    return android::net::gPrivateDnsConfiguration.set(netid, mark, tlsServers, std::string(tlsName),
-                                                      tlsFingerprints);
-}
-
-void resolv_delete_private_dns_for_net(unsigned netid) {
-    android::net::gPrivateDnsConfiguration.clear(netid);
-}
-
-void resolv_get_private_dns_status_for_net(unsigned netid, ExternalPrivateDnsStatus* status) {
-    android::net::gPrivateDnsConfiguration.getStatus(netid, status);
-}
-
 namespace android {
-
-using android::netdutils::BackoffSequence;
-
 namespace net {
 
 std::string addrToString(const sockaddr_storage* addr) {
@@ -88,8 +57,8 @@ int PrivateDnsConfiguration::set(int32_t netId, uint32_t mark,
                                  const std::vector<std::string>& servers, const std::string& name,
                                  const std::set<std::vector<uint8_t>>& fingerprints) {
     if (DBG) {
-        ALOGD("PrivateDnsConfiguration::set(%u, %zu, %s, %zu)", netId, servers.size(), name.c_str(),
-              fingerprints.size());
+        ALOGD("PrivateDnsConfiguration::set(%u, 0x%x, %zu, %s, %zu)", netId, mark, servers.size(),
+              name.c_str(), fingerprints.size());
     }
 
     const bool explicitlyConfigured = !name.empty() || !fingerprints.empty();
@@ -151,12 +120,6 @@ int PrivateDnsConfiguration::set(int32_t netId, uint32_t mark,
 
 PrivateDnsStatus PrivateDnsConfiguration::getStatus(unsigned netId) {
     PrivateDnsStatus status{PrivateDnsMode::OFF, {}};
-
-    // This mutex is on the critical path of every DNS lookup.
-    //
-    // If the overhead of mutex acquisition proves too high, we could reduce
-    // it by maintaining an atomic_int32_t counter of TLS-enabled netids, or
-    // by using an RWLock.
     std::lock_guard guard(mPrivateDnsLock);
 
     const auto mode = mPrivateDnsModes.find(netId);
@@ -176,11 +139,6 @@ PrivateDnsStatus PrivateDnsConfiguration::getStatus(unsigned netId) {
 }
 
 void PrivateDnsConfiguration::getStatus(unsigned netId, ExternalPrivateDnsStatus* status) {
-    // This mutex is on the critical path of every DNS lookup.
-    //
-    // If the overhead of mutex acquisition proves too high, we could reduce
-    // it by maintaining an atomic_int32_t counter of TLS-enabled netids, or
-    // by using an RWLock.
     std::lock_guard guard(mPrivateDnsLock);
 
     const auto mode = mPrivateDnsModes.find(netId);
@@ -238,7 +196,7 @@ void PrivateDnsConfiguration::validatePrivateDnsProvider(const DnsTlsServer& ser
         // such validation passes per day is about ~30MB per month, in the
         // worst case. Otherwise, this will cost ~600 SYNs per month
         // (6 SYNs per ip, 4 ips per validation pass, 24 passes per day).
-        auto backoff = BackoffSequence<>::Builder()
+        auto backoff = netdutils::BackoffSequence<>::Builder()
                                .withInitialRetransmissionTime(std::chrono::seconds(60))
                                .withMaximumRetransmissionTime(std::chrono::seconds(3600))
                                .build();

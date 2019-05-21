@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+
 #include <vector>
 
 #include <openssl/base64.h>
@@ -26,7 +30,6 @@
 #include <gtest/gtest.h>
 #include <netdb.h>
 #include <netdutils/Stopwatch.h>
-
 #include "tests/BaseTestMetricsListener.h"
 #include "tests/TestMetrics.h"
 
@@ -44,6 +47,7 @@ using android::sp;
 using android::String16;
 using android::String8;
 using android::net::IDnsResolver;
+using android::net::ResolverParamsParcel;
 using android::net::ResolverStats;
 using android::net::metrics::INetdEventListener;
 using android::net::metrics::TestOnDnsEvent;
@@ -51,7 +55,7 @@ using android::netdutils::Stopwatch;
 
 // TODO: make this dynamic and stop depending on implementation details.
 // Sync from TEST_NETID in dns_responder_client.cpp as resolver_test.cpp does.
-static const int TEST_NETID = 30;
+constexpr int TEST_NETID = 30;
 
 class DnsResolverBinderTest : public ::testing::Test {
   public:
@@ -61,9 +65,15 @@ class DnsResolverBinderTest : public ::testing::Test {
         if (binder != nullptr) {
             mDnsResolver = android::interface_cast<IDnsResolver>(binder);
         }
+        assert(nullptr != mDnsResolver.get());
+        // Create cache for test
+        mDnsResolver->createNetworkCache(TEST_NETID);
     }
 
-    void SetUp() override { ASSERT_NE(nullptr, mDnsResolver.get()); }
+    ~DnsResolverBinderTest() {
+        // Destroy cache for test
+        mDnsResolver->destroyNetworkCache(TEST_NETID);
+    }
 
   protected:
     sp<IDnsResolver> mDnsResolver;
@@ -87,7 +97,41 @@ std::string base64Encode(const std::vector<uint8_t>& input) {
     uint8_t output_bytes[out_len];
     EXPECT_EQ(out_len - 1, EVP_EncodeBlock(output_bytes, input.data(), input.size()));
     return std::string(reinterpret_cast<char*>(output_bytes));
-}  // namespace
+}
+
+// TODO: Convert tests to ResolverParamsParcel and delete this stub.
+ResolverParamsParcel makeResolverParamsParcel(int netId, const std::vector<int>& params,
+                                              const std::vector<std::string>& servers,
+                                              const std::vector<std::string>& domains,
+                                              const std::string& tlsHostname,
+                                              const std::vector<std::string>& tlsServers,
+                                              const std::vector<std::string>& tlsFingerprints) {
+    using android::net::IDnsResolver;
+    ResolverParamsParcel paramsParcel;
+
+    paramsParcel.netId = netId;
+    paramsParcel.sampleValiditySeconds = params[IDnsResolver::RESOLVER_PARAMS_SAMPLE_VALIDITY];
+    paramsParcel.successThreshold = params[IDnsResolver::RESOLVER_PARAMS_SUCCESS_THRESHOLD];
+    paramsParcel.minSamples = params[IDnsResolver::RESOLVER_PARAMS_MIN_SAMPLES];
+    paramsParcel.maxSamples = params[IDnsResolver::RESOLVER_PARAMS_MAX_SAMPLES];
+    if (params.size() > IDnsResolver::RESOLVER_PARAMS_BASE_TIMEOUT_MSEC) {
+        paramsParcel.baseTimeoutMsec = params[IDnsResolver::RESOLVER_PARAMS_BASE_TIMEOUT_MSEC];
+    } else {
+        paramsParcel.baseTimeoutMsec = 0;
+    }
+    if (params.size() > IDnsResolver::RESOLVER_PARAMS_RETRY_COUNT) {
+        paramsParcel.retryCount = params[IDnsResolver::RESOLVER_PARAMS_RETRY_COUNT];
+    } else {
+        paramsParcel.retryCount = 0;
+    }
+    paramsParcel.servers = servers;
+    paramsParcel.domains = domains;
+    paramsParcel.tlsName = tlsHostname;
+    paramsParcel.tlsServers = tlsServers;
+    paramsParcel.tlsFingerprints = tlsFingerprints;
+
+    return paramsParcel;
+}
 
 }  // namespace
 
@@ -98,6 +142,7 @@ TEST_F(DnsResolverBinderTest, IsAlive) {
     ASSERT_TRUE(isAlive);
 }
 
+// TODO: Move this test to resolver_test.cpp
 TEST_F(DnsResolverBinderTest, EventListener_onDnsEvent) {
     // The test configs are used to trigger expected events. The expected results are defined in
     // expectedResults.
@@ -138,6 +183,7 @@ TEST_F(DnsResolverBinderTest, EventListener_onDnsEvent) {
     std::vector<std::string> test_domains = {"example.com"};
     std::vector<int> test_params = {300 /*sample_validity*/, 25 /*success_threshold*/,
                                     8 /*min_samples*/, 8 /*max_samples*/};
+
     ASSERT_TRUE(dnsClient.SetResolversForNetwork(test_servers, test_domains, test_params));
     dns.clearQueries();
 
@@ -210,9 +256,10 @@ TEST_F(DnsResolverBinderTest, SetResolverConfiguration_Tls) {
         for (const auto& fingerprint : td.tlsFingerprints) {
             fingerprints.push_back(base64Encode(fingerprint));
         }
-        binder::Status status = mDnsResolver->setResolverConfiguration(
-                TEST_NETID, LOCALLY_ASSIGNED_DNS, test_domains, test_params, td.tlsName, td.servers,
-                fingerprints);
+        const auto resolverParams =
+                makeResolverParamsParcel(TEST_NETID, test_params, LOCALLY_ASSIGNED_DNS,
+                                         test_domains, td.tlsName, td.servers, fingerprints);
+        binder::Status status = mDnsResolver->setResolverConfiguration(resolverParams);
 
         if (td.expectedReturnCode == 0) {
             SCOPED_TRACE(String8::format("test case %zu should have passed", i));
@@ -224,9 +271,6 @@ TEST_F(DnsResolverBinderTest, SetResolverConfiguration_Tls) {
             EXPECT_EQ(td.expectedReturnCode, status.serviceSpecificErrorCode());
         }
     }
-
-    binder::Status status = mDnsResolver->clearResolverConfiguration(TEST_NETID);
-    EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
 }
 
 TEST_F(DnsResolverBinderTest, GetResolverInfo) {
@@ -237,10 +281,11 @@ TEST_F(DnsResolverBinderTest, GetResolverInfo) {
             25,      // success threshod in percent
             8,   8,  // {MIN,MAX}_SAMPLES
             100,     // BASE_TIMEOUT_MSEC
-            2,       // retry count
+            3,       // retry count
     };
-    binder::Status status = mDnsResolver->setResolverConfiguration(TEST_NETID, servers, domains,
-                                                                   testParams, "", {}, {});
+    const auto resolverParams =
+            makeResolverParamsParcel(TEST_NETID, testParams, servers, domains, "", {}, {});
+    binder::Status status = mDnsResolver->setResolverConfiguration(resolverParams);
     EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
 
     std::vector<std::string> res_servers;
@@ -268,6 +313,8 @@ TEST_F(DnsResolverBinderTest, GetResolverInfo) {
               params32[IDnsResolver::RESOLVER_PARAMS_MAX_SAMPLES]);
     EXPECT_EQ(testParams[IDnsResolver::RESOLVER_PARAMS_BASE_TIMEOUT_MSEC],
               params32[IDnsResolver::RESOLVER_PARAMS_BASE_TIMEOUT_MSEC]);
+    EXPECT_EQ(testParams[IDnsResolver::RESOLVER_PARAMS_RETRY_COUNT],
+              params32[IDnsResolver::RESOLVER_PARAMS_RETRY_COUNT]);
 
     std::vector<ResolverStats> stats;
     ResolverStats::decodeAll(stats32, &stats);
@@ -276,7 +323,47 @@ TEST_F(DnsResolverBinderTest, GetResolverInfo) {
 
     EXPECT_THAT(res_servers, testing::UnorderedElementsAreArray(servers));
     EXPECT_THAT(res_domains, testing::UnorderedElementsAreArray(domains));
+}
 
-    status = mDnsResolver->clearResolverConfiguration(TEST_NETID);
-    EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
+TEST_F(DnsResolverBinderTest, CreateDestroyNetworkCache) {
+    // Must not be the same as TEST_NETID
+    const int ANOTHER_TEST_NETID = TEST_NETID + 1;
+
+    // Create a new network cache.
+    EXPECT_TRUE(mDnsResolver->createNetworkCache(ANOTHER_TEST_NETID).isOk());
+
+    // create it again, expect a EEXIST.
+    EXPECT_EQ(EEXIST,
+              mDnsResolver->createNetworkCache(ANOTHER_TEST_NETID).serviceSpecificErrorCode());
+
+    // destroy it.
+    EXPECT_TRUE(mDnsResolver->destroyNetworkCache(ANOTHER_TEST_NETID).isOk());
+
+    // re-create it
+    EXPECT_TRUE(mDnsResolver->createNetworkCache(ANOTHER_TEST_NETID).isOk());
+
+    // destroy it.
+    EXPECT_TRUE(mDnsResolver->destroyNetworkCache(ANOTHER_TEST_NETID).isOk());
+
+    // re-destroy it
+    EXPECT_TRUE(mDnsResolver->destroyNetworkCache(ANOTHER_TEST_NETID).isOk());
+}
+
+TEST_F(DnsResolverBinderTest, setLogSeverity) {
+    // Expect fail
+    EXPECT_EQ(EINVAL, mDnsResolver->setLogSeverity(-1).serviceSpecificErrorCode());
+
+    // Test set different log level
+    EXPECT_TRUE(mDnsResolver->setLogSeverity(IDnsResolver::DNS_RESOLVER_LOG_VERBOSE).isOk());
+
+    EXPECT_TRUE(mDnsResolver->setLogSeverity(IDnsResolver::DNS_RESOLVER_LOG_DEBUG).isOk());
+
+    EXPECT_TRUE(mDnsResolver->setLogSeverity(IDnsResolver::DNS_RESOLVER_LOG_INFO).isOk());
+
+    EXPECT_TRUE(mDnsResolver->setLogSeverity(IDnsResolver::DNS_RESOLVER_LOG_WARNING).isOk());
+
+    EXPECT_TRUE(mDnsResolver->setLogSeverity(IDnsResolver::DNS_RESOLVER_LOG_ERROR).isOk());
+
+    // Set back to default
+    EXPECT_TRUE(mDnsResolver->setLogSeverity(IDnsResolver::DNS_RESOLVER_LOG_WARNING).isOk());
 }

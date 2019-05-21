@@ -16,10 +16,10 @@
 
 package android.net;
 
-import android.net.UidRangeParcel;
-import android.net.TetherStatsParcel;
 import android.net.INetdUnsolicitedEventListener;
 import android.net.InterfaceConfigurationParcel;
+import android.net.TetherStatsParcel;
+import android.net.UidRangeParcel;
 
 /** {@hide} */
 interface INetd {
@@ -1187,4 +1187,11 @@ interface INetd {
     *         cause of the failure.
     */
     void trafficSwapActiveStatsMap();
+
+   /**
+    * Retrieves OEM netd listener interface
+    *
+    * @return a IBinder object, it could be casted to oem specific interface.
+    */
+    IBinder getOemNetd();
 }

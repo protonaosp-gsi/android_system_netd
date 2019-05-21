@@ -43,8 +43,11 @@
 #include <android-base/macros.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
+#include <binder/IPCThreadState.h>
 #include <bpf/BpfMap.h>
 #include <bpf/BpfUtils.h>
+#include <com/android/internal/net/BnOemNetdUnsolicitedEventListener.h>
+#include <com/android/internal/net/IOemNetd.h>
 #include <cutils/multiuser.h>
 #include <gtest/gtest.h>
 #include <logwrap/logwrap.h>
@@ -1332,7 +1335,7 @@ bool getIpfwdV4Enable() {
 }
 
 bool getIpfwdV6Enable() {
-    static const char ipv6IpfwdCmd[] = "cat proc/sys/net/ipv6/conf/all/forwarding";
+    static const char ipv6IpfwdCmd[] = "cat /proc/sys/net/ipv6/conf/all/forwarding";
     std::vector<std::string> result = runCommand(ipv6IpfwdCmd);
     EXPECT_TRUE(!result.empty());
     int v6Enable = std::stoi(result[0]);
@@ -2873,7 +2876,7 @@ void checkUidsInPermissionMap(std::vector<int32_t>& uids, bool exist) {
         android::netdutils::StatusOr<uint8_t> permission = uidPermissionMap.readValue(uid);
         if (exist) {
             EXPECT_TRUE(isOk(permission));
-            EXPECT_EQ(INetd::NO_PERMISSIONS, permission.value());
+            EXPECT_EQ(INetd::PERMISSION_NONE, permission.value());
         } else {
             EXPECT_FALSE(isOk(permission));
             EXPECT_EQ(ENOENT, permission.status().code());
@@ -2890,7 +2893,7 @@ TEST_F(BinderTest, TestInternetPermission) {
 
     mNetd->trafficSetNetPermForUids(INetd::PERMISSION_INTERNET, appUids);
     checkUidsInPermissionMap(appUids, false);
-    mNetd->trafficSetNetPermForUids(INetd::NO_PERMISSIONS, appUids);
+    mNetd->trafficSetNetPermForUids(INetd::PERMISSION_NONE, appUids);
     checkUidsInPermissionMap(appUids, true);
     mNetd->trafficSetNetPermForUids(INetd::PERMISSION_UNINSTALLED, appUids);
     checkUidsInPermissionMap(appUids, false);
@@ -2929,4 +2932,160 @@ TEST_F(BinderTest, UnsolEvents) {
     const uint32_t kExpectedEvents = InterfaceAddressUpdated | InterfaceAdded | InterfaceRemoved |
                                      InterfaceLinkStatusChanged | RouteChanged;
     EXPECT_EQ(kExpectedEvents, testUnsolService->getReceived());
+
+    // Re-init sTun to clear predefined name
+    sTun.destroy();
+    sTun.init();
+}
+
+TEST_F(BinderTest, NDC) {
+    struct Command {
+        const std::string cmdString;
+        const std::string expectedResult;
+    };
+
+    // clang-format off
+    // Do not change the commands order
+    const Command networkCmds[] = {
+            {StringPrintf("ndc network create %d", TEST_NETID1),
+             "200 0 success"},
+            {StringPrintf("ndc network interface add %d %s", TEST_NETID1, sTun.name().c_str()),
+             "200 0 success"},
+            {StringPrintf("ndc network interface remove %d %s", TEST_NETID1, sTun.name().c_str()),
+             "200 0 success"},
+            {StringPrintf("ndc network interface add %d %s", TEST_NETID2, sTun.name().c_str()),
+             "400 0 addInterfaceToNetwork() failed (Machine is not on the network)"},
+            {StringPrintf("ndc network destroy %d", TEST_NETID1),
+             "200 0 success"},
+    };
+
+    const std::vector<Command> ipfwdCmds = {
+            {"ndc ipfwd enable " + sTun.name(),
+             "200 0 ipfwd operation succeeded"},
+            {"ndc ipfwd disable " + sTun.name(),
+             "200 0 ipfwd operation succeeded"},
+            {"ndc ipfwd add lo2 lo3",
+             "400 0 ipfwd operation failed (No such process)"},
+            {"ndc ipfwd add " + sTun.name() + " " + sTun2.name(),
+             "200 0 ipfwd operation succeeded"},
+            {"ndc ipfwd remove " + sTun.name() + " " + sTun2.name(),
+             "200 0 ipfwd operation succeeded"},
+    };
+
+    static const struct {
+        const char* ipVersion;
+        const char* testDest;
+        const char* testNextHop;
+        const bool expectSuccess;
+        const std::string expectedResult;
+    } kTestData[] = {
+            {IP_RULE_V4, "0.0.0.0/0",          "",            true,
+             "200 0 success"},
+            {IP_RULE_V4, "10.251.0.0/16",      "",            true,
+             "200 0 success"},
+            {IP_RULE_V4, "10.251.0.0/16",      "fe80::/64",   false,
+             "400 0 addRoute() failed (Invalid argument)",},
+            {IP_RULE_V6, "::/0",               "",            true,
+             "200 0 success"},
+            {IP_RULE_V6, "2001:db8:cafe::/64", "",            true,
+             "200 0 success"},
+            {IP_RULE_V6, "fe80::/64",          "0.0.0.0",     false,
+             "400 0 addRoute() failed (Invalid argument)"},
+    };
+    // clang-format on
+
+    for (const auto& cmd : networkCmds) {
+        const std::vector<std::string> result = runCommand(cmd.cmdString);
+        SCOPED_TRACE(cmd.cmdString);
+        EXPECT_EQ(result.size(), 1U);
+        EXPECT_EQ(cmd.expectedResult, Trim(result[0]));
+    }
+
+    for (const auto& cmd : ipfwdCmds) {
+        const std::vector<std::string> result = runCommand(cmd.cmdString);
+        SCOPED_TRACE(cmd.cmdString);
+        EXPECT_EQ(result.size(), 1U);
+        EXPECT_EQ(cmd.expectedResult, Trim(result[0]));
+    }
+
+    // Add test physical network
+    EXPECT_TRUE(mNetd->networkCreatePhysical(TEST_NETID1, INetd::PERMISSION_NONE).isOk());
+    EXPECT_TRUE(mNetd->networkAddInterface(TEST_NETID1, sTun.name()).isOk());
+
+    for (const auto& td : kTestData) {
+        const std::string routeAddCmd =
+                StringPrintf("ndc network route add %d %s %s %s", TEST_NETID1, sTun.name().c_str(),
+                             td.testDest, td.testNextHop);
+        const std::string routeRemoveCmd =
+                StringPrintf("ndc network route remove %d %s %s %s", TEST_NETID1,
+                             sTun.name().c_str(), td.testDest, td.testNextHop);
+        std::vector<std::string> result = runCommand(routeAddCmd);
+        SCOPED_TRACE(routeAddCmd);
+        EXPECT_EQ(result.size(), 1U);
+        EXPECT_EQ(td.expectedResult, Trim(result[0]));
+        if (td.expectSuccess) {
+            expectNetworkRouteExists(td.ipVersion, sTun.name(), td.testDest, td.testNextHop,
+                                     sTun.name().c_str());
+            result = runCommand(routeRemoveCmd);
+            EXPECT_EQ(result.size(), 1U);
+            EXPECT_EQ(td.expectedResult, Trim(result[0]));
+            expectNetworkRouteDoesNotExist(td.ipVersion, sTun.name(), td.testDest, td.testNextHop,
+                                           sTun.name().c_str());
+        }
+    }
+    // Remove test physical network
+    EXPECT_TRUE(mNetd->networkDestroy(TEST_NETID1).isOk());
+}
+
+TEST_F(BinderTest, OemNetdRelated) {
+    sp<IBinder> binder;
+    binder::Status status = mNetd->getOemNetd(&binder);
+    EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
+    sp<com::android::internal::net::IOemNetd> oemNetd;
+    if (binder != nullptr) {
+        oemNetd = android::interface_cast<com::android::internal::net::IOemNetd>(binder);
+    }
+    ASSERT_NE(nullptr, oemNetd.get());
+
+    TimedOperation t("OemNetd isAlive RPC");
+    bool isAlive = false;
+    oemNetd->isAlive(&isAlive);
+    ASSERT_TRUE(isAlive);
+
+    class TestOemUnsolListener
+        : public com::android::internal::net::BnOemNetdUnsolicitedEventListener {
+      public:
+        android::binder::Status onRegistered() override {
+            std::lock_guard lock(mCvMutex);
+            mCv.notify_one();
+            return android::binder::Status::ok();
+        }
+        std::condition_variable& getCv() { return mCv; }
+        std::mutex& getCvMutex() { return mCvMutex; }
+
+      private:
+        std::mutex mCvMutex;
+        std::condition_variable mCv;
+    };
+
+    // Start the Binder thread pool.
+    android::ProcessState::self()->startThreadPool();
+
+    android::sp<TestOemUnsolListener> testListener = new TestOemUnsolListener();
+
+    auto& cv = testListener->getCv();
+    auto& cvMutex = testListener->getCvMutex();
+
+    {
+        std::unique_lock lock(cvMutex);
+
+        status = oemNetd->registerOemUnsolicitedEventListener(
+                ::android::interface_cast<
+                        com::android::internal::net::IOemNetdUnsolicitedEventListener>(
+                        testListener));
+        EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
+
+        // Wait for receiving expected events.
+        EXPECT_EQ(std::cv_status::no_timeout, cv.wait_for(lock, std::chrono::seconds(2)));
+    }
 }

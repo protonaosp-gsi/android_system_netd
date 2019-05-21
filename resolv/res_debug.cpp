@@ -105,6 +105,7 @@
 #include <arpa/nameser.h>
 #include <netinet/in.h>
 
+#include <aidl/android/net/IDnsResolver.h>
 #include <android-base/logging.h>
 #include <android-base/stringprintf.h>
 #include <ctype.h>
@@ -143,7 +144,6 @@ static void do_section(ns_msg* handle, ns_sect section) {
     /*
      * Print answer records.
      */
-    auto buf = std::make_unique<char[]>(buflen);
     for (;;) {
         if (ns_parserr(handle, section, rrnum, &rr)) {
             if (errno != ENODEV) StringAppendF(&s, "ns_parserr: %s", strerror(errno));
@@ -202,13 +202,18 @@ static void do_section(ns_msg* handle, ns_sect section) {
                 cp += optlen;
             }
         } else {
+            auto buf = std::make_unique<char[]>(buflen);
             n = ns_sprintrr(handle, &rr, NULL, NULL, buf.get(), (u_int)buflen);
             if (n < 0) {
                 if (errno == ENOSPC) {
                     if (buflen < 131072) {
-                        buf = std::make_unique<char[]>(buflen += 1024);
+                        buflen += 1024;
+                        continue;
+                    } else {
+                        StringAppendF(&s, "buflen over 131072");
+                        PLOG(VERBOSE) << s;
+                        return;
                     }
-                    continue;
                 }
                 StringAppendF(&s, "ns_sprintrr failed");
                 PLOG(VERBOSE) << s;
@@ -218,7 +223,6 @@ static void do_section(ns_msg* handle, ns_sect section) {
         }
         rrnum++;
     }
-    LOG(VERBOSE) << s;
 }
 
 /*
@@ -465,26 +469,34 @@ const char* p_rcode(int rcode) {
     return (sym_ntos(p_rcode_syms, rcode, (int*) 0));
 }
 
-android::base::LogSeverity logSeverityStrToEnum(const std::string& logSeverityStr) {
-    android::base::LogSeverity logSeverityEnum;
-
-    if (logSeverityStr == "VERBOSE") {
-        // *** enable verbose logging only when DBG is set. It prints sensitive data ***
-        logSeverityEnum =
-                RESOLV_ALLOW_VERBOSE_LOGGING ? android::base::VERBOSE : android::base::DEBUG;
-    } else if (logSeverityStr == "DEBUG") {
-        logSeverityEnum = android::base::DEBUG;
-    } else if (logSeverityStr == "INFO") {
-        logSeverityEnum = android::base::INFO;
-    } else if (logSeverityStr == "WARNING") {
-        logSeverityEnum = android::base::WARNING;
-    } else if (logSeverityStr == "ERROR") {
-        logSeverityEnum = android::base::ERROR;
-    } else {
-        // Invalid parameter is treated as WARNING (default setting)
-        LOG(ERROR) << "Invalid parameter is treated as WARNING by default.";
-        logSeverityEnum = android::base::WARNING;
+int resolv_set_log_severity(uint32_t logSeverity) {
+    switch (logSeverity) {
+        case aidl::android::net::IDnsResolver::DNS_RESOLVER_LOG_VERBOSE:
+            logSeverity = android::base::VERBOSE;
+            // *** enable verbose logging only when DBG is set. It prints sensitive data ***
+            if (RESOLV_ALLOW_VERBOSE_LOGGING == false) {
+                logSeverity = android::base::DEBUG;
+                LOG(ERROR) << "Refusing to set VERBOSE logging in non-debuggable build";
+                // TODO: Return EACCES then callers could know if the log
+                // severity is acceptable
+            }
+            break;
+        case aidl::android::net::IDnsResolver::DNS_RESOLVER_LOG_DEBUG:
+            logSeverity = android::base::DEBUG;
+            break;
+        case aidl::android::net::IDnsResolver::DNS_RESOLVER_LOG_INFO:
+            logSeverity = android::base::INFO;
+            break;
+        case aidl::android::net::IDnsResolver::DNS_RESOLVER_LOG_WARNING:
+            logSeverity = android::base::WARNING;
+            break;
+        case aidl::android::net::IDnsResolver::DNS_RESOLVER_LOG_ERROR:
+            logSeverity = android::base::ERROR;
+            break;
+        default:
+            LOG(ERROR) << __func__ << ": invalid log severity: " << logSeverity;
+            return -EINVAL;
     }
-    LOG(INFO) << __func__ << ": " << logSeverityEnum;
-    return logSeverityEnum;
+    android::base::SetMinimumLogSeverity(static_cast<android::base::LogSeverity>(logSeverity));
+    return 0;
 }
