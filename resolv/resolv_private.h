@@ -59,11 +59,13 @@
 #include <resolv.h>
 #include <time.h>
 #include <string>
+#include <vector>
 
 #include "netd_resolv/params.h"
 #include "netd_resolv/resolv.h"
 #include "netd_resolv/stats.h"
 #include "resolv_static.h"
+#include "stats.pb.h"
 
 // Linux defines MAXHOSTNAMELEN as 64, while the domain name limit in
 // RFC 1034 and RFC 1035 is 255 octets.
@@ -75,9 +77,6 @@
 /*
  * Global defines and variables for resolver stub.
  */
-#define MAXDFLSRCH 3       /* # default domain levels to try */
-#define LOCALDOMAINPARTS 2 /* min levels in name that is "local" */
-
 #define RES_TIMEOUT 5000 /* min. milliseconds between retries */
 #define MAXRESOLVSORT 10  /* number of net to sort on */
 #define RES_MAXNDOTS 15   /* should reflect bit field size */
@@ -87,16 +86,16 @@
 struct res_state_ext;
 
 struct __res_state {
-    unsigned netid;                        /* NetId: cache key and socket mark */
-    u_long options;                        /* option flags - see below. */
-    int nscount;                           /* number of name srvers */
-    struct sockaddr_in nsaddr_list[MAXNS]; /* address of name server */
-#define nsaddr nsaddr_list[0]              /* for backward compatibility */
-    u_short id;                            /* current message id */
-    char* dnsrch[MAXDNSRCH + 1];           /* components of domain to search */
-    char defdname[256];                    /* default domain (deprecated) */
-    unsigned ndots : 4;                    /* threshold for initial abs. query */
-    unsigned nsort : 4;                    /* number of elements in sort_list[] */
+    unsigned netid;                           // NetId: cache key and socket mark
+    uid_t uid;                                // uid of the app that sent the DNS lookup
+    u_long options;                           // option flags - see below.
+    int nscount;                              // number of name srvers
+    struct sockaddr_in nsaddr_list[MAXNS];    // address of name server
+#define nsaddr nsaddr_list[0]                 // for backward compatibility
+    u_short id;                               // current message id
+    std::vector<std::string> search_domains;  // domains to search
+    unsigned ndots : 4;                       // threshold for initial abs. query
+    unsigned nsort : 4;                       // number of elements in sort_list[]
     char unused[3];
     struct {
         struct in_addr addr;
@@ -118,9 +117,17 @@ struct __res_state {
     } _u;
     struct res_static rstatic[1];
     bool use_local_nameserver; /* DNS-over-TLS bypass */
+    android::net::NetworkDnsEventReported* event;
 };
 
 typedef struct __res_state* res_state;
+
+// Holds either a sockaddr_in or a sockaddr_in6.
+typedef union sockaddr_union {
+    struct sockaddr sa;
+    struct sockaddr_in sin;
+    struct sockaddr_in6 sin6;
+} sockaddr_union;
 
 /* Retrieve a local copy of the stats for the given netid. The buffer must have space for
  * MAXNS __resolver_stats. Returns the revision id of the resolvers used.
@@ -149,32 +156,10 @@ void _res_stats_set_sample(res_sample* sample, time_t now, int rcode, int rtt);
  * Resolver options (keep these in synch with res_debug.c, please)
  */
 #define RES_INIT 0x00000001           /* address initialized */
-#define RES_DEBUG 0x00000002          /* print debug messages */
-#define RES_AAONLY 0x00000004         /* authoritative answers only (!IMPL)*/
-#define RES_USEVC 0x00000008          /* use virtual circuit */
-#define RES_PRIMARY 0x00000010        /* query primary server only (!IMPL) */
-#define RES_IGNTC 0x00000020          /* ignore trucation errors */
-#define RES_RECURSE 0x00000040        /* recursion desired */
-#define RES_DEFNAMES 0x00000080       /* use default domain name */
-#define RES_STAYOPEN 0x00000100       /* Keep TCP socket open */
-#define RES_DNSRCH 0x00000200         /* search up local domain tree */
-#define RES_INSECURE1 0x00000400      /* type 1 security disabled */
-#define RES_INSECURE2 0x00000800      /* type 2 security disabled */
-#define RES_USE_INET6 0x00002000      /* use/map IPv6 in gethostbyname() */
-#define RES_ROTATE 0x00004000         /* rotate ns list after each query */
-#define RES_NOCHECKNAME 0x00008000    /* do not check names for sanity. */
-#define RES_KEEPTSIG 0x00010000       /* do not strip TSIG records */
-#define RES_BLAST 0x00020000          /* blast all recursive servers */
-#define RES_NOTLDQUERY 0x00100000     /* don't unqualified name as a tld */
 #define RES_USE_DNSSEC 0x00200000     /* use DNSSEC using OK bit in OPT */
-/* #define RES_DEBUG2	0x00400000 */ /* nslookup internal */
-/* KAME extensions: use higher bit to avoid conflict with ISC use */
-#define RES_USE_DNAME 0x10000000  /* use DNAME */
 #define RES_USE_EDNS0 0x40000000  /* use EDNS0 if configured */
-#define RES_NO_NIBBLE2 0x80000000 /* disable alternate nibble lookup */
 
-#define RES_DEFAULT (RES_RECURSE | RES_DEFNAMES | RES_DNSRCH | RES_NO_NIBBLE2)
-
+#define RES_DEFAULT 0
 
 /*
  * Error code extending h_errno codes defined in bionic/libc/include/netdb.h.
@@ -226,7 +211,8 @@ void res_setservers(res_state, const sockaddr_union*, int);
 int res_getservers(res_state, sockaddr_union*, int);
 
 struct android_net_context; /* forward */
-void res_setnetcontext(res_state, const struct android_net_context*);
+void res_setnetcontext(res_state, const struct android_net_context*,
+                       android::net::NetworkDnsEventReported* event);
 
 int getaddrinfo_numeric(const char* hostname, const char* servname, addrinfo hints,
                         addrinfo** result);
@@ -236,5 +222,17 @@ int herrnoToAiErrno(int herrno);
 
 // switch resolver log severity
 android::base::LogSeverity logSeverityStrToEnum(const std::string& logSeverityStr);
+
+template <typename Dest>
+Dest saturate_cast(int64_t x) {
+    using DestLimits = std::numeric_limits<Dest>;
+    if (x > DestLimits::max()) return DestLimits::max();
+    if (x < DestLimits::min()) return DestLimits::min();
+    return static_cast<Dest>(x);
+}
+
+android::net::NsType getQueryType(const uint8_t* msg, size_t msgLen);
+
+android::net::IpVersion ipFamilyToIPVersion(int ipFamily);
 
 #endif  // NETD_RESOLV_PRIVATE_H

@@ -32,6 +32,8 @@
 
 #define LOG_TAG "resolv"
 
+#include "getaddrinfo.h"
+
 #include <arpa/inet.h>
 #include <arpa/nameser.h>
 #include <assert.h>
@@ -59,6 +61,8 @@
 #include "resolv_private.h"
 
 #define ANY 0
+
+using android::net::NetworkDnsEventReported;
 
 const char in_addrany[] = {0, 0, 0, 0};
 const char in_loopback[] = {127, 0, 0, 1};
@@ -122,7 +126,7 @@ struct res_target {
 
 static int str2number(const char*);
 static int explore_fqdn(const struct addrinfo*, const char*, const char*, struct addrinfo**,
-                        const struct android_net_context*);
+                        const struct android_net_context*, NetworkDnsEventReported* event);
 static int explore_null(const struct addrinfo*, const char*, struct addrinfo**);
 static int explore_numeric(const struct addrinfo*, const char*, const char*, struct addrinfo**,
                            const char*);
@@ -138,7 +142,8 @@ static int ip6_str2scopeid(const char*, struct sockaddr_in6*, u_int32_t*);
 static struct addrinfo* getanswer(const querybuf*, int, const char*, int, const struct addrinfo*,
                                   int* herrno);
 static int dns_getaddrinfo(const char* name, const addrinfo* pai,
-                           const android_net_context* netcontext, addrinfo** rv);
+                           const android_net_context* netcontext, addrinfo** rv,
+                           NetworkDnsEventReported* event);
 static void _sethtent(FILE**);
 static void _endhtent(FILE**);
 static struct addrinfo* _gethtent(FILE**, const char*, const struct addrinfo*);
@@ -251,7 +256,7 @@ static int have_ipv4(unsigned mark, uid_t uid) {
 }
 
 // Internal version of getaddrinfo(), but limited to AI_NUMERICHOST.
-// NOTE: also called by resolv_set_nameservers_for_net().
+// NOTE: also called by resolv_set_nameservers().
 int getaddrinfo_numeric(const char* hostname, const char* servname, addrinfo hints,
                         addrinfo** result) {
     hints.ai_flags = AI_NUMERICHOST;
@@ -262,83 +267,84 @@ int getaddrinfo_numeric(const char* hostname, const char* servname, addrinfo hin
             .dns_mark = MARK_UNSET,
             .uid = NET_CONTEXT_INVALID_UID,
     };
-    return android_getaddrinfofornetcontext(hostname, servname, &hints, &netcontext, result);
+    NetworkDnsEventReported event;
+    return android_getaddrinfofornetcontext(hostname, servname, &hints, &netcontext, result,
+                                            &event);
 }
 
-int android_getaddrinfofornetcontext(const char* hostname, const char* servname,
-                                     const struct addrinfo* hints,
-                                     const struct android_net_context* netcontext,
-                                     struct addrinfo** res) {
-    struct addrinfo sentinel = {};
-    struct addrinfo* cur = &sentinel;
-    int error = 0;
+namespace {
 
+int validateHints(const addrinfo* _Nonnull hints) {
+    if (!hints) return EAI_BADHINTS;
+
+    // error check for hints
+    if (hints->ai_addrlen || hints->ai_canonname || hints->ai_addr || hints->ai_next) {
+        return EAI_BADHINTS;
+    }
+    if (hints->ai_flags & ~AI_MASK) {
+        return EAI_BADFLAGS;
+    }
+    if (!(hints->ai_family == PF_UNSPEC || hints->ai_family == PF_INET ||
+          hints->ai_family == PF_INET6)) {
+        return EAI_FAMILY;
+    }
+
+    // Socket types which are not in explore_options.
+    switch (hints->ai_socktype) {
+        case SOCK_RAW:
+        case SOCK_DGRAM:
+        case SOCK_STREAM:
+        case ANY:
+            break;
+        default:
+            return EAI_SOCKTYPE;
+    }
+
+    if (hints->ai_socktype == ANY || hints->ai_protocol == ANY) return 0;
+
+    // if both socktype/protocol are specified, check if they are meaningful combination.
+    for (const Explore& ex : explore_options) {
+        if (hints->ai_family != ex.e_af) continue;
+        if (ex.e_socktype == ANY) continue;
+        if (ex.e_protocol == ANY) continue;
+        if (hints->ai_socktype == ex.e_socktype && hints->ai_protocol != ex.e_protocol) {
+            return EAI_BADHINTS;
+        }
+    }
+
+    return 0;
+}
+
+}  // namespace
+
+int android_getaddrinfofornetcontext(const char* hostname, const char* servname,
+                                     const addrinfo* hints, const android_net_context* netcontext,
+                                     addrinfo** res, NetworkDnsEventReported* event) {
     // hostname is allowed to be nullptr
     // servname is allowed to be nullptr
     // hints is allowed to be nullptr
     assert(res != nullptr);
     assert(netcontext != nullptr);
+    assert(event != nullptr);
 
-    struct addrinfo ai = {
-            .ai_flags = 0,
-            .ai_family = PF_UNSPEC,
-            .ai_socktype = ANY,
-            .ai_protocol = ANY,
-            .ai_addrlen = 0,
-            .ai_canonname = nullptr,
-            .ai_addr = nullptr,
-            .ai_next = nullptr,
-    };
+    addrinfo sentinel = {};
+    addrinfo* cur = &sentinel;
+    int error = 0;
 
     do {
-        if (hostname == NULL && servname == NULL) {
+        if (hostname == nullptr && servname == nullptr) {
             error = EAI_NONAME;
             break;
         }
-        if (hints) {
-            /* error check for hints */
-            if (hints->ai_addrlen || hints->ai_canonname || hints->ai_addr || hints->ai_next) {
-                error = EAI_BADHINTS;
-                break;
-            }
-            if (hints->ai_flags & ~AI_MASK) {
-                error = EAI_BADFLAGS;
-                break;
-            }
 
-            if (!(hints->ai_family == PF_UNSPEC || hints->ai_family == PF_INET ||
-                  hints->ai_family == PF_INET6)) {
-                error = EAI_FAMILY;
-                break;
-            }
+        if (hints && (error = validateHints(hints))) break;
+        addrinfo ai = hints ? *hints : addrinfo{};
 
-            ai = *hints;
-
-            /*
-             * if both socktype/protocol are specified, check if they
-             * are meaningful combination.
-             */
-            if (ai.ai_socktype != ANY && ai.ai_protocol != ANY) {
-                for (const Explore& ex : explore_options) {
-                    if (ai.ai_family != ex.e_af) continue;
-                    if (ex.e_socktype == ANY) continue;
-                    if (ex.e_protocol == ANY) continue;
-                    if (ai.ai_socktype == ex.e_socktype && ai.ai_protocol != ex.e_protocol) {
-                        error = EAI_BADHINTS;
-                        break;
-                    }
-                }
-                if (error) break;
-            }
-        }
-
-        /*
-         * Check for special cases:
-         * (1) numeric servname is disallowed if socktype/protocol are left unspecified.
-         * (2) servname is disallowed for raw and other inet{,6} sockets.
-         */
+        // Check for special cases:
+        // (1) numeric servname is disallowed if socktype/protocol are left unspecified.
+        // (2) servname is disallowed for raw and other inet{,6} sockets.
         if (MATCH_FAMILY(ai.ai_family, PF_INET, 1) || MATCH_FAMILY(ai.ai_family, PF_INET6, 1)) {
-            struct addrinfo tmp = ai;
+            addrinfo tmp = ai;
             if (tmp.ai_family == PF_UNSPEC) {
                 tmp.ai_family = PF_INET6;
             }
@@ -355,7 +361,7 @@ int android_getaddrinfofornetcontext(const char* hostname, const char* servname,
             if (!MATCH(ai.ai_socktype, ex.e_socktype, WILD_SOCKTYPE(ex))) continue;
             if (!MATCH(ai.ai_protocol, ex.e_protocol, WILD_PROTOCOL(ex))) continue;
 
-            struct addrinfo tmp = ai;
+            addrinfo tmp = ai;
             if (tmp.ai_family == PF_UNSPEC) tmp.ai_family = ex.e_af;
             if (tmp.ai_socktype == ANY && ex.e_socktype != ANY) tmp.ai_socktype = ex.e_socktype;
             if (tmp.ai_protocol == ANY && ex.e_protocol != ANY) tmp.ai_protocol = ex.e_protocol;
@@ -373,11 +379,8 @@ int android_getaddrinfofornetcontext(const char* hostname, const char* servname,
         }
         if (error) break;
 
-        /*
-         * XXX
-         * If numeric representation of AF1 can be interpreted as FQDN
-         * representation of AF2, we need to think again about the code below.
-         */
+        // If numeric representation of AF1 can be interpreted as FQDN
+        // representation of AF2, we need to think again about the code below.
         if (sentinel.ai_next) break;
 
         if (hostname == nullptr) {
@@ -389,37 +392,7 @@ int android_getaddrinfofornetcontext(const char* hostname, const char* servname,
             break;
         }
 
-        /*
-         * hostname as alphabetical name.
-         * We would like to prefer AF_INET6 over AF_INET, so we'll make a outer loop by AFs.
-         */
-        for (const Explore& ex : explore_options) {
-            // Require exact match for family field
-            if (ai.ai_family != ex.e_af) continue;
-
-            if (!MATCH(ai.ai_socktype, ex.e_socktype, WILD_SOCKTYPE(ex))) {
-                continue;
-            }
-            if (!MATCH(ai.ai_protocol, ex.e_protocol, WILD_PROTOCOL(ex))) {
-                continue;
-            }
-
-            struct addrinfo tmp = ai;
-            if (tmp.ai_socktype == ANY && ex.e_socktype != ANY) tmp.ai_socktype = ex.e_socktype;
-            if (tmp.ai_protocol == ANY && ex.e_protocol != ANY) tmp.ai_protocol = ex.e_protocol;
-
-            LOG(DEBUG) << __func__ << ": explore_fqdn(): ai_family=" << tmp.ai_family
-                       << " ai_socktype=" << tmp.ai_socktype << " ai_protocol=" << tmp.ai_protocol;
-            error = explore_fqdn(&tmp, hostname, servname, &cur->ai_next, netcontext);
-
-            while (cur->ai_next) cur = cur->ai_next;
-        }
-
-        if (sentinel.ai_next) {
-            error = 0;
-        } else if (error == 0) {
-            error = EAI_FAIL;
-        }
+        return resolv_getaddrinfo(hostname, servname, hints, netcontext, res, event);
     } while (0);
 
     if (error) {
@@ -431,38 +404,89 @@ int android_getaddrinfofornetcontext(const char* hostname, const char* servname,
     return error;
 }
 
+int resolv_getaddrinfo(const char* _Nonnull hostname, const char* servname, const addrinfo* hints,
+                       const android_net_context* _Nonnull netcontext, addrinfo** _Nonnull res,
+                       NetworkDnsEventReported* _Nonnull event) {
+    if (hostname == nullptr && servname == nullptr) return EAI_NONAME;
+    if (hostname == nullptr) return EAI_NODATA;
+
+    // servname is allowed to be nullptr
+    // hints is allowed to be nullptr
+    assert(res != nullptr);
+    assert(netcontext != nullptr);
+    assert(event != nullptr);
+
+    int error = EAI_FAIL;
+    if (hints && (error = validateHints(hints))) {
+        *res = nullptr;
+        return error;
+    }
+
+    addrinfo ai = hints ? *hints : addrinfo{};
+    addrinfo sentinel = {};
+    addrinfo* cur = &sentinel;
+    // hostname as alphanumeric name.
+    // We would like to prefer AF_INET6 over AF_INET, so we'll make a outer loop by AFs.
+    for (const Explore& ex : explore_options) {
+        // Require exact match for family field
+        if (ai.ai_family != ex.e_af) continue;
+
+        if (!MATCH(ai.ai_socktype, ex.e_socktype, WILD_SOCKTYPE(ex))) continue;
+
+        if (!MATCH(ai.ai_protocol, ex.e_protocol, WILD_PROTOCOL(ex))) continue;
+
+        addrinfo tmp = ai;
+        if (tmp.ai_socktype == ANY && ex.e_socktype != ANY) tmp.ai_socktype = ex.e_socktype;
+        if (tmp.ai_protocol == ANY && ex.e_protocol != ANY) tmp.ai_protocol = ex.e_protocol;
+
+        LOG(DEBUG) << __func__ << ": explore_fqdn(): ai_family=" << tmp.ai_family
+                   << " ai_socktype=" << tmp.ai_socktype << " ai_protocol=" << tmp.ai_protocol;
+        error = explore_fqdn(&tmp, hostname, servname, &cur->ai_next, netcontext, event);
+
+        while (cur->ai_next) cur = cur->ai_next;
+    }
+
+    // Propagate the last error from explore_fqdn(), but only when *all* attempts failed.
+    if ((*res = sentinel.ai_next)) return 0;
+
+    // TODO: consider removing freeaddrinfo.
+    freeaddrinfo(sentinel.ai_next);
+    *res = nullptr;
+    return (error == 0) ? EAI_FAIL : error;
+}
+
 // FQDN hostname, DNS lookup
-static int explore_fqdn(const struct addrinfo* pai, const char* hostname, const char* servname,
-                        struct addrinfo** res, const struct android_net_context* netcontext) {
-    struct addrinfo* result;
+static int explore_fqdn(const addrinfo* pai, const char* hostname, const char* servname,
+                        addrinfo** res, const android_net_context* netcontext,
+                        NetworkDnsEventReported* event) {
+    assert(pai != nullptr);
+    // hostname may be nullptr
+    // servname may be nullptr
+    assert(res != nullptr);
+
+    addrinfo* result = nullptr;
     int error = 0;
 
-    assert(pai != NULL);
-    /* hostname may be NULL */
-    /* servname may be NULL */
-    assert(res != NULL);
-
-    result = NULL;
-
-    // If the servname does not match socktype/protocol, ignore it.
-    if (get_portmatch(pai, servname) != 0) return 0;
+    // If the servname does not match socktype/protocol, return error code.
+    if ((error = get_portmatch(pai, servname))) return error;
 
     if (!files_getaddrinfo(hostname, pai, &result)) {
-        error = dns_getaddrinfo(hostname, pai, netcontext, &result);
+        error = dns_getaddrinfo(hostname, pai, netcontext, &result, event);
     }
-    if (!error) {
-        struct addrinfo* cur;
-        for (cur = result; cur; cur = cur->ai_next) {
-            GET_PORT(cur, servname);
-            /* canonname should be filled already */
-        }
-        *res = result;
-        return 0;
+    if (error) {
+        freeaddrinfo(result);
+        return error;
     }
 
-free:
-    freeaddrinfo(result);
-    return error;
+    for (addrinfo* cur = result; cur; cur = cur->ai_next) {
+        // canonname should be filled already
+        if ((error = get_port(cur, servname, 0))) {
+            freeaddrinfo(result);
+            return error;
+        }
+    }
+    *res = result;
+    return 0;
 }
 
 /*
@@ -784,19 +808,10 @@ static int ip6_str2scopeid(const char* scope, struct sockaddr_in6* sin6, u_int32
          * like-local scopes.
          */
         *scopeid = if_nametoindex(scope);
-        if (*scopeid == 0) goto trynumeric;
-        return 0;
+        if (*scopeid != 0) return 0;
     }
 
-    /* still unclear about literal, allow numeric only - placeholder */
-    if (IN6_IS_ADDR_SITELOCAL(a6) || IN6_IS_ADDR_MC_SITELOCAL(a6)) goto trynumeric;
-    if (IN6_IS_ADDR_MC_ORGLOCAL(a6))
-        goto trynumeric;
-    else
-        goto trynumeric; /* global */
-
-    /* try to convert to a numeric id as a last resort */
-trynumeric:
+    // try to convert to a numeric id as a last resort
     errno = 0;
     lscopeid = strtoul(scope, &ep, 10);
     *scopeid = (u_int32_t)(lscopeid & 0xffffffffUL);
@@ -1376,7 +1391,8 @@ error:
 }
 
 static int dns_getaddrinfo(const char* name, const addrinfo* pai,
-                           const android_net_context* netcontext, addrinfo** rv) {
+                           const android_net_context* netcontext, addrinfo** rv,
+                           NetworkDnsEventReported* event) {
     res_target q = {};
     res_target q2 = {};
 
@@ -1438,7 +1454,7 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
      * fully populate the thread private data here, but if we get down there
      * and have a cache hit that would be wasted, so we do the rest there on miss
      */
-    res_setnetcontext(res, netcontext);
+    res_setnetcontext(res, netcontext, event);
 
     int he;
     if (res_searchN(name, &q, res, &he) < 0) {
@@ -1663,10 +1679,10 @@ static int res_queryN(const char* name, res_target* target, res_state res, int* 
  * is detected.  Error code, if any, is left in *herrno.
  */
 static int res_searchN(const char* name, res_target* target, res_state res, int* herrno) {
-    const char *cp, *const *domain;
+    const char* cp;
     HEADER* hp;
     u_int dots;
-    int trailing_dot, ret, saved_herrno;
+    int ret, saved_herrno;
     int got_nodata = 0, got_servfail = 0, tried_as_is = 0;
 
     assert(name != NULL);
@@ -1678,8 +1694,7 @@ static int res_searchN(const char* name, res_target* target, res_state res, int*
     *herrno = HOST_NOT_FOUND; /* default, if we never query */
     dots = 0;
     for (cp = name; *cp; cp++) dots += (*cp == '.');
-    trailing_dot = 0;
-    if (cp > name && *--cp == '.') trailing_dot++;
+    const bool trailing_dot = (cp > name && *--cp == '.') ? true : false;
 
     /*
      * If there are dots in the name already, let's just give it a try
@@ -1695,12 +1710,10 @@ static int res_searchN(const char* name, res_target* target, res_state res, int*
 
     /*
      * We do at least one level of search if
-     *	- there is no dot and RES_DEFNAME is set, or
-     *	- there is at least one dot, there is no trailing dot,
-     *	  and RES_DNSRCH is set.
+     *	- there is no dot, or
+     *	- there is at least one dot and there is no trailing dot.
      */
-    if ((!dots && (res->options & RES_DEFNAMES)) ||
-        (dots && !trailing_dot && (res->options & RES_DNSRCH))) {
+    if ((!dots) || (dots && !trailing_dot)) {
         int done = 0;
 
         /* Unfortunately we need to set stuff up before
@@ -1709,8 +1722,8 @@ static int res_searchN(const char* name, res_target* target, res_state res, int*
          */
         _resolv_populate_res_for_net(res);
 
-        for (domain = (const char* const*) res->dnsrch; *domain && !done; domain++) {
-            ret = res_querydomainN(name, *domain, target, res, herrno);
+        for (const auto& domain : res->search_domains) {
+            ret = res_querydomainN(name, domain.c_str(), target, res, herrno);
             if (ret > 0) return ret;
 
             /*
@@ -1749,11 +1762,6 @@ static int res_searchN(const char* name, res_target* target, res_state res, int*
                     /* anything else implies that we're done */
                     done++;
             }
-            /*
-             * if we got here for some reason other than DNSRCH,
-             * we only wanted one iteration of the loop, so stop.
-             */
-            if (!(res->options & RES_DNSRCH)) done++;
         }
     }
 

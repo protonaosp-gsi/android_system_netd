@@ -15,16 +15,19 @@
  */
 
 #define LOG_TAG "resolv"
-//#define LOG_NDEBUG 0
 
 #include "DnsTlsDispatcher.h"
+#include <netdutils/Stopwatch.h>
 #include "DnsTlsSocketFactory.h"
+#include "resolv_private.h"
+#include "stats.pb.h"
 
-#include "log/log.h"
+#include <android-base/logging.h>
 
 namespace android {
 namespace net {
 
+using android::netdutils::Stopwatch;
 using netdutils::Slice;
 
 // static
@@ -82,29 +85,45 @@ std::list<DnsTlsServer> DnsTlsDispatcher::getOrderedServerList(
     return out;
 }
 
-DnsTlsTransport::Response DnsTlsDispatcher::query(
-        const std::list<DnsTlsServer> &tlsServers, unsigned mark,
-        const Slice query, const Slice ans, int *resplen) {
-    const std::list<DnsTlsServer> orderedServers(getOrderedServerList(tlsServers, mark));
+DnsTlsTransport::Response DnsTlsDispatcher::query(const std::list<DnsTlsServer>& tlsServers,
+                                                  res_state statp, const Slice query,
+                                                  const Slice ans, int* resplen) {
+    const std::list<DnsTlsServer> orderedServers(getOrderedServerList(tlsServers, statp->_mark));
 
-    if (orderedServers.empty()) ALOGW("Empty DnsTlsServer list");
+    if (orderedServers.empty()) LOG(WARNING) << "Empty DnsTlsServer list";
 
     DnsTlsTransport::Response code = DnsTlsTransport::Response::internal_error;
+    int serverCount = 0;
     for (const auto& server : orderedServers) {
-        code = this->query(server, mark, query, ans, resplen);
+        DnsQueryEvent* dnsQueryEvent =
+                statp->event->mutable_dns_query_events()->add_dns_query_event();
+        dnsQueryEvent->set_rcode(NS_R_INTERNAL_ERROR);
+        Stopwatch query_stopwatch;
+        code = this->query(server, statp->_mark, query, ans, resplen);
+
+        dnsQueryEvent->set_latency_micros(saturate_cast<int32_t>(query_stopwatch.timeTakenUs()));
+        dnsQueryEvent->set_dns_server_index(serverCount++);
+        dnsQueryEvent->set_ip_version(ipFamilyToIPVersion(server.ss.ss_family));
+        dnsQueryEvent->set_protocol(PROTO_DOT);
+        dnsQueryEvent->set_type(getQueryType(query.base(), query.size()));
+
         switch (code) {
             // These response codes are valid responses and not expected to
             // change if another server is queried.
             case DnsTlsTransport::Response::success:
+                dnsQueryEvent->set_rcode(
+                        static_cast<NsRcode>(reinterpret_cast<HEADER*>(ans.base())->rcode));
+                [[fallthrough]];
             case DnsTlsTransport::Response::limit_error:
                 return code;
-                break;
             // These response codes might differ when trying other servers, so
             // keep iterating to see if we can get a different (better) result.
             case DnsTlsTransport::Response::network_error:
+                // Sync from res_tls_send in res_send.cpp
+                dnsQueryEvent->set_rcode(NS_R_TIMEOUT);
+                [[fallthrough]];
             case DnsTlsTransport::Response::internal_error:
                 continue;
-                break;
             // No "default" statement.
         }
     }
@@ -129,22 +148,22 @@ DnsTlsTransport::Response DnsTlsDispatcher::query(const DnsTlsServer& server, un
         ++xport->useCount;
     }
 
-    ALOGV("Sending query of length %zu", query.size());
+    LOG(DEBUG) << "Sending query of length " << query.size();
     auto res = xport->transport.query(query);
-    ALOGV("Awaiting response");
+    LOG(DEBUG) << "Awaiting response";
     const auto& result = res.get();
     DnsTlsTransport::Response code = result.code;
     if (code == DnsTlsTransport::Response::success) {
         if (result.response.size() > ans.size()) {
-            ALOGV("Response too large: %zu > %zu", result.response.size(), ans.size());
+            LOG(DEBUG) << "Response too large: " << result.response.size() << " > " << ans.size();
             code = DnsTlsTransport::Response::limit_error;
         } else {
-            ALOGV("Got response successfully");
+            LOG(DEBUG) << "Got response successfully";
             *resplen = result.response.size();
             netdutils::copy(ans, netdutils::makeSlice(result.response));
         }
     } else {
-        ALOGV("Query failed: %u", (unsigned int) code);
+        LOG(DEBUG) << "Query failed: " << (unsigned int)code;
     }
 
     auto now = std::chrono::steady_clock::now();

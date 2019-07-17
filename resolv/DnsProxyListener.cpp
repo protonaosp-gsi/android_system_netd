@@ -35,6 +35,7 @@
 #include <list>
 #include <vector>
 
+#include <NetdClient.h>  // NETID_USE_LOCAL_NAMESERVERS
 #include <android-base/stringprintf.h>
 #include <android/multinetwork.h>  // ResNsendFlags
 #include <cutils/misc.h>           // FIRST_APPLICATION_UID
@@ -49,11 +50,13 @@
 #include <sysutils/SocketClient.h>
 
 #include "DnsResolver.h"
-#include "NetdClient.h"  // NETID_USE_LOCAL_NAMESERVERS
 #include "NetdPermissions.h"
 #include "PrivateDnsConfiguration.h"
 #include "ResolverEventReporter.h"
+#include "getaddrinfo.h"
+#include "gethnamaddr.h"
 #include "netd_resolv/stats.h"  // RCODE_TIMEOUT
+#include "res_send.h"
 #include "resolv_private.h"
 #include "stats.pb.h"
 
@@ -296,17 +299,23 @@ bool parseQuery(const uint8_t* msg, size_t msgLen, uint16_t* query_id, int* rr_t
     return true;
 }
 
+void initDnsEvent(NetworkDnsEventReported* event) {
+    // The value 0 has the special meaning of unset/unknown in Westworld atoms.
+    event->set_hints_ai_flags(-1);
+    event->set_res_nsend_flags(-1);
+}
+
 void reportDnsEvent(int eventType, const android_net_context& netContext, int latencyUs,
-                    int returnCode, const NetworkDnsEventReported& dnsEvent,
-                    const std::string& query_name, const std::vector<std::string>& ip_addrs = {},
-                    int total_ip_addr_count = 0) {
-    std::string dnsQueryStats = dnsEvent.dns_query_events().SerializeAsString();
-    char const* dnsQueryStatsBytes = dnsQueryStats.c_str();
-    stats::BytesField dnsQueryBytesField{dnsQueryStatsBytes, dnsQueryStats.size()};
-    android::net::stats::stats_write(android::net::stats::NETWORK_DNS_EVENT_REPORTED, eventType,
-                                     returnCode, latencyUs, dnsEvent.hints_ai_flags(),
-                                     dnsEvent.res_nsend_flags(), dnsEvent.network_type(),
-                                     dnsEvent.private_dns_modes(), dnsQueryBytesField);
+                    int returnCode, NetworkDnsEventReported& event, const std::string& query_name,
+                    const std::vector<std::string>& ip_addrs = {}, int total_ip_addr_count = 0) {
+    const std::string& dnsQueryStats = event.dns_query_events().SerializeAsString();
+    stats::BytesField dnsQueryBytesField{dnsQueryStats.c_str(), dnsQueryStats.size()};
+    event.set_return_code(static_cast<ReturnCode>(returnCode));
+    android::net::stats::stats_write(android::net::stats::NETWORK_DNS_EVENT_REPORTED,
+                                     event.event_type(), event.return_code(),
+                                     event.latency_micros(), event.hints_ai_flags(),
+                                     event.res_nsend_flags(), event.network_type(),
+                                     event.private_dns_modes(), dnsQueryBytesField);
 
     const auto& listeners = ResolverEventReporter::getInstance().getListeners();
     if (listeners.size() == 0) {
@@ -587,7 +596,8 @@ static bool sendaddrinfo(SocketClient* c, addrinfo* ai) {
     return true;
 }
 
-void DnsProxyListener::GetAddrInfoHandler::doDns64Synthesis(int32_t* rv, addrinfo** res) {
+void DnsProxyListener::GetAddrInfoHandler::doDns64Synthesis(int32_t* rv, addrinfo** res,
+                                                            NetworkDnsEventReported* event) {
     if (mHost == nullptr) return;
 
     const bool ipv6WantedButNoData = (mHints && mHints->ai_family == AF_INET6 && *rv == EAI_NODATA);
@@ -610,7 +620,7 @@ void DnsProxyListener::GetAddrInfoHandler::doDns64Synthesis(int32_t* rv, addrinf
             mHints->ai_family = AF_INET;
             // Don't need to do freeaddrinfo(res) before starting new DNS lookup because previous
             // DNS lookup is failed with error EAI_NODATA.
-            *rv = android_getaddrinfofornetcontext(mHost, mService, mHints, &mNetContext, res);
+            *rv = resolv_getaddrinfo(mHost, mService, mHints, &mNetContext, res, event);
             queryLimiter.finish(uid);
             if (*rv) {
                 *rv = EAI_NODATA;  // return original error code
@@ -645,9 +655,10 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
     maybeFixupNetContext(&mNetContext);
     const uid_t uid = mClient->getUid();
     int32_t rv = 0;
-    NetworkDnsEventReported dnsEvent;
+    NetworkDnsEventReported event;
+    initDnsEvent(&event);
     if (queryLimiter.start(uid)) {
-        rv = android_getaddrinfofornetcontext(mHost, mService, mHints, &mNetContext, &result);
+        rv = resolv_getaddrinfo(mHost, mService, mHints, &mNetContext, &result, &event);
         queryLimiter.finish(uid);
     } else {
         // Note that this error code is currently not passed down to the client.
@@ -657,8 +668,11 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
                    << ", max concurrent queries reached";
     }
 
-    doDns64Synthesis(&rv, &result);
-    const int latencyUs = int(s.timeTakenUs());
+    doDns64Synthesis(&rv, &result, &event);
+    const int32_t latencyUs = saturate_cast<int32_t>(s.timeTakenUs());
+    event.set_latency_micros(latencyUs);
+    event.set_event_type(EVENT_GETADDRINFO);
+    event.set_hints_ai_flags((mHints ? mHints->ai_flags : 0));
 
     if (rv) {
         // getaddrinfo failed
@@ -677,8 +691,8 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
     }
     std::vector<std::string> ip_addrs;
     const int total_ip_addr_count = extractGetAddrInfoAnswers(result, &ip_addrs);
-    reportDnsEvent(INetdEventListener::EVENT_GETADDRINFO, mNetContext, latencyUs, rv, dnsEvent,
-                   mHost, ip_addrs, total_ip_addr_count);
+    reportDnsEvent(INetdEventListener::EVENT_GETADDRINFO, mNetContext, latencyUs, rv, event, mHost,
+                   ip_addrs, total_ip_addr_count);
     freeaddrinfo(result);
     mClient->decRef();
 }
@@ -851,10 +865,11 @@ void DnsProxyListener::ResNSendHandler::run() {
     // Send DNS query
     std::vector<uint8_t> ansBuf(MAXPACKET, 0);
     int arcode, nsendAns = -1;
-    NetworkDnsEventReported dnsEvent;
+    NetworkDnsEventReported event;
+    initDnsEvent(&event);
     if (queryLimiter.start(uid)) {
         nsendAns = resolv_res_nsend(&mNetContext, msg.data(), msgLen, ansBuf.data(), MAXPACKET,
-                                    &arcode, static_cast<ResNsendFlags>(mFlags));
+                                    &arcode, static_cast<ResNsendFlags>(mFlags), &event);
         queryLimiter.finish(uid);
     } else {
         LOG(WARNING) << "ResNSendHandler::run: resnsend: from UID " << uid
@@ -862,14 +877,17 @@ void DnsProxyListener::ResNSendHandler::run() {
         nsendAns = -EBUSY;
     }
 
-    const int latencyUs = int(s.timeTakenUs());
+    const int32_t latencyUs = saturate_cast<int32_t>(s.timeTakenUs());
+    event.set_latency_micros(latencyUs);
+    event.set_event_type(EVENT_RES_NSEND);
+    event.set_res_nsend_flags(static_cast<ResNsendFlags>(mFlags));
 
     // Fail, send -errno
     if (nsendAns < 0) {
         sendBE32(mClient, nsendAns);
         if (rr_type == ns_t_a || rr_type == ns_t_aaaa) {
             reportDnsEvent(INetdEventListener::EVENT_RES_NSEND, mNetContext, latencyUs,
-                           resNSendToAiError(nsendAns, arcode), dnsEvent, rr_name);
+                           resNSendToAiError(nsendAns, arcode), event, rr_name);
         }
         return;
     }
@@ -892,7 +910,7 @@ void DnsProxyListener::ResNSendHandler::run() {
         const int total_ip_addr_count =
                 extractResNsendAnswers((uint8_t*) ansBuf.data(), nsendAns, rr_type, &ip_addrs);
         reportDnsEvent(INetdEventListener::EVENT_RES_NSEND, mNetContext, latencyUs,
-                       resNSendToAiError(nsendAns, arcode), dnsEvent, rr_name, ip_addrs,
+                       resNSendToAiError(nsendAns, arcode), event, rr_name, ip_addrs,
                        total_ip_addr_count);
     }
 }
@@ -900,7 +918,7 @@ void DnsProxyListener::ResNSendHandler::run() {
 namespace {
 
 bool sendCodeAndBe32(SocketClient* c, int code, int data) {
-    return c->sendCode(code) || sendBE32(c, data);
+    return !c->sendCode(code) && sendBE32(c, data);
 }
 
 }  // namespace
@@ -929,10 +947,15 @@ int DnsProxyListener::GetDnsNetIdCommand::runCommand(SocketClient* cli, int argc
         return -1;
     }
 
+    const bool useLocalNameservers = checkAndClearUseLocalNameserversFlag(&netId);
     android_net_context netcontext;
     gResNetdCallbacks.get_network_context(netId, uid, &netcontext);
 
-    return sendCodeAndBe32(cli, ResponseCode::DnsProxyQueryResult, netcontext.dns_netid);
+    if (useLocalNameservers) {
+        netcontext.app_netid |= NETID_USE_LOCAL_NAMESERVERS;
+    }
+
+    return sendCodeAndBe32(cli, ResponseCode::DnsProxyQueryResult, netcontext.app_netid) ? 0 : -1;
 }
 
 /*******************************************************
@@ -986,7 +1009,8 @@ DnsProxyListener::GetHostByNameHandler::~GetHostByNameHandler() {
     free(mName);
 }
 
-void DnsProxyListener::GetHostByNameHandler::doDns64Synthesis(int32_t* rv, struct hostent** hpp) {
+void DnsProxyListener::GetHostByNameHandler::doDns64Synthesis(int32_t* rv, struct hostent** hpp,
+                                                              NetworkDnsEventReported* event) {
     // Don't have to consider family AF_UNSPEC case because gethostbyname{, 2} only supports
     // family AF_INET or AF_INET6.
     const bool ipv6WantedButNoData = (mAf == AF_INET6 && *rv == EAI_NODATA);
@@ -1003,7 +1027,7 @@ void DnsProxyListener::GetHostByNameHandler::doDns64Synthesis(int32_t* rv, struc
     // If caller wants IPv6 answers but no data, try to query IPv4 answers for synthesis
     const uid_t uid = mClient->getUid();
     if (queryLimiter.start(uid)) {
-        *rv = android_gethostbynamefornetcontext(mName, AF_INET, &mNetContext, hpp);
+        *rv = android_gethostbynamefornetcontext(mName, AF_INET, &mNetContext, hpp, event);
         queryLimiter.finish(uid);
         if (*rv) {
             *rv = EAI_NODATA;  // return original error code
@@ -1027,9 +1051,10 @@ void DnsProxyListener::GetHostByNameHandler::run() {
     const uid_t uid = mClient->getUid();
     hostent* hp = nullptr;
     int32_t rv = 0;
-    NetworkDnsEventReported dnsEvent;
+    NetworkDnsEventReported event;
+    initDnsEvent(&event);
     if (queryLimiter.start(uid)) {
-        rv = android_gethostbynamefornetcontext(mName, mAf, &mNetContext, &hp);
+        rv = android_gethostbynamefornetcontext(mName, mAf, &mNetContext, &hp, &event);
         queryLimiter.finish(uid);
     } else {
         rv = EAI_MEMORY;
@@ -1037,8 +1062,11 @@ void DnsProxyListener::GetHostByNameHandler::run() {
                    << ", max concurrent queries reached";
     }
 
-    doDns64Synthesis(&rv, &hp);
-    const int latencyUs = lround(s.timeTakenUs());
+    doDns64Synthesis(&rv, &hp, &event);
+    const int32_t latencyUs = saturate_cast<int32_t>(s.timeTakenUs());
+    event.set_latency_micros(latencyUs);
+    event.set_event_type(EVENT_GETHOSTBYNAME);
+
     LOG(DEBUG) << "GetHostByNameHandler::run: errno: " << (hp ? "success" : strerror(errno));
 
     bool success = true;
@@ -1056,7 +1084,7 @@ void DnsProxyListener::GetHostByNameHandler::run() {
 
     std::vector<std::string> ip_addrs;
     const int total_ip_addr_count = extractGetHostByNameAnswers(hp, &ip_addrs);
-    reportDnsEvent(INetdEventListener::EVENT_GETHOSTBYNAME, mNetContext, latencyUs, rv, dnsEvent,
+    reportDnsEvent(INetdEventListener::EVENT_GETHOSTBYNAME, mNetContext, latencyUs, rv, event,
                    mName, ip_addrs, total_ip_addr_count);
     mClient->decRef();
 }
@@ -1126,7 +1154,8 @@ DnsProxyListener::GetHostByAddrHandler::~GetHostByAddrHandler() {
     free(mAddress);
 }
 
-void DnsProxyListener::GetHostByAddrHandler::doDns64ReverseLookup(struct hostent** hpp) {
+void DnsProxyListener::GetHostByAddrHandler::doDns64ReverseLookup(struct hostent** hpp,
+                                                                  NetworkDnsEventReported* event) {
     if (*hpp != nullptr || mAddressFamily != AF_INET6 || !mAddress) {
         return;
     }
@@ -1154,7 +1183,8 @@ void DnsProxyListener::GetHostByAddrHandler::doDns64ReverseLookup(struct hostent
     if (queryLimiter.start(uid)) {
         // Remove NAT64 prefix and do reverse DNS query
         struct in_addr v4addr = {.s_addr = v6addr.s6_addr32[3]};
-        android_gethostbyaddrfornetcontext(&v4addr, sizeof(v4addr), AF_INET, &mNetContext, hpp);
+        android_gethostbyaddrfornetcontext(&v4addr, sizeof(v4addr), AF_INET, &mNetContext, hpp,
+                                           event);
         queryLimiter.finish(uid);
         if (*hpp) {
             // Replace IPv4 address with original queried IPv6 address in place. The space has
@@ -1176,10 +1206,11 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
     const uid_t uid = mClient->getUid();
     hostent* hp = nullptr;
     int32_t rv = 0;
-    NetworkDnsEventReported dnsEvent;
+    NetworkDnsEventReported event;
+    initDnsEvent(&event);
     if (queryLimiter.start(uid)) {
-        rv = android_gethostbyaddrfornetcontext(mAddress, mAddressLen, mAddressFamily,
-                                                &mNetContext, &hp);
+        rv = android_gethostbyaddrfornetcontext(mAddress, mAddressLen, mAddressFamily, &mNetContext,
+                                                &hp, &event);
         queryLimiter.finish(uid);
     } else {
         rv = EAI_MEMORY;
@@ -1187,8 +1218,10 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
                    << ", max concurrent queries reached";
     }
 
-    doDns64ReverseLookup(&hp);
-    const int latencyUs = int(s.timeTakenUs());
+    doDns64ReverseLookup(&hp, &event);
+    const int32_t latencyUs = saturate_cast<int32_t>(s.timeTakenUs());
+    event.set_latency_micros(latencyUs);
+    event.set_event_type(EVENT_GETHOSTBYADDR);
 
     LOG(DEBUG) << "GetHostByAddrHandler::run: result: " << (hp ? "success" : gai_strerror(rv));
 
@@ -1204,7 +1237,7 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
         LOG(WARNING) << "GetHostByAddrHandler::run: Error writing DNS result to client";
     }
 
-    reportDnsEvent(INetdEventListener::EVENT_GETHOSTBYADDR, mNetContext, latencyUs, rv, dnsEvent,
+    reportDnsEvent(INetdEventListener::EVENT_GETHOSTBYADDR, mNetContext, latencyUs, rv, event,
                    (hp && hp->h_name) ? hp->h_name : "null", {}, 0);
     mClient->decRef();
 }

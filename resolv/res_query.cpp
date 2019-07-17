@@ -207,21 +207,19 @@ int res_nsearch(res_state statp, const char* name, /* domain name */
                 int* herrno)                       /* legacy and extended
                                                       h_errno NETD_RESOLV_H_ERRNO_EXT_* */
 {
-    const char *cp, *const *domain;
+    const char* cp;
     HEADER* hp = (HEADER*) (void*) answer;
     u_int dots;
-    int trailing_dot, ret, saved_herrno;
+    int ret, saved_herrno;
     int got_nodata = 0, got_servfail = 0, root_on_list = 0;
     int tried_as_is = 0;
-    int searched = 0;
 
     errno = 0;
     *herrno = HOST_NOT_FOUND; /* True if we never query. */
 
     dots = 0;
     for (cp = name; *cp != '\0'; cp++) dots += (*cp == '.');
-    trailing_dot = 0;
-    if (cp > name && *--cp == '.') trailing_dot++;
+    const bool trailing_dot = (cp > name && *--cp == '.') ? true : false;
 
     /*
      * If there are enough dots in the name, let's just give it a
@@ -238,12 +236,10 @@ int res_nsearch(res_state statp, const char* name, /* domain name */
 
     /*
      * We do at least one level of search if
-     *	- there is no dot and RES_DEFNAME is set, or
-     *	- there is at least one dot, there is no trailing dot,
-     *	  and RES_DNSRCH is set.
+     *	- there is no dot, or
+     *	- there is at least one dot and there is no trailing dot.
      */
-    if ((!dots && (statp->options & RES_DEFNAMES) != 0U) ||
-        (dots && !trailing_dot && (statp->options & RES_DNSRCH) != 0U)) {
+    if ((!dots) || (dots && !trailing_dot)) {
         int done = 0;
 
         /* Unfortunately we need to load network-specific info
@@ -255,13 +251,10 @@ int res_nsearch(res_state statp, const char* name, /* domain name */
          */
         _resolv_populate_res_for_net(statp);
 
-        for (domain = (const char* const*) statp->dnsrch; *domain && !done; domain++) {
-            searched = 1;
+        for (const auto& domain : statp->search_domains) {
+            if (domain == "." || domain == "") ++root_on_list;
 
-            if (domain[0][0] == '\0' || (domain[0][0] == '.' && domain[0][1] == '\0'))
-                root_on_list++;
-
-            ret = res_nquerydomain(statp, name, *domain, cl, type, answer, anslen, herrno);
+            ret = res_nquerydomain(statp, name, domain.c_str(), cl, type, answer, anslen, herrno);
             if (ret > 0) return ret;
 
             /*
@@ -300,20 +293,13 @@ int res_nsearch(res_state statp, const char* name, /* domain name */
                     /* anything else implies that we're done */
                     done++;
             }
-
-            /* if we got here for some reason other than DNSRCH,
-             * we only wanted one iteration of the loop, so stop.
-             */
-            if ((statp->options & RES_DNSRCH) == 0U) done++;
         }
     }
 
-    /*
-     * If the query has not already been tried as is then try it
-     * unless RES_NOTLDQUERY is set and there were no dots.
-     */
-    if ((dots || !searched || (statp->options & RES_NOTLDQUERY) == 0U) &&
-        !(tried_as_is || root_on_list)) {
+    // if we have not already tried the name "as is", do that now.
+    // note that we do this regardless of how many dots were in the
+    // name or whether it ends with a dot.
+    if (!tried_as_is && !root_on_list) {
         ret = res_nquerydomain(statp, name, NULL, cl, type, answer, anslen, herrno);
         if (ret > 0) return ret;
     }

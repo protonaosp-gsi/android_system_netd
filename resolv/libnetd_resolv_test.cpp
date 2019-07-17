@@ -21,9 +21,15 @@
 #include <android-base/stringprintf.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <netdutils/InternetAddresses.h>
 
 #include "dns_responder.h"
-#include "netd_resolv/resolv.h"
+#include "getaddrinfo.h"
+#include "gethnamaddr.h"
+#include "resolv_cache.h"
+#include "stats.pb.h"
+
+#define NAME(variable) #variable
 
 // TODO: make this dynamic and stop depending on implementation details.
 constexpr unsigned int TEST_NETID = 30;
@@ -32,10 +38,12 @@ constexpr unsigned int TEST_NETID = 30;
 // protocol can be returned by getaddrinfo().
 constexpr unsigned int ANY = 0;
 
-using android::base::StringPrintf;
-
 namespace android {
 namespace net {
+
+using android::base::StringPrintf;
+using android::net::NetworkDnsEventReported;
+using android::netdutils::ScopedAddrinfo;
 
 // Minimize class ResolverTest to be class TestBase because class TestBase doesn't need all member
 // functions of class ResolverTest and class DnsResponderClient.
@@ -82,15 +90,20 @@ class TestBase : public ::testing::Test {
         return found;
     }
 
-    const char* mDefaultSearchDomains = "example.com";
-    const res_params mDefaultParams_Binder = {
-            .sample_validity = 300,
-            .success_threshold = 25,
-            .min_samples = 8,
-            .max_samples = 8,
-            .base_timeout_msec = 1000,
-            .retry_count = 2,
-    };
+    int setResolvers() {
+        const std::vector<std::string> servers = {test::kDefaultListenAddr};
+        const std::vector<std::string> domains = {"example.com"};
+        const res_params params = {
+                .sample_validity = 300,
+                .success_threshold = 25,
+                .min_samples = 8,
+                .max_samples = 8,
+                .base_timeout_msec = 1000,
+                .retry_count = 2,
+        };
+        return resolv_set_nameservers(TEST_NETID, servers, domains, params);
+    }
+
     const android_net_context mNetcontext = {
             .app_netid = TEST_NETID,
             .app_mark = MARK_UNSET,
@@ -98,24 +111,30 @@ class TestBase : public ::testing::Test {
             .dns_mark = MARK_UNSET,
             .uid = NET_CONTEXT_INVALID_UID,
     };
+
+    // Illegal hostnames
+    static constexpr char kBadCharAfterPeriodHost[] = "hello.example.^com.";
+    static constexpr char kBadCharBeforePeriodHost[] = "hello.example^.com.";
+    static constexpr char kBadCharAtTheEndHost[] = "hello.example.com^.";
+    static constexpr char kBadCharInTheMiddleOfLabelHost[] = "hello.ex^ample.com.";
 };
 
-class GetAddrInfoForNetContextTest : public TestBase {};
+class ResolvGetAddrInfoTest : public TestBase {};
 class GetHostByNameForNetContextTest : public TestBase {};
 
-TEST_F(GetAddrInfoForNetContextTest, InvalidParameters) {
-    // Both null "netcontext" and null "res" of android_getaddrinfofornetcontext() are not tested
+TEST_F(ResolvGetAddrInfoTest, InvalidParameters) {
+    // Both null "netcontext" and null "res" of resolv_getaddrinfo() are not tested
     // here because they are checked by assert() without returning any error number.
 
     // Invalid hostname and servname.
     // Both hostname and servname are null pointers. Expect error number EAI_NONAME.
-    struct addrinfo* result = nullptr;
-    int rv = android_getaddrinfofornetcontext(nullptr /*hostname*/, nullptr /*servname*/,
-                                              nullptr /*hints*/, &mNetcontext, &result);
-    EXPECT_EQ(EAI_NONAME, rv);
-    if (result) {
-        freeaddrinfo(result);
-        result = nullptr;
+    {
+        addrinfo* result = nullptr;
+        NetworkDnsEventReported event;
+        int rv = resolv_getaddrinfo(nullptr /*hostname*/, nullptr /*servname*/, nullptr /*hints*/,
+                                    &mNetcontext, &result, &event);
+        ScopedAddrinfo result_cleanup(result);
+        EXPECT_EQ(EAI_NONAME, rv);
     }
 
     // Invalid hints.
@@ -129,18 +148,18 @@ TEST_F(GetAddrInfoForNetContextTest, InvalidParameters) {
         int ai_flags;
         socklen_t ai_addrlen;
         char* ai_canonname;
-        struct sockaddr* ai_addr;
-        struct addrinfo* ai_next;
+        sockaddr* ai_addr;
+        addrinfo* ai_next;
 
         int expected_eai_error;
 
         std::string asParameters() const {
             return StringPrintf("0x%x/%u/%s/%p/%p", ai_flags, ai_addrlen,
-                                ai_canonname ? ai_canonname : "(null)", (void*) ai_addr,
-                                (void*) ai_next);
+                                ai_canonname ? ai_canonname : "(null)", (void*)ai_addr,
+                                (void*)ai_next);
         }
     } testConfigs[]{
-            {0, sizeof(struct in_addr) /*bad*/, nullptr, nullptr, nullptr, EAI_BADHINTS},
+            {0, sizeof(in_addr) /*bad*/, nullptr, nullptr, nullptr, EAI_BADHINTS},
             {0, 0, placeholder_cname /*bad*/, nullptr, nullptr, EAI_BADHINTS},
             {0, 0, nullptr, &placeholder_addr /*bad*/, nullptr, EAI_BADHINTS},
             {0, 0, nullptr, nullptr, &placeholder_next /*bad*/, EAI_BADHINTS},
@@ -153,9 +172,10 @@ TEST_F(GetAddrInfoForNetContextTest, InvalidParameters) {
     for (const auto& config : testConfigs) {
         SCOPED_TRACE(config.asParameters());
 
+        addrinfo* result = nullptr;
         // In current test configuration set, ai_family, ai_protocol and ai_socktype are not
         // checked because other fields cause hints error check failed first.
-        const struct addrinfo hints = {
+        const addrinfo hints = {
                 .ai_flags = config.ai_flags,
                 .ai_family = AF_UNSPEC,
                 .ai_socktype = ANY,
@@ -165,39 +185,65 @@ TEST_F(GetAddrInfoForNetContextTest, InvalidParameters) {
                 .ai_addr = config.ai_addr,
                 .ai_next = config.ai_next,
         };
-
-        rv = android_getaddrinfofornetcontext("localhost", nullptr /*servname*/, &hints,
-                                              &mNetcontext, &result);
+        NetworkDnsEventReported event;
+        int rv = resolv_getaddrinfo("localhost", nullptr /*servname*/, &hints, &mNetcontext,
+                                    &result, &event);
+        ScopedAddrinfo result_cleanup(result);
         EXPECT_EQ(config.expected_eai_error, rv);
-
-        if (result) {
-            freeaddrinfo(result);
-            result = nullptr;
-        }
     }
 }
 
-TEST_F(GetAddrInfoForNetContextTest, InvalidParameters_Family) {
+TEST_F(ResolvGetAddrInfoTest, InvalidParameters_Family) {
     for (int family = 0; family < AF_MAX; ++family) {
         if (family == AF_UNSPEC || family == AF_INET || family == AF_INET6) {
             continue;  // skip supported family
         }
         SCOPED_TRACE(StringPrintf("family: %d", family));
 
-        struct addrinfo* result = nullptr;
-        const struct addrinfo hints = {
+        addrinfo* result = nullptr;
+        const addrinfo hints = {
                 .ai_family = family,  // unsupported family
         };
-
-        int rv = android_getaddrinfofornetcontext("localhost", nullptr /*servname*/, &hints,
-                                                  &mNetcontext, &result);
+        NetworkDnsEventReported event;
+        int rv = resolv_getaddrinfo("localhost", nullptr /*servname*/, &hints, &mNetcontext,
+                                    &result, &event);
+        ScopedAddrinfo result_cleanup(result);
         EXPECT_EQ(EAI_FAMILY, rv);
-
-        if (result) freeaddrinfo(result);
     }
 }
 
-TEST_F(GetAddrInfoForNetContextTest, InvalidParameters_MeaningfulSocktypeAndProtocolCombination) {
+TEST_F(ResolvGetAddrInfoTest, InvalidParameters_SocketType) {
+    for (const auto& family : {AF_INET, AF_INET6, AF_UNSPEC}) {
+        for (int protocol = 0; protocol < IPPROTO_MAX; ++protocol) {
+            // Socket types which are not in explore_options.
+            for (const auto& socktype : {SOCK_RDM, SOCK_SEQPACKET, SOCK_DCCP, SOCK_PACKET}) {
+                const addrinfo hints = {
+                        .ai_family = family,
+                        .ai_protocol = protocol,
+                        .ai_socktype = socktype,
+                };
+                for (const char* service : {static_cast<const char*>(nullptr),  // service is null
+                                            "80",
+                                            "",  // empty service name
+                                            "ftp",
+                                            "65536",  // out of valid port range from 0 to 65535
+                                            "invalid"}) {
+                    SCOPED_TRACE(StringPrintf("family: %d, socktype: %d, protocol: %d, service: %s",
+                                              family, socktype, protocol,
+                                              service ? service : "service is nullptr"));
+                    addrinfo* result = nullptr;
+                    NetworkDnsEventReported event;
+                    int rv = resolv_getaddrinfo("localhost", service, &hints, &mNetcontext, &result,
+                                                &event);
+                    ScopedAddrinfo result_cleanup(result);
+                    EXPECT_EQ(EAI_SOCKTYPE, rv);
+                }
+            }
+        }
+    }
+}
+
+TEST_F(ResolvGetAddrInfoTest, InvalidParameters_MeaningfulSocktypeAndProtocolCombination) {
     static const int families[] = {PF_INET, PF_INET6, PF_UNSPEC};
     // Skip to test socket type SOCK_RAW in meaningful combination (explore_options[]) of
     // system\netd\resolv\getaddrinfo.cpp. In explore_options[], the socket type SOCK_RAW always
@@ -229,24 +275,27 @@ TEST_F(GetAddrInfoForNetContextTest, InvalidParameters_MeaningfulSocktypeAndProt
                     continue;
                 }
 
-                struct addrinfo* result = nullptr;
-                const struct addrinfo hints = {
+                addrinfo* result = nullptr;
+                const addrinfo hints = {
                         .ai_family = family,
                         .ai_protocol = protocol,
                         .ai_socktype = socktype,
                 };
-
-                int rv = android_getaddrinfofornetcontext("localhost", nullptr /*servname*/, &hints,
-                                                          &mNetcontext, &result);
+                NetworkDnsEventReported event;
+                int rv = resolv_getaddrinfo("localhost", nullptr /*servname*/, &hints, &mNetcontext,
+                                            &result, &event);
+                ScopedAddrinfo result_cleanup(result);
                 EXPECT_EQ(EAI_BADHINTS, rv);
-
-                if (result) freeaddrinfo(result);
             }
         }
     }
 }
 
-TEST_F(GetAddrInfoForNetContextTest, InvalidParameters_PortNameAndNumber) {
+// The test configs are used for verifying the error path of get_port().
+// Note that the EAI_SOCKTYPE verification are moved to an independent
+// test case because validateHints() verify invalid socket type early now.
+// See also InvalidParameters_SocketType.
+TEST_F(ResolvGetAddrInfoTest, InvalidParameters_PortNameAndNumber) {
     constexpr char http_portno[] = "80";
     constexpr char invalid_portno[] = "65536";  // out of valid port range from 0 to 65535
     constexpr char http_portname[] = "http";
@@ -268,18 +317,6 @@ TEST_F(GetAddrInfoForNetContextTest, InvalidParameters_PortNameAndNumber) {
             {0, AF_INET, SOCK_RAW /*bad*/, http_portno, EAI_SERVICE},
             {0, AF_INET6, SOCK_RAW /*bad*/, http_portno, EAI_SERVICE},
             {0, AF_UNSPEC, SOCK_RAW /*bad*/, http_portno, EAI_SERVICE},
-            {0, AF_INET, SOCK_RDM /*bad*/, http_portno, EAI_SOCKTYPE},
-            {0, AF_INET6, SOCK_RDM /*bad*/, http_portno, EAI_SOCKTYPE},
-            {0, AF_UNSPEC, SOCK_RDM /*bad*/, http_portno, EAI_SOCKTYPE},
-            {0, AF_INET, SOCK_SEQPACKET /*bad*/, http_portno, EAI_SOCKTYPE},
-            {0, AF_INET6, SOCK_SEQPACKET /*bad*/, http_portno, EAI_SOCKTYPE},
-            {0, AF_UNSPEC, SOCK_SEQPACKET /*bad*/, http_portno, EAI_SOCKTYPE},
-            {0, AF_INET, SOCK_DCCP /*bad*/, http_portno, EAI_SOCKTYPE},
-            {0, AF_INET6, SOCK_DCCP /*bad*/, http_portno, EAI_SOCKTYPE},
-            {0, AF_UNSPEC, SOCK_DCCP /*bad*/, http_portno, EAI_SOCKTYPE},
-            {0, AF_INET, SOCK_PACKET /*bad*/, http_portno, EAI_SOCKTYPE},
-            {0, AF_INET6, SOCK_PACKET /*bad*/, http_portno, EAI_SOCKTYPE},
-            {0, AF_UNSPEC, SOCK_PACKET /*bad*/, http_portno, EAI_SOCKTYPE},
             {0, AF_INET, ANY, invalid_portno /*bad*/, EAI_SERVICE},
             {0, AF_INET, SOCK_STREAM, invalid_portno /*bad*/, EAI_SERVICE},
             {0, AF_INET, SOCK_DGRAM, invalid_portno /*bad*/, EAI_SERVICE},
@@ -313,60 +350,49 @@ TEST_F(GetAddrInfoForNetContextTest, InvalidParameters_PortNameAndNumber) {
         const std::string testParameters = config.asParameters();
         SCOPED_TRACE(testParameters);
 
-        const struct addrinfo hints = {
+        const addrinfo hints = {
                 .ai_flags = config.ai_flags,
                 .ai_family = config.ai_family,
                 .ai_socktype = config.ai_socktype,
         };
 
-        struct addrinfo* result = nullptr;
-        int rv = android_getaddrinfofornetcontext("localhost", config.servname, &hints,
-                                                  &mNetcontext, &result);
+        addrinfo* result = nullptr;
+        NetworkDnsEventReported event;
+        int rv = resolv_getaddrinfo("localhost", config.servname, &hints, &mNetcontext, &result,
+                                    &event);
+        ScopedAddrinfo result_cleanup(result);
         EXPECT_EQ(config.expected_eai_error, rv);
-
-        if (result) freeaddrinfo(result);
     }
 }
 
-TEST_F(GetAddrInfoForNetContextTest, AlphabeticalHostname_NoData) {
-    constexpr char listen_addr[] = "127.0.0.3";
-    constexpr char listen_srv[] = "53";
+TEST_F(ResolvGetAddrInfoTest, AlphabeticalHostname_NoData) {
     constexpr char v4_host_name[] = "v4only.example.com.";
-    test::DNSResponder dns(listen_addr, listen_srv, 250, ns_rcode::ns_r_servfail);
+    test::DNSResponder dns;
     dns.addMapping(v4_host_name, ns_type::ns_t_a, "1.2.3.3");
     ASSERT_TRUE(dns.startServer());
-    const char* servers[] = {listen_addr};
-    ASSERT_EQ(0, resolv_set_nameservers_for_net(TEST_NETID, servers,
-                                                sizeof(servers) / sizeof(servers[0]),
-                                                mDefaultSearchDomains, &mDefaultParams_Binder));
-    dns.clearQueries();
+    ASSERT_EQ(0, setResolvers());
 
     // Want AAAA answer but DNS server has A answer only.
-    struct addrinfo* result = nullptr;
+    addrinfo* result = nullptr;
     const addrinfo hints = {.ai_family = AF_INET6};
-    int rv = android_getaddrinfofornetcontext("v4only", nullptr, &hints, &mNetcontext, &result);
+    NetworkDnsEventReported event;
+    int rv = resolv_getaddrinfo("v4only", nullptr, &hints, &mNetcontext, &result, &event);
+    ScopedAddrinfo result_cleanup(result);
     EXPECT_LE(1U, GetNumQueries(dns, v4_host_name));
-    EXPECT_TRUE(result == nullptr);
+    EXPECT_EQ(nullptr, result);
     EXPECT_EQ(EAI_NODATA, rv);
-
-    if (result) freeaddrinfo(result);
 }
 
-TEST_F(GetAddrInfoForNetContextTest, AlphabeticalHostname) {
-    constexpr char listen_addr[] = "127.0.0.3";
-    constexpr char listen_srv[] = "53";
+TEST_F(ResolvGetAddrInfoTest, AlphabeticalHostname) {
     constexpr char host_name[] = "sawadee.example.com.";
     constexpr char v4addr[] = "1.2.3.4";
     constexpr char v6addr[] = "::1.2.3.4";
 
-    test::DNSResponder dns(listen_addr, listen_srv, 250, ns_rcode::ns_r_servfail);
+    test::DNSResponder dns;
     dns.addMapping(host_name, ns_type::ns_t_a, v4addr);
     dns.addMapping(host_name, ns_type::ns_t_aaaa, v6addr);
     ASSERT_TRUE(dns.startServer());
-    const char* servers[] = {listen_addr};
-    ASSERT_EQ(0, resolv_set_nameservers_for_net(TEST_NETID, servers,
-                                                sizeof(servers) / sizeof(servers[0]),
-                                                mDefaultSearchDomains, &mDefaultParams_Binder));
+    ASSERT_EQ(0, setResolvers());
 
     static const struct TestConfig {
         int ai_family;
@@ -380,22 +406,59 @@ TEST_F(GetAddrInfoForNetContextTest, AlphabeticalHostname) {
         SCOPED_TRACE(StringPrintf("family: %d", config.ai_family));
         dns.clearQueries();
 
-        struct addrinfo* result = nullptr;
-        const struct addrinfo hints = {.ai_family = config.ai_family};
-        int rv =
-                android_getaddrinfofornetcontext("sawadee", nullptr, &hints, &mNetcontext, &result);
+        addrinfo* result = nullptr;
+        const addrinfo hints = {.ai_family = config.ai_family};
+        NetworkDnsEventReported event;
+        int rv = resolv_getaddrinfo("sawadee", nullptr, &hints, &mNetcontext, &result, &event);
+        ScopedAddrinfo result_cleanup(result);
         EXPECT_EQ(0, rv);
         EXPECT_TRUE(result != nullptr);
         EXPECT_EQ(1U, GetNumQueries(dns, host_name));
         EXPECT_EQ(config.expected_addr, ToString(result));
-
-        if (result) freeaddrinfo(result);
     }
 }
 
-TEST_F(GetAddrInfoForNetContextTest, ServerResponseError) {
-    constexpr char listen_addr[] = "127.0.0.3";
-    constexpr char listen_srv[] = "53";
+TEST_F(ResolvGetAddrInfoTest, IllegalHostname) {
+    test::DNSResponder dns;
+    ASSERT_TRUE(dns.startServer());
+    ASSERT_EQ(0, setResolvers());
+
+    // Illegal hostname is verified by res_hnok() in system/netd/resolv/res_comp.cpp.
+    static constexpr char const* illegalHostnames[] = {
+            kBadCharAfterPeriodHost,
+            kBadCharBeforePeriodHost,
+            kBadCharAtTheEndHost,
+            kBadCharInTheMiddleOfLabelHost,
+    };
+
+    for (const auto& hostname : illegalHostnames) {
+        // Expect to get no address because hostname format is illegal.
+        //
+        // Ex:
+        // ANSWER SECTION:
+        // a.ex^ample.com.      IN  A       1.2.3.3
+        // a.ex^ample.com.      IN  AAAA    2001:db8::42
+        //
+        // In this example, querying "a.ex^ample.com" should get no address because
+        // "a.ex^ample.com" has an illegal char '^' in the middle of label.
+        dns.addMapping(hostname, ns_type::ns_t_a, "1.2.3.3");
+        dns.addMapping(hostname, ns_type::ns_t_aaaa, "2001:db8::42");
+
+        for (const auto& family : {AF_INET, AF_INET6, AF_UNSPEC}) {
+            SCOPED_TRACE(StringPrintf("family: %d, config.name: %s", family, hostname));
+
+            addrinfo* res = nullptr;
+            const addrinfo hints = {.ai_family = family};
+            NetworkDnsEventReported event;
+            int rv = resolv_getaddrinfo(hostname, nullptr, &hints, &mNetcontext, &res, &event);
+            ScopedAddrinfo result(res);
+            EXPECT_EQ(nullptr, result);
+            EXPECT_EQ(EAI_FAIL, rv);
+        }
+    }
+}
+
+TEST_F(ResolvGetAddrInfoTest, ServerResponseError) {
     constexpr char host_name[] = "hello.example.com.";
 
     static const struct TestConfig {
@@ -417,63 +480,156 @@ TEST_F(GetAddrInfoForNetContextTest, ServerResponseError) {
     for (const auto& config : testConfigs) {
         SCOPED_TRACE(StringPrintf("rcode: %d", config.rcode));
 
-        test::DNSResponder dns(listen_addr, listen_srv, 250,
-                               config.rcode /*response specific rcode*/);
+        test::DNSResponder dns(config.rcode);
         dns.addMapping(host_name, ns_type::ns_t_a, "1.2.3.4");
         dns.setResponseProbability(0.0);  // always ignore requests and response preset rcode
         ASSERT_TRUE(dns.startServer());
-        const char* servers[] = {listen_addr};
-        ASSERT_EQ(0, resolv_set_nameservers_for_net(TEST_NETID, servers,
-                                                    sizeof(servers) / sizeof(servers[0]),
-                                                    mDefaultSearchDomains, &mDefaultParams_Binder));
+        ASSERT_EQ(0, setResolvers());
 
-        struct addrinfo* result = nullptr;
-        const struct addrinfo hints = {.ai_family = AF_UNSPEC};
-        int rv =
-                android_getaddrinfofornetcontext(host_name, nullptr, &hints, &mNetcontext, &result);
+        addrinfo* result = nullptr;
+        const addrinfo hints = {.ai_family = AF_UNSPEC};
+        NetworkDnsEventReported event;
+        int rv = resolv_getaddrinfo(host_name, nullptr, &hints, &mNetcontext, &result, &event);
         EXPECT_EQ(config.expected_eai_error, rv);
-
-        if (result) freeaddrinfo(result);
     }
 }
 
 // TODO: Add private DNS server timeout test.
-TEST_F(GetAddrInfoForNetContextTest, ServerTimeout) {
-    constexpr char listen_addr[] = "127.0.0.3";
-    constexpr char listen_srv[] = "53";
+TEST_F(ResolvGetAddrInfoTest, ServerTimeout) {
     constexpr char host_name[] = "hello.example.com.";
-    test::DNSResponder dns(listen_addr, listen_srv, 250, static_cast<ns_rcode>(-1) /*no response*/);
+    test::DNSResponder dns(static_cast<ns_rcode>(-1) /*no response*/);
     dns.addMapping(host_name, ns_type::ns_t_a, "1.2.3.4");
     dns.setResponseProbability(0.0);  // always ignore requests and don't response
     ASSERT_TRUE(dns.startServer());
-    const char* servers[] = {listen_addr};
-    ASSERT_EQ(0, resolv_set_nameservers_for_net(TEST_NETID, servers,
-                                                sizeof(servers) / sizeof(servers[0]),
-                                                mDefaultSearchDomains, &mDefaultParams_Binder));
+    ASSERT_EQ(0, setResolvers());
 
-    struct addrinfo* result = nullptr;
-    const struct addrinfo hints = {.ai_family = AF_UNSPEC};
-    int rv = android_getaddrinfofornetcontext("hello", nullptr, &hints, &mNetcontext, &result);
+    addrinfo* result = nullptr;
+    const addrinfo hints = {.ai_family = AF_UNSPEC};
+    NetworkDnsEventReported event;
+    int rv = resolv_getaddrinfo("hello", nullptr, &hints, &mNetcontext, &result, &event);
     EXPECT_EQ(NETD_RESOLV_TIMEOUT, rv);
+}
 
-    if (result) freeaddrinfo(result);
+TEST_F(ResolvGetAddrInfoTest, CnamesNoIpAddress) {
+    constexpr char ACNAME[] = "acname";  // expect a cname in answer
+    constexpr char CNAMES[] = "cnames";  // expect cname chain in answer
+
+    test::DNSResponder dns;
+    dns.addMapping("cnames.example.com.", ns_type::ns_t_cname, "acname.example.com.");
+    dns.addMapping("acname.example.com.", ns_type::ns_t_cname, "hello.example.com.");
+    ASSERT_TRUE(dns.startServer());
+    ASSERT_EQ(0, setResolvers());
+
+    static const struct TestConfig {
+        const char* name;
+        int family;
+    } testConfigs[]{
+            // clang-format off
+            {ACNAME, AF_INET},
+            {ACNAME, AF_INET6},
+            {ACNAME, AF_UNSPEC},
+            {CNAMES, AF_INET},
+            {CNAMES, AF_INET6},
+            {CNAMES, AF_UNSPEC},
+            // clang-format on
+    };
+
+    for (const auto& config : testConfigs) {
+        SCOPED_TRACE(
+                StringPrintf("config.family: %d, config.name: %s", config.family, config.name));
+
+        addrinfo* res = nullptr;
+        const addrinfo hints = {.ai_family = config.family};
+        NetworkDnsEventReported event;
+        int rv = resolv_getaddrinfo(config.name, nullptr, &hints, &mNetcontext, &res, &event);
+        ScopedAddrinfo result(res);
+        EXPECT_EQ(nullptr, result);
+        EXPECT_EQ(EAI_FAIL, rv);
+    }
+}
+
+TEST_F(ResolvGetAddrInfoTest, CnamesBrokenChainByIllegalCname) {
+    test::DNSResponder dns;
+    ASSERT_TRUE(dns.startServer());
+    ASSERT_EQ(0, setResolvers());
+
+    static const struct TestConfig {
+        const char* name;
+        const char* cname;
+        std::string asHostName() const { return StringPrintf("%s.example.com.", name); }
+
+        // Illegal cname is verified by res_hnok() in system/netd/resolv/res_comp.cpp.
+    } testConfigs[]{
+            // clang-format off
+            {NAME(kBadCharAfterPeriodHost),        kBadCharAfterPeriodHost},
+            {NAME(kBadCharBeforePeriodHost),       kBadCharBeforePeriodHost},
+            {NAME(kBadCharAtTheEndHost),           kBadCharAtTheEndHost},
+            {NAME(kBadCharInTheMiddleOfLabelHost), kBadCharInTheMiddleOfLabelHost},
+            // clang-format on
+    };
+
+    for (const auto& config : testConfigs) {
+        const std::string testHostName = config.asHostName();
+
+        // Expect to get no address because the cname chain is broken by an illegal cname format.
+        //
+        // Ex:
+        // ANSWER SECTION:
+        // hello.example.com.   IN  CNAME   a.ex^ample.com.
+        // a.ex^ample.com.      IN  A       1.2.3.3
+        // a.ex^ample.com.      IN  AAAA    2001:db8::42
+        //
+        // In this example, querying hello.example.com should get no address because
+        // "a.ex^ample.com" has an illegal char '^' in the middle of label.
+        dns.addMapping(testHostName.c_str(), ns_type::ns_t_cname, config.cname);
+        dns.addMapping(config.cname, ns_type::ns_t_a, "1.2.3.3");
+        dns.addMapping(config.cname, ns_type::ns_t_aaaa, "2001:db8::42");
+
+        for (const auto& family : {AF_INET, AF_INET6, AF_UNSPEC}) {
+            SCOPED_TRACE(
+                    StringPrintf("family: %d, testHostName: %s", family, testHostName.c_str()));
+
+            addrinfo* res = nullptr;
+            const addrinfo hints = {.ai_family = family};
+            NetworkDnsEventReported event;
+            int rv = resolv_getaddrinfo(config.name, nullptr, &hints, &mNetcontext, &res, &event);
+            ScopedAddrinfo result(res);
+            EXPECT_EQ(nullptr, result);
+            EXPECT_EQ(EAI_FAIL, rv);
+        }
+    }
+}
+
+TEST_F(ResolvGetAddrInfoTest, CnamesInfiniteLoop) {
+    test::DNSResponder dns;
+    dns.addMapping("hello.example.com.", ns_type::ns_t_cname, "a.example.com.");
+    dns.addMapping("a.example.com.", ns_type::ns_t_cname, "hello.example.com.");
+    ASSERT_TRUE(dns.startServer());
+    ASSERT_EQ(0, setResolvers());
+
+    for (const auto& family : {AF_INET, AF_INET6, AF_UNSPEC}) {
+        SCOPED_TRACE(StringPrintf("family: %d", family));
+
+        addrinfo* res = nullptr;
+        const addrinfo hints = {.ai_family = family};
+        NetworkDnsEventReported event;
+        int rv = resolv_getaddrinfo("hello", nullptr, &hints, &mNetcontext, &res, &event);
+        ScopedAddrinfo result(res);
+        EXPECT_EQ(nullptr, result);
+        EXPECT_EQ(EAI_FAIL, rv);
+    }
 }
 
 TEST_F(GetHostByNameForNetContextTest, AlphabeticalHostname) {
-    constexpr char listen_addr[] = "127.0.0.3";
-    constexpr char listen_srv[] = "53";
     constexpr char host_name[] = "jiababuei.example.com.";
     constexpr char v4addr[] = "1.2.3.4";
     constexpr char v6addr[] = "::1.2.3.4";
 
-    test::DNSResponder dns(listen_addr, listen_srv, 250, ns_rcode::ns_r_servfail);
+    test::DNSResponder dns;
     dns.addMapping(host_name, ns_type::ns_t_a, v4addr);
     dns.addMapping(host_name, ns_type::ns_t_aaaa, v6addr);
     ASSERT_TRUE(dns.startServer());
-    const char* servers[] = {listen_addr};
-    ASSERT_EQ(0, resolv_set_nameservers_for_net(TEST_NETID, servers,
-                                                sizeof(servers) / sizeof(servers[0]),
-                                                mDefaultSearchDomains, &mDefaultParams_Binder));
+    ASSERT_EQ(0, setResolvers());
 
     static const struct TestConfig {
         int ai_family;
@@ -487,9 +643,10 @@ TEST_F(GetHostByNameForNetContextTest, AlphabeticalHostname) {
         SCOPED_TRACE(StringPrintf("family: %d", config.ai_family));
         dns.clearQueries();
 
-        struct hostent* hp = nullptr;
+        hostent* hp = nullptr;
+        NetworkDnsEventReported event;
         int rv = android_gethostbynamefornetcontext("jiababuei", config.ai_family, &mNetcontext,
-                                                    &hp);
+                                                    &hp, &event);
         EXPECT_EQ(0, rv);
         EXPECT_TRUE(hp != nullptr);
         EXPECT_EQ(1U, GetNumQueries(dns, host_name));
@@ -497,30 +654,64 @@ TEST_F(GetHostByNameForNetContextTest, AlphabeticalHostname) {
     }
 }
 
+TEST_F(GetHostByNameForNetContextTest, IllegalHostname) {
+    test::DNSResponder dns;
+    ASSERT_TRUE(dns.startServer());
+    ASSERT_EQ(0, setResolvers());
+
+    // Illegal hostname is verified by res_hnok() in system/netd/resolv/res_comp.cpp.
+    static constexpr char const* illegalHostnames[] = {
+            kBadCharAfterPeriodHost,
+            kBadCharBeforePeriodHost,
+            kBadCharAtTheEndHost,
+            kBadCharInTheMiddleOfLabelHost,
+    };
+
+    for (const auto& hostname : illegalHostnames) {
+        // Expect to get no address because hostname format is illegal.
+        //
+        // Ex:
+        // ANSWER SECTION:
+        // a.ex^ample.com.      IN  A       1.2.3.3
+        // a.ex^ample.com.      IN  AAAA    2001:db8::42
+        //
+        // In this example, querying "a.ex^ample.com" should get no address because
+        // "a.ex^ample.com" has an illegal char '^' in the middle of label.
+        dns.addMapping(hostname, ns_type::ns_t_a, "1.2.3.3");
+        dns.addMapping(hostname, ns_type::ns_t_aaaa, "2001:db8::42");
+
+        for (const auto& family : {AF_INET, AF_INET6}) {
+            SCOPED_TRACE(StringPrintf("family: %d, config.name: %s", family, hostname));
+
+            struct hostent* hp = nullptr;
+            NetworkDnsEventReported event;
+            int rv =
+                    android_gethostbynamefornetcontext(hostname, family, &mNetcontext, &hp, &event);
+            EXPECT_EQ(nullptr, hp);
+            EXPECT_EQ(EAI_FAIL, rv);
+        }
+    }
+}
+
 TEST_F(GetHostByNameForNetContextTest, NoData) {
-    constexpr char listen_addr[] = "127.0.0.3";
-    constexpr char listen_srv[] = "53";
     constexpr char v4_host_name[] = "v4only.example.com.";
-    test::DNSResponder dns(listen_addr, listen_srv, 250, ns_rcode::ns_r_servfail);
+
+    test::DNSResponder dns;
     dns.addMapping(v4_host_name, ns_type::ns_t_a, "1.2.3.3");
     ASSERT_TRUE(dns.startServer());
-    const char* servers[] = {listen_addr};
-    ASSERT_EQ(0, resolv_set_nameservers_for_net(TEST_NETID, servers,
-                                                sizeof(servers) / sizeof(servers[0]),
-                                                mDefaultSearchDomains, &mDefaultParams_Binder));
+    ASSERT_EQ(0, setResolvers());
     dns.clearQueries();
 
     // Want AAAA answer but DNS server has A answer only.
-    struct hostent* hp = nullptr;
-    int rv = android_gethostbynamefornetcontext("v4only", AF_INET6, &mNetcontext, &hp);
+    hostent* hp = nullptr;
+    NetworkDnsEventReported event;
+    int rv = android_gethostbynamefornetcontext("v4only", AF_INET6, &mNetcontext, &hp, &event);
     EXPECT_LE(1U, GetNumQueries(dns, v4_host_name));
-    EXPECT_TRUE(hp == nullptr);
+    EXPECT_EQ(nullptr, hp);
     EXPECT_EQ(EAI_NODATA, rv);
 }
 
 TEST_F(GetHostByNameForNetContextTest, ServerResponseError) {
-    constexpr char listen_addr[] = "127.0.0.3";
-    constexpr char listen_srv[] = "53";
     constexpr char host_name[] = "hello.example.com.";
 
     static const struct TestConfig {
@@ -544,48 +735,156 @@ TEST_F(GetHostByNameForNetContextTest, ServerResponseError) {
     for (const auto& config : testConfigs) {
         SCOPED_TRACE(StringPrintf("rcode: %d", config.rcode));
 
-        test::DNSResponder dns(listen_addr, listen_srv, 250,
-                               config.rcode /*response specific rcode*/);
+        test::DNSResponder dns(config.rcode);
         dns.addMapping(host_name, ns_type::ns_t_a, "1.2.3.4");
         dns.setResponseProbability(0.0);  // always ignore requests and response preset rcode
         ASSERT_TRUE(dns.startServer());
-        const char* servers[] = {listen_addr};
-        ASSERT_EQ(0, resolv_set_nameservers_for_net(TEST_NETID, servers,
-                                                    sizeof(servers) / sizeof(servers[0]),
-                                                    mDefaultSearchDomains, &mDefaultParams_Binder));
+        ASSERT_EQ(0, setResolvers());
 
-        struct hostent* hp = nullptr;
-        int rv = android_gethostbynamefornetcontext(host_name, AF_INET, &mNetcontext, &hp);
-        EXPECT_TRUE(hp == nullptr);
+        hostent* hp = nullptr;
+        NetworkDnsEventReported event;
+        int rv = android_gethostbynamefornetcontext(host_name, AF_INET, &mNetcontext, &hp, &event);
+        EXPECT_EQ(nullptr, hp);
         EXPECT_EQ(config.expected_eai_error, rv);
     }
 }
 
 // TODO: Add private DNS server timeout test.
 TEST_F(GetHostByNameForNetContextTest, ServerTimeout) {
-    constexpr char listen_addr[] = "127.0.0.3";
-    constexpr char listen_srv[] = "53";
     constexpr char host_name[] = "hello.example.com.";
-    test::DNSResponder dns(listen_addr, listen_srv, 250, static_cast<ns_rcode>(-1) /*no response*/);
+    test::DNSResponder dns(static_cast<ns_rcode>(-1) /*no response*/);
     dns.addMapping(host_name, ns_type::ns_t_a, "1.2.3.4");
     dns.setResponseProbability(0.0);  // always ignore requests and don't response
     ASSERT_TRUE(dns.startServer());
-    const char* servers[] = {listen_addr};
-    ASSERT_EQ(0, resolv_set_nameservers_for_net(TEST_NETID, servers,
-                                                sizeof(servers) / sizeof(servers[0]),
-                                                mDefaultSearchDomains, &mDefaultParams_Binder));
+    ASSERT_EQ(0, setResolvers());
 
-    struct hostent* hp = nullptr;
-    int rv = android_gethostbynamefornetcontext(host_name, AF_INET, &mNetcontext, &hp);
+    hostent* hp = nullptr;
+    NetworkDnsEventReported event;
+    int rv = android_gethostbynamefornetcontext(host_name, AF_INET, &mNetcontext, &hp, &event);
     EXPECT_EQ(NETD_RESOLV_TIMEOUT, rv);
 }
 
-// Note that local host file function, files_getaddrinfo(), of android_getaddrinfofornetcontext()
+TEST_F(GetHostByNameForNetContextTest, CnamesNoIpAddress) {
+    constexpr char ACNAME[] = "acname";  // expect a cname in answer
+    constexpr char CNAMES[] = "cnames";  // expect cname chain in answer
+
+    test::DNSResponder dns;
+    dns.addMapping("cnames.example.com.", ns_type::ns_t_cname, "acname.example.com.");
+    dns.addMapping("acname.example.com.", ns_type::ns_t_cname, "hello.example.com.");
+    ASSERT_TRUE(dns.startServer());
+    ASSERT_EQ(0, setResolvers());
+
+    static const struct TestConfig {
+        const char* name;
+        int family;
+    } testConfigs[]{
+            {ACNAME, AF_INET},
+            {ACNAME, AF_INET6},
+            {CNAMES, AF_INET},
+            {CNAMES, AF_INET6},
+    };
+
+    for (const auto& config : testConfigs) {
+        SCOPED_TRACE(
+                StringPrintf("config.family: %d, config.name: %s", config.family, config.name));
+
+        struct hostent* hp = nullptr;
+        NetworkDnsEventReported event;
+        int rv = android_gethostbynamefornetcontext(config.name, config.family, &mNetcontext, &hp,
+                                                    &event);
+        EXPECT_EQ(nullptr, hp);
+        EXPECT_EQ(EAI_FAIL, rv);
+    }
+}
+
+TEST_F(GetHostByNameForNetContextTest, CnamesBrokenChainByIllegalCname) {
+    test::DNSResponder dns;
+    ASSERT_TRUE(dns.startServer());
+    ASSERT_EQ(0, setResolvers());
+
+    static const struct TestConfig {
+        const char* name;
+        const char* cname;
+        std::string asHostName() const { return StringPrintf("%s.example.com.", name); }
+
+        // Illegal cname is verified by res_hnok() in system/netd/resolv/res_comp.cpp
+    } testConfigs[]{
+            // clang-format off
+            {NAME(kBadCharAfterPeriodHost),        kBadCharAfterPeriodHost},
+            {NAME(kBadCharBeforePeriodHost),       kBadCharBeforePeriodHost},
+            {NAME(kBadCharAtTheEndHost),           kBadCharAtTheEndHost},
+            {NAME(kBadCharInTheMiddleOfLabelHost), kBadCharInTheMiddleOfLabelHost},
+            // clang-format on
+    };
+
+    for (const auto& config : testConfigs) {
+        const std::string testHostName = config.asHostName();
+
+        // Expect to get no address because the cname chain is broken by an illegal cname format.
+        //
+        // Ex:
+        // ANSWER SECTION:
+        // hello.example.com.   IN  CNAME   a.ex^ample.com.
+        // a.ex^ample.com.      IN  A       1.2.3.3
+        // a.ex^ample.com.      IN  AAAA    2001:db8::42
+        //
+        // In this example, querying hello.example.com should get no address because
+        // "a.ex^ample.com" has an illegal char '^' in the middle of label.
+        dns.addMapping(testHostName.c_str(), ns_type::ns_t_cname, config.cname);
+        dns.addMapping(config.cname, ns_type::ns_t_a, "1.2.3.3");
+        dns.addMapping(config.cname, ns_type::ns_t_aaaa, "2001:db8::42");
+
+        for (const auto& family : {AF_INET, AF_INET6}) {
+            SCOPED_TRACE(
+                    StringPrintf("family: %d, testHostName: %s", family, testHostName.c_str()));
+
+            struct hostent* hp = nullptr;
+            NetworkDnsEventReported event;
+            int rv = android_gethostbynamefornetcontext(config.name, family, &mNetcontext, &hp,
+                                                        &event);
+            EXPECT_EQ(nullptr, hp);
+            EXPECT_EQ(EAI_FAIL, rv);
+        }
+    }
+}
+
+TEST_F(GetHostByNameForNetContextTest, CnamesInfiniteLoop) {
+    test::DNSResponder dns;
+    dns.addMapping("hello.example.com.", ns_type::ns_t_cname, "a.example.com.");
+    dns.addMapping("a.example.com.", ns_type::ns_t_cname, "hello.example.com.");
+    ASSERT_TRUE(dns.startServer());
+    ASSERT_EQ(0, setResolvers());
+
+    for (const auto& family : {AF_INET, AF_INET6}) {
+        SCOPED_TRACE(StringPrintf("family: %d", family));
+
+        struct hostent* hp = nullptr;
+        NetworkDnsEventReported event;
+        int rv = android_gethostbynamefornetcontext("hello", family, &mNetcontext, &hp, &event);
+        EXPECT_EQ(nullptr, hp);
+        EXPECT_EQ(EAI_FAIL, rv);
+    }
+}
+
+// Note that local host file function, files_getaddrinfo(), of resolv_getaddrinfo()
 // is not tested because it only returns a boolean (success or failure) without any error number.
 
-// TODO: Add test NULL hostname, or numeric hostname for android_getaddrinfofornetcontext.
-// TODO: Add test invalid parameters for android_gethostbynamefornetcontext.
-// TODO: Add test for android_gethostbyaddrfornetcontext.
+// TODO: Simplify the DNS server configuration, DNSResponder and resolv_set_nameservers, as
+//       ResolverTest does.
+// TODO: Add test for resolv_getaddrinfo().
+//       - DNS response message parsing.
+//           - Unexpected type of resource record (RR).
+//           - Invalid length CNAME, or QNAME.
+//           - Unexpected amount of questions.
+//       - CNAME RDATA with the domain name which has null label(s).
+// TODO: Add test for android_gethostbynamefornetcontext().
+//       - Invalid parameters.
+//       - DNS response message parsing.
+//           - Unexpected type of resource record (RR).
+//           - Invalid length CNAME, or QNAME.
+//           - Unexpected amount of questions.
+//       - CNAME RDATA with the domain name which has null label(s).
+// TODO: Add test for android_gethostbyaddrfornetcontext().
 
 }  // end of namespace net
 }  // end of namespace android

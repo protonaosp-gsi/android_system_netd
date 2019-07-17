@@ -18,9 +18,10 @@
 #undef NDEBUG
 #endif
 
-#include <vector>
+#include <netdb.h>
 
-#include <openssl/base64.h>
+#include <iostream>
+#include <vector>
 
 #include <android-base/strings.h>
 #include <android/net/IDnsResolver.h>
@@ -28,12 +29,13 @@
 #include <binder/IServiceManager.h>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
-#include <netdb.h>
+#include <netdutils/NetworkConstants.h>  // SHA256_SIZE
 #include <netdutils/Stopwatch.h>
-#include "tests/BaseTestMetricsListener.h"
-#include "tests/TestMetrics.h"
+#include <openssl/base64.h>
 
-#include "NetdConstants.h"  // SHA256_SIZE
+#include "tests/dns_metrics_listener/base_metrics_listener.h"
+#include "tests/dns_metrics_listener/test_metrics.h"
+
 #include "ResolverStats.h"
 #include "dns_responder.h"
 #include "dns_responder_client.h"
@@ -65,6 +67,7 @@ class DnsResolverBinderTest : public ::testing::Test {
         if (binder != nullptr) {
             mDnsResolver = android::interface_cast<IDnsResolver>(binder);
         }
+        // This could happen when the test isn't running as root, or if netd isn't running.
         assert(nullptr != mDnsResolver.get());
         // Create cache for test
         mDnsResolver->createNetworkCache(TEST_NETID);
@@ -82,7 +85,9 @@ class DnsResolverBinderTest : public ::testing::Test {
 class TimedOperation : public Stopwatch {
   public:
     explicit TimedOperation(const std::string& name) : mName(name) {}
-    virtual ~TimedOperation() { fprintf(stderr, "    %s: %6.1f ms\n", mName.c_str(), timeTaken()); }
+    virtual ~TimedOperation() {
+        std::cerr << "    " << mName << ": " << timeTakenUs() << "us" << std::endl;
+    }
 
   private:
     std::string mName;
@@ -142,8 +147,31 @@ TEST_F(DnsResolverBinderTest, IsAlive) {
     ASSERT_TRUE(isAlive);
 }
 
+TEST_F(DnsResolverBinderTest, RegisterEventListener_NullListener) {
+    android::binder::Status status = mDnsResolver->registerEventListener(
+            android::interface_cast<INetdEventListener>(nullptr));
+    ASSERT_FALSE(status.isOk());
+    ASSERT_EQ(EINVAL, status.serviceSpecificErrorCode());
+}
+
+TEST_F(DnsResolverBinderTest, RegisterEventListener_DuplicateSubscription) {
+    class DummyListener : public android::net::metrics::BaseMetricsListener {};
+
+    // Expect to subscribe successfully.
+    android::sp<DummyListener> dummyListener = new DummyListener();
+    android::binder::Status status = mDnsResolver->registerEventListener(
+            android::interface_cast<INetdEventListener>(dummyListener));
+    ASSERT_TRUE(status.isOk()) << status.exceptionMessage();
+
+    // Expect to subscribe failed with registered listener instance.
+    status = mDnsResolver->registerEventListener(
+            android::interface_cast<INetdEventListener>(dummyListener));
+    ASSERT_FALSE(status.isOk());
+    ASSERT_EQ(EEXIST, status.serviceSpecificErrorCode());
+}
+
 // TODO: Move this test to resolver_test.cpp
-TEST_F(DnsResolverBinderTest, EventListener_onDnsEvent) {
+TEST_F(DnsResolverBinderTest, RegisterEventListener_onDnsEvent) {
     // The test configs are used to trigger expected events. The expected results are defined in
     // expectedResults.
     static const struct TestConfig {
@@ -174,7 +202,7 @@ TEST_F(DnsResolverBinderTest, EventListener_onDnsEvent) {
     // Setup DNS responder server.
     constexpr char listen_addr[] = "127.0.0.3";
     constexpr char listen_srv[] = "53";
-    test::DNSResponder dns(listen_addr, listen_srv, 250, ns_rcode::ns_r_servfail);
+    test::DNSResponder dns(listen_addr, listen_srv, ns_rcode::ns_r_servfail);
     dns.addMapping("hi.example.com.", ns_type::ns_t_a, "1.2.3.4");
     ASSERT_TRUE(dns.startServer());
 
@@ -224,9 +252,9 @@ TEST_F(DnsResolverBinderTest, EventListener_onDnsEvent) {
 
 TEST_F(DnsResolverBinderTest, SetResolverConfiguration_Tls) {
     const std::vector<std::string> LOCALLY_ASSIGNED_DNS{"8.8.8.8", "2001:4860:4860::8888"};
-    std::vector<uint8_t> fp(SHA256_SIZE);
+    std::vector<uint8_t> fp(android::netdutils::SHA256_SIZE);
     std::vector<uint8_t> short_fp(1);
-    std::vector<uint8_t> long_fp(SHA256_SIZE + 1);
+    std::vector<uint8_t> long_fp(android::netdutils::SHA256_SIZE + 1);
     std::vector<std::string> test_domains;
     std::vector<int> test_params = {300, 25, 8, 8};
     static const struct TestData {

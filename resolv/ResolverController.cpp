@@ -24,18 +24,18 @@
 
 #include <netdb.h>
 
+#include <Fwmark.h>
 #include <aidl/android/net/IDnsResolver.h>
 #include <android-base/logging.h>
 #include <android-base/strings.h>
 
 #include "Dns64Configuration.h"
 #include "DnsResolver.h"
-#include "Fwmark.h"
 #include "PrivateDnsConfiguration.h"
 #include "ResolverEventReporter.h"
 #include "ResolverStats.h"
-#include "netd_resolv/resolv.h"
 #include "netd_resolv/stats.h"
+#include "resolv_cache.h"
 
 using namespace std::placeholders;
 using aidl::android::net::ResolverParamsParcel;
@@ -57,6 +57,8 @@ std::string addrToString(const sockaddr_storage* addr) {
 
 const char* getPrivateDnsModeString(PrivateDnsMode mode) {
     switch (mode) {
+        case PrivateDnsMode::UNKNOWN:
+            return "UNKNOWN";
         case PrivateDnsMode::OFF:
             return "OFF";
         case PrivateDnsMode::OPPORTUNISTIC:
@@ -219,16 +221,6 @@ int ResolverController::setResolverConfiguration(
         return err;
     }
 
-    // Convert network-assigned server list to bionic's format.
-    const size_t serverCount = std::min<size_t>(MAXNS, resolverParams.servers.size());
-    std::vector<const char*> server_ptrs;
-    for (size_t i = 0; i < serverCount; ++i) {
-        server_ptrs.push_back(resolverParams.servers[i].c_str());
-    }
-
-    std::string domains_str = android::base::Join(resolverParams.domains, " ");
-
-    // TODO: Change resolv_set_nameservers_for_net() to use ResolverParamsParcel directly.
     res_params res_params = {};
     res_params.sample_validity = resolverParams.sampleValiditySeconds;
     res_params.success_threshold = resolverParams.successThreshold;
@@ -237,11 +229,8 @@ int ResolverController::setResolverConfiguration(
     res_params.base_timeout_msec = resolverParams.baseTimeoutMsec;
     res_params.retry_count = resolverParams.retryCount;
 
-    LOG(VERBOSE) << "setDnsServers netId = " << resolverParams.netId
-                 << ", numservers = " << resolverParams.domains.size();
-
-    return -resolv_set_nameservers_for_net(resolverParams.netId, server_ptrs.data(),
-                                           server_ptrs.size(), domains_str.c_str(), &res_params);
+    return -resolv_set_nameservers(resolverParams.netId, resolverParams.servers,
+                                   resolverParams.domains, res_params);
 }
 
 int ResolverController::getResolverInfo(int32_t netId, std::vector<std::string>* servers,
@@ -357,8 +346,7 @@ void ResolverController::dump(DumpWriter& dw, unsigned netId) {
         mDns64Configuration.dump(dw, netId);
         ExternalPrivateDnsStatus privateDnsStatus = {PrivateDnsMode::OFF, 0, {}};
         gPrivateDnsConfiguration.getStatus(netId, &privateDnsStatus);
-        dw.println("Private DNS mode: %s",
-                   getPrivateDnsModeString(static_cast<PrivateDnsMode>(privateDnsStatus.mode)));
+        dw.println("Private DNS mode: %s", getPrivateDnsModeString(privateDnsStatus.mode));
         if (!privateDnsStatus.numServers) {
             dw.println("No Private DNS servers configured");
         } else {

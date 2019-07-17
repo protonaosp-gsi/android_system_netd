@@ -100,6 +100,7 @@
 #include <android/multinetwork.h>  // ResNsendFlags
 
 #include <netdutils/Slice.h>
+#include <netdutils/Stopwatch.h>
 #include "DnsTlsDispatcher.h"
 #include "DnsTlsTransport.h"
 #include "PrivateDnsConfiguration.h"
@@ -109,10 +110,13 @@
 #include "res_state_ext.h"
 #include "resolv_cache.h"
 #include "resolv_private.h"
+#include "stats.pb.h"
 
 // TODO: use the namespace something like android::netd_resolv for libnetd_resolv
 using namespace android::net;
+using android::net::NetworkDnsEventReported;
 using android::netdutils::Slice;
+using android::netdutils::Stopwatch;
 
 static DnsTlsDispatcher sDnsTlsDispatcher;
 
@@ -122,8 +126,7 @@ static int send_vc(res_state, res_params* params, const u_char*, int, u_char*, i
                    time_t*, int*, int*);
 static int send_dg(res_state, res_params* params, const u_char*, int, u_char*, int, int*, int, int*,
                    int*, time_t*, int*, int*);
-static void Aerror(const res_state, const char*, int, const struct sockaddr*, int);
-static void Perror(const res_state, const char*, int);
+static void dump_error(const char*, const struct sockaddr*, int);
 
 static int sock_eq(struct sockaddr*, struct sockaddr*);
 static int connect_with_timeout(int sock, const struct sockaddr* nsap, socklen_t salen,
@@ -132,11 +135,29 @@ static int retrying_poll(const int sock, short events, const struct timespec* fi
 static int res_tls_send(res_state, const Slice query, const Slice answer, int* rcode,
                         bool* fallback);
 
-/* BIONIC-BEGIN: implement source port randomization */
+NsType getQueryType(const uint8_t* msg, size_t msgLen) {
+    ns_msg handle;
+    ns_rr rr;
+    if (ns_initparse((const uint8_t*)msg, msgLen, &handle) < 0 ||
+        ns_parserr(&handle, ns_s_qd, 0, &rr) < 0) {
+        return NS_T_INVALID;
+    }
+    return static_cast<NsType>(ns_rr_type(rr));
+}
+
+IpVersion ipFamilyToIPVersion(const int ipFamily) {
+    switch (ipFamily) {
+        case AF_INET:
+            return IV_IPV4;
+        case AF_INET6:
+            return IV_IPV6;
+        default:
+            return IV_UNKNOWN;
+    }
+}
 
 // BEGIN: Code copied from ISC eventlib
 // TODO: move away from this code
-
 #define BILLION 1000000000
 
 static struct timespec evConsTime(time_t sec, long nsec) {
@@ -200,6 +221,7 @@ static struct iovec evConsIovec(void* buf, size_t cnt) {
 
 // END: Code copied from ISC eventlib
 
+/* BIONIC-BEGIN: implement source port randomization */
 static int random_bind(int s, int family) {
     sockaddr_union u;
     int j;
@@ -372,6 +394,10 @@ int res_queriesmatch(const u_char* buf1, const u_char* eom1, const u_char* buf2,
     return (1);
 }
 
+static DnsQueryEvent* addDnsQueryEvent(NetworkDnsEventReported* event) {
+    return event->mutable_dns_query_events()->add_dns_query_event();
+}
+
 int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int anssiz, int* rcode,
               uint32_t flags) {
     int gotsomewhere, terrno, v_circuit, resplen, n;
@@ -385,16 +411,20 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
     LOG(DEBUG) << __func__;
     res_pquery(buf, buflen);
 
-    v_circuit = (statp->options & RES_USEVC) || buflen > PACKETSZ;
+    v_circuit = buflen > PACKETSZ;
     gotsomewhere = 0;
     terrno = ETIMEDOUT;
 
     int anslen = 0;
-    cache_status = _resolv_cache_lookup(statp->netid, buf, buflen, ans, anssiz, &anslen, flags);
-
+    Stopwatch cache_stopwatch;
+    cache_status = resolv_cache_lookup(statp->netid, buf, buflen, ans, anssiz, &anslen, flags);
+    const int32_t cacheLatencyUs = saturate_cast<int32_t>(cache_stopwatch.timeTakenUs());
     if (cache_status == RESOLV_CACHE_FOUND) {
         HEADER* hp = (HEADER*)(void*)ans;
         *rcode = hp->rcode;
+        DnsQueryEvent* dnsQueryEvent = addDnsQueryEvent(statp->event);
+        dnsQueryEvent->set_latency_micros(cacheLatencyUs);
+        dnsQueryEvent->set_cache_hit(static_cast<CacheStatus>(cache_status));
         return anslen;
     } else if (cache_status != RESOLV_CACHE_UNSUPPORTED) {
         // had a cache miss for a known network, so populate the thread private
@@ -464,34 +494,6 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
         statp->_u._ext.nscount = statp->nscount;
     }
 
-    /*
-     * Some resolvers want to even out the load on their nameservers.
-     * Note that RES_BLAST overrides RES_ROTATE.
-     */
-    if ((statp->options & RES_ROTATE) != 0U && (statp->options & RES_BLAST) == 0U) {
-        sockaddr_union inu;
-        struct sockaddr_in ina;
-        int lastns = statp->nscount - 1;
-        int fd;
-        u_int16_t nstime;
-
-        if (statp->_u._ext.ext != NULL) inu = statp->_u._ext.ext->nsaddrs[0];
-        ina = statp->nsaddr_list[0];
-        fd = statp->_u._ext.nssocks[0];
-        nstime = statp->_u._ext.nstimes[0];
-        for (int ns = 0; ns < lastns; ns++) {
-            if (statp->_u._ext.ext != NULL)
-                statp->_u._ext.ext->nsaddrs[ns] = statp->_u._ext.ext->nsaddrs[ns + 1];
-            statp->nsaddr_list[ns] = statp->nsaddr_list[ns + 1];
-            statp->_u._ext.nssocks[ns] = statp->_u._ext.nssocks[ns + 1];
-            statp->_u._ext.nstimes[ns] = statp->_u._ext.nstimes[ns + 1];
-        }
-        if (statp->_u._ext.ext != NULL) statp->_u._ext.ext->nsaddrs[lastns] = inu;
-        statp->nsaddr_list[lastns] = ina;
-        statp->_u._ext.nssocks[lastns] = fd;
-        statp->_u._ext.nstimes[lastns] = nstime;
-    }
-
     res_stats stats[MAXNS];
     res_params params;
     int revision_id = resolv_cache_get_resolver_stats(statp->netid, &params, stats);
@@ -521,12 +523,11 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
 
         for (int ns = 0; ns < statp->nscount; ns++) {
             if (!usable_servers[ns]) continue;
-            struct sockaddr* nsap;
             int nsaplen;
             time_t now = 0;
             int delay = 0;
             *rcode = RCODE_INTERNAL_ERROR;
-            nsap = get_nsaddr(statp, (size_t) ns);
+            const sockaddr* nsap = get_nsaddr(statp, ns);
             nsaplen = get_salen(nsap);
 
         same_ns:
@@ -539,7 +540,7 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
                                        Slice(ans, anssiz), rcode, &fallback);
                 if (resplen > 0) {
                     if (cache_status == RESOLV_CACHE_NOTFOUND) {
-                        _resolv_cache_add(statp->netid, buf, buflen, ans, resplen);
+                        resolv_cache_add(statp->netid, buf, buflen, ans, resplen);
                     }
                     return resplen;
                 }
@@ -550,13 +551,16 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
                 }
             }
 
-            [[maybe_unused]] static const int niflags = NI_NUMERICHOST | NI_NUMERICSERV;
-            [[maybe_unused]] char abuf[NI_MAXHOST];
+            static const int niflags = NI_NUMERICHOST | NI_NUMERICSERV;
+            char abuf[NI_MAXHOST];
+            DnsQueryEvent* dnsQueryEvent = addDnsQueryEvent(statp->event);
+            dnsQueryEvent->set_cache_hit(static_cast<CacheStatus>(cache_status));
 
             if (getnameinfo(nsap, (socklen_t)nsaplen, abuf, sizeof(abuf), NULL, 0, niflags) == 0)
                 LOG(DEBUG) << __func__ << ": Querying server (# " << ns + 1
                            << ") address = " << abuf;
 
+            Stopwatch query_stopwatch;
             if (v_circuit) {
                 /* Use VC; at most one attempt per server. */
                 bool shouldRecordStats = (attempt == 0);
@@ -564,6 +568,15 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
 
                 n = send_vc(statp, &params, buf, buflen, ans, anssiz, &terrno, ns, &now, rcode,
                             &delay);
+
+                dnsQueryEvent->set_latency_micros(
+                        saturate_cast<int32_t>(query_stopwatch.timeTakenUs()));
+                dnsQueryEvent->set_dns_server_index(ns);
+                dnsQueryEvent->set_ip_version(ipFamilyToIPVersion(nsap->sa_family));
+                dnsQueryEvent->set_retry_times(attempt);
+                dnsQueryEvent->set_rcode(static_cast<NsRcode>(*rcode));
+                dnsQueryEvent->set_protocol(PROTO_TCP);
+                dnsQueryEvent->set_type(getQueryType(buf, buflen));
 
                 /*
                  * Only record stats the first time we try a query. This ensures that
@@ -593,6 +606,15 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
                 n = send_dg(statp, &params, buf, buflen, ans, anssiz, &terrno, ns, &v_circuit,
                             &gotsomewhere, &now, rcode, &delay);
 
+                dnsQueryEvent->set_latency_micros(
+                        saturate_cast<int32_t>(query_stopwatch.timeTakenUs()));
+                dnsQueryEvent->set_dns_server_index(ns);
+                dnsQueryEvent->set_ip_version(ipFamilyToIPVersion(nsap->sa_family));
+                dnsQueryEvent->set_retry_times(attempt);
+                dnsQueryEvent->set_rcode(static_cast<NsRcode>(*rcode));
+                dnsQueryEvent->set_protocol(PROTO_UDP);
+                dnsQueryEvent->set_type(getQueryType(buf, buflen));
+
                 /* Only record stats the first time we try a query. See above. */
                 if (attempt == 0) {
                     res_sample sample;
@@ -617,17 +639,9 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
             res_pquery(ans, (resplen > anssiz) ? anssiz : resplen);
 
             if (cache_status == RESOLV_CACHE_NOTFOUND) {
-                _resolv_cache_add(statp->netid, buf, buflen, ans, resplen);
+                resolv_cache_add(statp->netid, buf, buflen, ans, resplen);
             }
-            /*
-             * If we have temporarily opened a virtual circuit,
-             * or if we haven't been asked to keep a socket open,
-             * close the socket.
-             */
-            if ((v_circuit && (statp->options & RES_USEVC) == 0U) ||
-                (statp->options & RES_STAYOPEN) == 0U) {
-                res_nclose(statp);
-            }
+            res_nclose(statp);
             return (resplen);
         next_ns:;
         }  // for each ns
@@ -750,34 +764,36 @@ same_ns:
                 case EPROTONOSUPPORT:
                 case EPFNOSUPPORT:
                 case EAFNOSUPPORT:
-                    Perror(statp, "socket(vc)", errno);
+                    PLOG(DEBUG) << __func__ << ": socket(vc): ";
                     return 0;
                 default:
                     *terrno = errno;
-                    Perror(statp, "socket(vc)", errno);
+                    PLOG(DEBUG) << __func__ << ": socket(vc): ";
                     return -1;
             }
         }
-        fchown(statp->_vcsock, AID_DNS, -1);
+        if (fchown(statp->_vcsock, statp->uid, -1) == -1) {
+            PLOG(WARNING) << __func__ << ": Failed to chown socket";
+        }
         if (statp->_mark != MARK_UNSET) {
             if (setsockopt(statp->_vcsock, SOL_SOCKET, SO_MARK, &statp->_mark,
                            sizeof(statp->_mark)) < 0) {
                 *terrno = errno;
-                Perror(statp, "setsockopt", errno);
+                PLOG(DEBUG) << __func__ << ": setsockopt: ";
                 return -1;
             }
         }
         errno = 0;
         if (random_bind(statp->_vcsock, nsap->sa_family) < 0) {
             *terrno = errno;
-            Aerror(statp, "bind/vc", errno, nsap, nsaplen);
+            dump_error("bind/vc", nsap, nsaplen);
             res_nclose(statp);
             return (0);
         }
         if (connect_with_timeout(statp->_vcsock, nsap, (socklen_t) nsaplen,
                                  get_timeout(statp, params, ns)) < 0) {
             *terrno = errno;
-            Aerror(statp, "connect/vc", errno, nsap, nsaplen);
+            dump_error("connect/vc", nsap, nsaplen);
             res_nclose(statp);
             /*
              * The way connect_with_timeout() is implemented prevents us from reliably
@@ -801,7 +817,7 @@ same_ns:
     iov[1] = evConsIovec((void*) buf, (size_t) buflen);
     if (writev(statp->_vcsock, iov, 2) != (INT16SZ + buflen)) {
         *terrno = errno;
-        Perror(statp, "write failed", errno);
+        PLOG(DEBUG) << __func__ << ": write failed: ";
         res_nclose(statp);
         return (0);
     }
@@ -817,7 +833,7 @@ read_len:
     }
     if (n <= 0) {
         *terrno = errno;
-        Perror(statp, "read failed", errno);
+        PLOG(DEBUG) << __func__ << ": read failed: ";
         res_nclose(statp);
         /*
          * A long running process might get its TCP
@@ -859,7 +875,7 @@ read_len:
     }
     if (n <= 0) {
         *terrno = errno;
-        Perror(statp, "read(vc)", errno);
+        PLOG(DEBUG) << __func__ << ": read(vc): ";
         res_nclose(statp);
         return (0);
     }
@@ -992,16 +1008,18 @@ static int send_dg(res_state statp, res_params* params, const u_char* buf, int b
                 case EPROTONOSUPPORT:
                 case EPFNOSUPPORT:
                 case EAFNOSUPPORT:
-                    Perror(statp, "socket(dg)", errno);
+                    PLOG(DEBUG) << __func__ << ": socket(dg): ";
                     return (0);
                 default:
                     *terrno = errno;
-                    Perror(statp, "socket(dg)", errno);
+                    PLOG(DEBUG) << __func__ << ": socket(dg): ";
                     return (-1);
             }
         }
 
-        fchown(statp->_u._ext.nssocks[ns], AID_DNS, -1);
+        if (fchown(statp->_u._ext.nssocks[ns], statp->uid, -1) == -1) {
+            PLOG(WARNING) << __func__ << ": Failed to chown socket";
+        }
         if (statp->_mark != MARK_UNSET) {
             if (setsockopt(statp->_u._ext.nssocks[ns], SOL_SOCKET, SO_MARK, &(statp->_mark),
                            sizeof(statp->_mark)) < 0) {
@@ -1022,12 +1040,12 @@ static int send_dg(res_state statp, res_params* params, const u_char* buf, int b
          * the absence of a nameserver without timing out.
          */
         if (random_bind(statp->_u._ext.nssocks[ns], nsap->sa_family) < 0) {
-            Aerror(statp, "bind(dg)", errno, nsap, nsaplen);
+            dump_error("bind(dg)", nsap, nsaplen);
             res_nclose(statp);
             return (0);
         }
         if (connect(statp->_u._ext.nssocks[ns], nsap, (socklen_t) nsaplen) < 0) {
-            Aerror(statp, "connect(dg)", errno, nsap, nsaplen);
+            dump_error("connect(dg)", nsap, nsaplen);
             res_nclose(statp);
             return (0);
         }
@@ -1037,13 +1055,13 @@ static int send_dg(res_state statp, res_params* params, const u_char* buf, int b
     s = statp->_u._ext.nssocks[ns];
 #ifndef CANNOT_CONNECT_DGRAM
     if (send(s, (const char*) buf, (size_t) buflen, 0) != buflen) {
-        Perror(statp, "send", errno);
+        PLOG(DEBUG) << __func__ << ": send: ";
         res_nclose(statp);
         return 0;
     }
 #else  /* !CANNOT_CONNECT_DGRAM */
     if (sendto(s, (const char*) buf, buflen, 0, nsap, nsaplen) != buflen) {
-        Aerror(statp, "sendto", errno, nsap, nsaplen);
+        dump_error("sendto", nsap, nsaplen);
         res_nclose(statp);
         return 0;
     }
@@ -1063,7 +1081,7 @@ retry:
         return 0;
     }
     if (n < 0) {
-        Perror(statp, "poll", errno);
+        PLOG(DEBUG) << __func__ << ": poll: ";
         res_nclose(statp);
         return 0;
     }
@@ -1072,7 +1090,7 @@ retry:
     resplen = recvfrom(s, (char*) ans, (size_t) anssiz, 0, (struct sockaddr*) (void*) &from,
                        &fromlen);
     if (resplen <= 0) {
-        Perror(statp, "recvfrom", errno);
+        PLOG(DEBUG) << __func__ << ": recvfrom: ";
         res_nclose(statp);
         return 0;
     }
@@ -1096,8 +1114,7 @@ retry:
         res_pquery(ans, (resplen > anssiz) ? anssiz : resplen);
         goto retry;
     }
-    if (!(statp->options & RES_INSECURE1) &&
-        !res_ourserver_p(statp, (struct sockaddr*) (void*) &from)) {
+    if (!res_ourserver_p(statp, (struct sockaddr*)(void*)&from)) {
         /*
          * response from wrong server? ignore it.
          * XXX - potential security hazard could
@@ -1120,8 +1137,7 @@ retry:
         res_nclose(statp);
         return 0;
     }
-    if (!(statp->options & RES_INSECURE2) &&
-        !res_queriesmatch(buf, buf + buflen, ans, ans + anssiz)) {
+    if (!res_queriesmatch(buf, buf + buflen, ans, ans + anssiz)) {
         /*
          * response contains wrong query? ignore it.
          * XXX - potential security hazard could
@@ -1140,7 +1156,7 @@ retry:
         *rcode = anhp->rcode;
         return 0;
     }
-    if (!(statp->options & RES_IGNTC) && anhp->tc) {
+    if (anhp->tc) {
         /*
          * To get the rest of answer,
          * use TCP with same server.
@@ -1160,31 +1176,20 @@ retry:
     return resplen;
 }
 
-static void Aerror(const res_state statp, const char* string, int error,
-                   const struct sockaddr* address, int alen) {
-    const int save = errno;
+static void dump_error(const char* str, const struct sockaddr* address, int alen) {
     char hbuf[NI_MAXHOST];
     char sbuf[NI_MAXSERV];
     constexpr int niflags = NI_NUMERICHOST | NI_NUMERICSERV;
 
-    if ((statp->options & RES_DEBUG) != 0U) {
-        if (getnameinfo(address, (socklen_t) alen, hbuf, sizeof(hbuf), sbuf, sizeof(sbuf),
-                        niflags)) {
-            strncpy(hbuf, "?", sizeof(hbuf) - 1);
-            hbuf[sizeof(hbuf) - 1] = '\0';
-            strncpy(sbuf, "?", sizeof(sbuf) - 1);
-            sbuf[sizeof(sbuf) - 1] = '\0';
-        }
-        LOG(DEBUG) << __func__ << ": " << string << " ([" << hbuf << "]." << sbuf
-                   << "): " << strerror(error);
-    }
-    errno = save;
-}
+    if (!WOULD_LOG(DEBUG)) return;
 
-static void Perror(const res_state statp, const char* string, int error) {
-    if ((statp->options & RES_DEBUG) != 0U) {
-        LOG(DEBUG) << __func__ << ": " << string << ": " << strerror(error);
+    if (getnameinfo(address, (socklen_t)alen, hbuf, sizeof(hbuf), sbuf, sizeof(sbuf), niflags)) {
+        strncpy(hbuf, "?", sizeof(hbuf) - 1);
+        hbuf[sizeof(hbuf) - 1] = '\0';
+        strncpy(sbuf, "?", sizeof(sbuf) - 1);
+        sbuf[sizeof(sbuf) - 1] = '\0';
     }
+    PLOG(DEBUG) << __func__ << ": " << str << " ([" << hbuf << "]." << sbuf << "): ";
 }
 
 static int sock_eq(struct sockaddr* a, struct sockaddr* b) {
@@ -1214,9 +1219,9 @@ static int res_tls_send(res_state statp, const Slice query, const Slice answer, 
                         bool* fallback) {
     int resplen = 0;
     const unsigned netId = statp->netid;
-    const unsigned mark = statp->_mark;
 
     PrivateDnsStatus privateDnsStatus = gPrivateDnsConfiguration.getStatus(netId);
+    statp->event->set_private_dns_modes(static_cast<PrivateDnsModes>(privateDnsStatus.mode));
 
     if (privateDnsStatus.mode == PrivateDnsMode::OFF) {
         *fallback = true;
@@ -1255,7 +1260,7 @@ static int res_tls_send(res_state statp, const Slice query, const Slice answer, 
 
     LOG(INFO) << __func__ << ": performing query over TLS";
 
-    const auto response = sDnsTlsDispatcher.query(privateDnsStatus.validatedServers, mark, query,
+    const auto response = sDnsTlsDispatcher.query(privateDnsStatus.validatedServers, statp, query,
                                                   answer, &resplen);
 
     LOG(INFO) << __func__ << ": TLS query result: " << static_cast<int>(response);
@@ -1297,9 +1302,11 @@ static int res_tls_send(res_state statp, const Slice query, const Slice answer, 
 }
 
 int resolv_res_nsend(const android_net_context* netContext, const uint8_t* msg, int msgLen,
-                     uint8_t* ans, int ansLen, int* rcode, uint32_t flags) {
+                     uint8_t* ans, int ansLen, int* rcode, uint32_t flags,
+                     NetworkDnsEventReported* event) {
+    assert(event != nullptr);
     res_state res = res_get_state();
-    res_setnetcontext(res, netContext);
+    res_setnetcontext(res, netContext, event);
     _resolv_populate_res_for_net(res);
     *rcode = NOERROR;
     return res_nsend(res, msg, msgLen, ans, ansLen, rcode, flags);

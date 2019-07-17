@@ -51,6 +51,8 @@
  * --Copyright--
  */
 
+#include "gethnamaddr.h"
+
 #include <android-base/logging.h>
 #include <arpa/inet.h>
 #include <arpa/nameser.h>
@@ -75,6 +77,9 @@
 #include "netd_resolv/resolv.h"
 #include "resolv_cache.h"
 #include "resolv_private.h"
+#include "stats.pb.h"
+
+using android::net::NetworkDnsEventReported;
 
 // NetBSD uses _DIAGASSERT to null-check arguments and the like,
 // but it's clear from the number of mistakes in their assertions
@@ -86,7 +91,7 @@
 #define ALIGNBYTES (sizeof(uintptr_t) - 1)
 #define ALIGN(p) (((uintptr_t)(p) + ALIGNBYTES) & ~ALIGNBYTES)
 
-#define maybe_ok(res, nm, ok) (((res)->options & RES_NOCHECKNAME) != 0U || (ok)(nm) != 0)
+#define maybe_ok(res, nm, ok) ((ok)(nm) != 0)
 #define maybe_hnok(res, hn) maybe_ok((res), (hn), res_hnok)
 #define maybe_dnok(res, dn) maybe_ok((res), (dn), res_dnok)
 
@@ -107,25 +112,27 @@ static struct hostent* getanswer(const querybuf*, int, const char*, int, res_sta
 static void convert_v4v6_hostent(struct hostent* hp, char** bpp, char* ep,
                                  std::function<void(struct hostent* hp)> mapping_param,
                                  std::function<void(char* src, char* dst)> mapping_addr);
-static void map_v4v6_address(const char*, char*);
-static void map_v4v6_hostent(struct hostent*, char**, char*);
 static void pad_v4v6_hostent(struct hostent* hp, char** bpp, char* ep);
 static void addrsort(char**, int, res_state);
 
 static int dns_gethtbyaddr(const unsigned char* uaddr, int len, int af,
-                           const android_net_context* netcontext, getnamaddr* info);
+                           const android_net_context* netcontext, getnamaddr* info,
+                           NetworkDnsEventReported* event);
 static int dns_gethtbyname(const char* name, int af, getnamaddr* info);
 
 static int gethostbyname_internal(const char* name, int af, res_state res, hostent* hp, char* hbuf,
-                                  size_t hbuflen, const android_net_context* netcontext);
-static int gethostbyname_internal_real(const char* name, int af, res_state res, hostent* hp,
-                                       char* buf, size_t buflen);
+                                  size_t hbuflen, const android_net_context* netcontext,
+                                  NetworkDnsEventReported* event);
+static int gethostbyname_internal_real(const char* name, int af, hostent* hp, char* buf,
+                                       size_t buflen);
+
 static int android_gethostbyaddrfornetcontext_proxy_internal(const void*, socklen_t, int,
                                                              struct hostent*, char*, size_t,
-                                                             const struct android_net_context*);
+                                                             const struct android_net_context*,
+                                                             NetworkDnsEventReported* event);
 static int android_gethostbyaddrfornetcontext_proxy(const void* addr, socklen_t len, int af,
                                                     const struct android_net_context* netcontext,
-                                                    hostent** hp);
+                                                    hostent** hp, NetworkDnsEventReported* event);
 
 #define BOUNDED_INCR(x)      \
     do {                     \
@@ -376,7 +383,6 @@ static struct hostent* getanswer(const querybuf* answer, int anslen, const char*
             hent->h_name = bp;
             bp += n;
         }
-        if (res->options & RES_USE_INET6) map_v4v6_hostent(hent, &bp, ep);
         if (hent->h_addrtype == AF_INET) pad_v4v6_hostent(hent, &bp, ep);
         goto success;
     }
@@ -405,8 +411,8 @@ nospc:
     return NULL;
 }
 
-static int gethostbyname_internal_real(const char* name, int af, res_state res, hostent* hp,
-                                       char* buf, size_t buflen) {
+static int gethostbyname_internal_real(const char* name, int af, hostent* hp, char* buf,
+                                       size_t buflen) {
     getnamaddr info;
     size_t size;
 
@@ -485,20 +491,21 @@ fake:
     buf += size;
     buflen -= size;
     HENT_SCOPY(hp->h_name, name, buf, buflen);
-    if (res->options & RES_USE_INET6) map_v4v6_hostent(hp, &buf, buf + buflen);
     return 0;
 }
 
 // very similar in proxy-ness to android_getaddrinfo_proxy
 static int gethostbyname_internal(const char* name, int af, res_state res, hostent* hp, char* hbuf,
-                                  size_t hbuflen, const android_net_context* netcontext) {
-    res_setnetcontext(res, netcontext);
-    return gethostbyname_internal_real(name, af, res, hp, hbuf, hbuflen);
+                                  size_t hbuflen, const android_net_context* netcontext,
+                                  NetworkDnsEventReported* event) {
+    res_setnetcontext(res, netcontext, event);
+    return gethostbyname_internal_real(name, af, hp, hbuf, hbuflen);
 }
 
 static int android_gethostbyaddrfornetcontext_real(const void* addr, socklen_t len, int af,
                                                    struct hostent* hp, char* buf, size_t buflen,
-                                                   const struct android_net_context* netcontext) {
+                                                   const struct android_net_context* netcontext,
+                                                   NetworkDnsEventReported* event) {
     const u_char* uaddr = (const u_char*) addr;
     socklen_t size;
     struct getnamaddr info;
@@ -540,7 +547,7 @@ static int android_gethostbyaddrfornetcontext_real(const void* addr, socklen_t l
     info.buf = buf;
     info.buflen = buflen;
     if (_hf_gethtbyaddr(uaddr, len, af, &info)) {
-        int error = dns_gethtbyaddr(uaddr, len, af, netcontext, &info);
+        int error = dns_gethtbyaddr(uaddr, len, af, netcontext, &info, event);
         if (error != 0) return error;
     }
     return 0;
@@ -548,8 +555,9 @@ static int android_gethostbyaddrfornetcontext_real(const void* addr, socklen_t l
 
 static int android_gethostbyaddrfornetcontext_proxy_internal(
         const void* addr, socklen_t len, int af, struct hostent* hp, char* hbuf, size_t hbuflen,
-        const struct android_net_context* netcontext) {
-    return android_gethostbyaddrfornetcontext_real(addr, len, af, hp, hbuf, hbuflen, netcontext);
+        const struct android_net_context* netcontext, NetworkDnsEventReported* event) {
+    return android_gethostbyaddrfornetcontext_real(addr, len, af, hp, hbuf, hbuflen, netcontext,
+                                                   event);
 }
 
 // TODO: Consider leaving function without returning error code as _gethtent() does because
@@ -602,14 +610,8 @@ struct hostent* netbsd_gethostent_r(FILE* hf, struct hostent* hent, char* buf, s
 
             res_state res = res_get_state();
             if (res == NULL) goto nospc;
-            if (res->options & RES_USE_INET6) {
-                map_v4v6_address(buf, buf);
-                af = AF_INET6;
-                len = NS_IN6ADDRSZ;
-            } else {
-                af = AF_INET;
-                len = NS_INADDRSZ;
-            }
+            af = AF_INET;
+            len = NS_INADDRSZ;
         }
 
         /* if this is not something we're looking for, skip it. */
@@ -654,23 +656,6 @@ nospc:
     return NULL;
 }
 
-static void map_v4v6_address(const char* src, char* dst) {
-    u_char* p = (u_char*) dst;
-    char tmp[NS_INADDRSZ];
-    int i;
-
-    _DIAGASSERT(src != NULL);
-    _DIAGASSERT(dst != NULL);
-
-    /* Stash a temporary copy so our caller can update in place. */
-    memcpy(tmp, src, NS_INADDRSZ);
-    /* Mark this ipv6 addr as a mapped ipv4. */
-    for (i = 0; i < 10; i++) *p++ = 0x00;
-    *p++ = 0xff;
-    *p++ = 0xff;
-    /* Retrieve the saved copy and we're done. */
-    memcpy(p, tmp, NS_INADDRSZ);
-}
 
 static void convert_v4v6_hostent(struct hostent* hp, char** bpp, char* ep,
                                  std::function<void(struct hostent* hp)> map_param,
@@ -694,15 +679,6 @@ static void convert_v4v6_hostent(struct hostent* hp, char** bpp, char* ep,
         *ap = *bpp;
         *bpp += NS_IN6ADDRSZ;
     }
-}
-
-static void map_v4v6_hostent(struct hostent* hp, char** bpp, char* ep) {
-    convert_v4v6_hostent(hp, bpp, ep,
-                         [](struct hostent* hp) {
-                             hp->h_addrtype = AF_INET6;
-                             hp->h_length = NS_IN6ADDRSZ;
-                         },
-                         [](char* src, char* dst) { map_v4v6_address(src, dst); });
 }
 
 /* Reserve space for mapping IPv4 address to IPv6 address in place */
@@ -792,7 +768,8 @@ static int dns_gethtbyname(const char* name, int addr_type, getnamaddr* info) {
 }
 
 static int dns_gethtbyaddr(const unsigned char* uaddr, int len, int af,
-                           const android_net_context* netcontext, getnamaddr* info) {
+                           const android_net_context* netcontext, getnamaddr* info,
+                           NetworkDnsEventReported* event) {
     char qbuf[MAXDNAME + 1], *qp, *ep;
     int n;
     int advance;
@@ -839,7 +816,7 @@ static int dns_gethtbyaddr(const unsigned char* uaddr, int len, int af,
     res_state res = res_get_state();
     if (!res) return EAI_MEMORY;
 
-    res_setnetcontext(res, netcontext);
+    res_setnetcontext(res, netcontext, event);
     int he;
     n = res_nquery(res, qbuf, C_IN, T_PTR, buf->buf, (int)sizeof(buf->buf), &he);
     if (n < 0) {
@@ -858,12 +835,6 @@ static int dns_gethtbyaddr(const unsigned char* uaddr, int len, int af,
     hp->h_addr_list[0] = bf;
     hp->h_addr_list[1] = NULL;
     memcpy(bf, uaddr, (size_t) info->hp->h_length);
-    if (info->hp->h_addrtype == AF_INET && (res->options & RES_USE_INET6)) {
-        if (blen + NS_IN6ADDRSZ > info->buflen) goto nospc;
-        map_v4v6_address(bf, bf);
-        hp->h_addrtype = AF_INET6;
-        hp->h_length = NS_IN6ADDRSZ;
-    }
 
     /* Reserve enough space for mapping IPv4 address to IPv6 address in place */
     if (info->hp->h_addrtype == AF_INET) {
@@ -883,13 +854,16 @@ nospc:
  */
 
 int android_gethostbynamefornetcontext(const char* name, int af,
-                                       const struct android_net_context* netcontext, hostent** hp) {
-    int error;
+                                       const struct android_net_context* netcontext, hostent** hp,
+                                       NetworkDnsEventReported* event) {
+    assert(event != nullptr);
+
     res_state res = res_get_state();
     if (res == NULL) return EAI_MEMORY;
     res_static* rs = res_get_static();  // For thread-safety.
+    int error;
     error = gethostbyname_internal(name, af, res, &rs->host, rs->hostbuf, sizeof(rs->hostbuf),
-                                   netcontext);
+                                   netcontext, event);
     if (error == 0) {
         *hp = &rs->host;
     }
@@ -897,16 +871,19 @@ int android_gethostbynamefornetcontext(const char* name, int af,
 }
 
 int android_gethostbyaddrfornetcontext(const void* addr, socklen_t len, int af,
-                                       const struct android_net_context* netcontext, hostent** hp) {
-    return android_gethostbyaddrfornetcontext_proxy(addr, len, af, netcontext, hp);
+                                       const struct android_net_context* netcontext, hostent** hp,
+                                       NetworkDnsEventReported* event) {
+    return android_gethostbyaddrfornetcontext_proxy(addr, len, af, netcontext, hp, event);
 }
 
 static int android_gethostbyaddrfornetcontext_proxy(const void* addr, socklen_t len, int af,
                                                     const struct android_net_context* netcontext,
-                                                    hostent** hp) {
+                                                    hostent** hp, NetworkDnsEventReported* event) {
+    assert(event != nullptr);
+
     struct res_static* rs = res_get_static();  // For thread-safety.
     int error = android_gethostbyaddrfornetcontext_proxy_internal(
-            addr, len, af, &rs->host, rs->hostbuf, sizeof(rs->hostbuf), netcontext);
+            addr, len, af, &rs->host, rs->hostbuf, sizeof(rs->hostbuf), netcontext, event);
     if (error == 0) *hp = &rs->host;
     return error;
 }

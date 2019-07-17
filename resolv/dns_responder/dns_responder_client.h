@@ -7,7 +7,7 @@
  *
  *      http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless requied by applicable law or agreed to in writing, software
+ * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
@@ -22,15 +22,8 @@
 #include <string>
 #include <vector>
 
-#include <cutils/sockets.h>
-
-#include <private/android_filesystem_config.h>
-#include <utils/StrongPointer.h>
-
-#include "NetdClient.h"
 #include "android/net/IDnsResolver.h"
 #include "android/net/INetd.h"
-#include "binder/IServiceManager.h"
 #include "dns_responder.h"
 
 inline const std::vector<std::string> kDefaultServers = {"127.0.0.3"};

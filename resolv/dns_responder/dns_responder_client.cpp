@@ -15,10 +15,14 @@
  */
 
 #define LOG_TAG "dns_responder_client"
+
 #include "dns_responder_client.h"
 
+#include <android-base/logging.h>
 #include <android-base/stringprintf.h>
-#include <utils/Log.h>
+
+#include "NetdClient.h"
+#include "binder/IServiceManager.h"
 
 // TODO: make this dynamic and stop depending on implementation details.
 #define TEST_OEM_NETWORK "oem29"
@@ -96,7 +100,7 @@ bool DnsResponderClient::SetResolversWithTls(const std::vector<std::string>& ser
     const auto& resolverParams = makeResolverParamsParcel(TEST_NETID, params, servers, domains,
                                                           name, tlsServers, fingerprints);
     const auto rv = mDnsResolvSrv->setResolverConfiguration(resolverParams);
-    if (!rv.isOk()) ALOGI("SetResolversWithTls() -> %s", rv.toString8().c_str());
+    if (!rv.isOk()) LOG(ERROR) << "SetResolversWithTls() -> " << rv.toString8();
     return rv.isOk();
 }
 
@@ -110,7 +114,7 @@ void DnsResponderClient::SetupDNSServers(unsigned num_servers, const std::vector
         auto& server = (*servers)[i];
         auto& d = (*dns)[i];
         server = StringPrintf("127.0.0.%u", i + 100);
-        d = std::make_unique<test::DNSResponder>(server, listen_srv, 250, ns_rcode::ns_r_servfail);
+        d = std::make_unique<test::DNSResponder>(server, listen_srv, ns_rcode::ns_r_servfail);
         for (const auto& mapping : mappings) {
             d->addMapping(mapping.entry.c_str(), ns_type::ns_t_a, mapping.ip4.c_str());
             d->addMapping(mapping.entry.c_str(), ns_type::ns_t_aaaa, mapping.ip6.c_str());
@@ -152,6 +156,9 @@ void DnsResponderClient::SetUp() {
     // binder setup
     auto binder = android::defaultServiceManager()->getService(android::String16("netd"));
     mNetdSrv = android::interface_cast<android::net::INetd>(binder);
+    if (mNetdSrv == nullptr) {
+        LOG(FATAL) << "Can't connect to service 'netd'. Missing root privileges? uid=" << getuid();
+    }
 
     auto resolvBinder =
             android::defaultServiceManager()->getService(android::String16("dnsresolver"));

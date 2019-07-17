@@ -3,6 +3,16 @@ cc_library_headers {
     export_include_dirs: ["include"],
 }
 
+//For the test to use
+//TODO: 1. Need to Refactor ResolverStats related code(ex: ResolverController::getDnsInfo).
+//         Then removing this library header file.
+//      2. Change the imports path in netd/TEST_MAPPING after migrating from
+//         system/netd/resolv to packages/modules/resolv.
+cc_library_headers {
+    name: "libnetd_resolv_internal_headers",
+    export_include_dirs: ["."],
+}
+
 aidl_interface {
     name: "dnsresolver_aidl_interface",
     local_include_dir: "binder",
@@ -22,23 +32,6 @@ aidl_interface {
     versions: [
         "1",
         "2",
-    ],
-}
-
-cc_test_library {
-    name: "libnetd_test_metrics_listener",
-    defaults: ["netd_defaults"],
-    srcs: [
-        "tests/BaseTestMetricsListener.cpp",
-        "tests/TestMetrics.cpp",
-    ],
-    include_dirs: [
-        "system/netd/include",
-    ],
-    shared_libs: [
-        "libbinder",
-        "libutils",
-        "netd_event_listener_interface-V1-cpp",
     ],
 }
 
@@ -77,29 +70,28 @@ cc_library {
     // on system ABIs
     stl: "libc++_static",
     static_libs: [
+        "dnsresolver_aidl_interface-V2-ndk_platform",
         "libbase",
         "libcrypto",
         "libcutils",
         "libjsoncpp",
-        "liblog",
+        "liblog", //Used by libstatslog_resolv
         "libnetdutils",
+        "libprotobuf-cpp-lite",
         "libssl",
         "libstatslog_resolv",
         "libstatssocket",
         "libsysutils",
-        "libutils",
+        "libutils",  // Used by libstatslog_resolv
         "netd_event_listener_interface-V1-ndk_platform",
-        "dnsresolver_aidl_interface-V2-ndk_platform",
         "server_configurable_flags",
         "stats_proto",
-        "libprotobuf-cpp-lite",
     ],
     shared_libs: [
         "libbinder_ndk",
     ],
-    include_dirs: [
-        "system/netd/include",
-        "system/netd/server",
+    header_libs: [
+        "libnetd_client_headers",
     ],
     export_include_dirs: ["include"],
     // TODO: pie in the sky: make this code clang-tidy clean
@@ -151,30 +143,30 @@ cc_library_static {
     export_generated_headers: ["statslog_resolv.h"],
     static_libs: [
         "libcutils",
-        "liblog",
         "libstatssocket",
-        "libutils",
     ],
 }
 
 cc_test {
     name: "resolv_integration_test",
     test_suites: ["device-tests"],
+    require_root: true,
     defaults: ["netd_defaults"],
+    tidy: false,  // cuts test build time by > 1m30s
     srcs: [
         "dns_responder/dns_responder.cpp",
-        "resolver_test.cpp",
         "dnsresolver_binder_test.cpp",
+        "resolver_test.cpp",
+        "tests/resolv_test_utils.cpp",
     ],
-    include_dirs: [
-        "system/netd/resolv/include",
-        "system/netd/server",
+    header_libs: [
+        "libnetd_resolv_headers",
     ],
     shared_libs: [
+        "libbpf_android",
         "libbase",
         "libbinder",
         "libcrypto",
-        "liblog",
         "libnetd_client",
         "libssl",
         "libutils",
@@ -184,7 +176,7 @@ cc_test {
         "libnetd_test_dnsresponder",
         "libnetd_test_metrics_listener",
         "libnetd_test_tun_interface",
-        "liblogwrap",
+        "libnetd_test_utils",
         "libnetdutils",
         "netd_aidl_interface-V2-cpp",
         "netd_event_listener_interface-V1-cpp",
@@ -200,21 +192,25 @@ cc_test {
 cc_test {
     name: "resolv_unit_test",
     test_suites: ["device-tests"],
+    require_root: true,
+    //TODO:  drop root privileges and make it be an real unit test.
     defaults: ["netd_defaults"],
     srcs: [
         "dns_tls_test.cpp",
         "libnetd_resolv_test.cpp",
+        "res_cache_test.cpp",
     ],
     shared_libs: [
         "libbase",
         "libcrypto",
-        "liblog",
         "libssl",
     ],
     static_libs: [
         "libnetd_resolv",
         "libnetd_test_dnsresponder",
         "libnetdutils",
+        "libprotobuf-cpp-lite",
         "server_configurable_flags",
+        "stats_proto",
     ],
 }

@@ -7,7 +7,7 @@
  *
  *      http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless requied by applicable law or agreed to in writing, software
+ * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
@@ -33,13 +33,81 @@
 
 namespace test {
 
-struct DNSHeader;
-struct DNSQuestion;
-struct DNSRecord;
+struct DNSName {
+    std::string name;
+    const char* read(const char* buffer, const char* buffer_end);
+    char* write(char* buffer, const char* buffer_end) const;
+
+  private:
+    const char* parseField(const char* buffer, const char* buffer_end, bool* last);
+};
+
+struct DNSQuestion {
+    DNSName qname;
+    unsigned qtype;
+    unsigned qclass;
+    const char* read(const char* buffer, const char* buffer_end);
+    char* write(char* buffer, const char* buffer_end) const;
+    std::string toString() const;
+};
+
+struct DNSRecord {
+    DNSName name;
+    unsigned rtype;
+    unsigned rclass;
+    unsigned ttl;
+    std::vector<char> rdata;
+    const char* read(const char* buffer, const char* buffer_end);
+    char* write(char* buffer, const char* buffer_end) const;
+    std::string toString() const;
+
+  private:
+    struct IntFields {
+        uint16_t rtype;
+        uint16_t rclass;
+        uint32_t ttl;
+        uint16_t rdlen;
+    } __attribute__((__packed__));
+
+    const char* readIntFields(const char* buffer, const char* buffer_end, unsigned* rdlen);
+    char* writeIntFields(unsigned rdlen, char* buffer, const char* buffer_end) const;
+};
+
+struct DNSHeader {
+    unsigned id;
+    bool ra;
+    uint8_t rcode;
+    bool qr;
+    uint8_t opcode;
+    bool aa;
+    bool tr;
+    bool rd;
+    bool ad;
+    std::vector<DNSQuestion> questions;
+    std::vector<DNSRecord> answers;
+    std::vector<DNSRecord> authorities;
+    std::vector<DNSRecord> additionals;
+    const char* read(const char* buffer, const char* buffer_end);
+    char* write(char* buffer, const char* buffer_end) const;
+    std::string toString() const;
+
+  private:
+    struct Header {
+        uint16_t id;
+        uint8_t flags0;
+        uint8_t flags1;
+        uint16_t qdcount;
+        uint16_t ancount;
+        uint16_t nscount;
+        uint16_t arcount;
+    } __attribute__((__packed__));
+
+    const char* readHeader(const char* buffer, const char* buffer_end, unsigned* qdcount,
+                           unsigned* ancount, unsigned* nscount, unsigned* arcount);
+};
 
 inline const std::string kDefaultListenAddr = "127.0.0.3";
 inline const std::string kDefaultListenService = "53";
-inline const int kDefaultPollTimoutMillis = -1;
 
 /*
  * Simple DNS responder, which replies to queries with the registered response
@@ -50,8 +118,11 @@ class DNSResponder {
   public:
     DNSResponder(std::string listen_address = kDefaultListenAddr,
                  std::string listen_service = kDefaultListenService,
-                 int poll_timeout_ms = kDefaultPollTimoutMillis,
                  ns_rcode error_rcode = ns_rcode::ns_r_servfail);
+
+    DNSResponder(ns_rcode error_rcode)
+        : DNSResponder(kDefaultListenAddr, kDefaultListenService, error_rcode){};
+
     ~DNSResponder();
 
     enum class Edns : uint8_t {
@@ -80,6 +151,7 @@ class DNSResponder {
     std::condition_variable& getCv() { return cv; }
     std::mutex& getCvMutex() { return cv_mutex_; }
     void setDeferredResp(bool deferred_resp);
+    static bool fillAnswerRdata(const std::string& rdatastr, DNSRecord& record);
 
   private:
     // Key used for accessing mappings.
@@ -115,8 +187,6 @@ class DNSResponder {
 
     bool addAnswerRecords(const DNSQuestion& question, std::vector<DNSRecord>* answers) const;
 
-    bool fillAnswerRdata(const std::string& rdatastr, DNSRecord& record) const;
-
     bool generateErrorResponse(DNSHeader* header, ns_rcode rcode,
                                char* response, size_t* response_len) const;
     bool makeErrorResponse(DNSHeader* header, ns_rcode rcode, char* response,
@@ -138,8 +208,6 @@ class DNSResponder {
     // Address and service to listen on, currently limited to UDP.
     const std::string listen_address_;
     const std::string listen_service_;
-    // epoll_wait() timeout in ms.
-    const int poll_timeout_ms_;
     // Error code to return for requests for an unknown name.
     const ns_rcode error_rcode_;
     // Probability that a valid response is being sent instead of being sent
