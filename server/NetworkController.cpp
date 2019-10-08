@@ -47,8 +47,7 @@
 
 using android::netdutils::DumpWriter;
 
-namespace android {
-namespace net {
+namespace android::net {
 
 namespace {
 
@@ -67,21 +66,21 @@ const unsigned MAX_NET_ID = 65535;
 // setPermissionForNetworks).
 // TODO: use std::mutex and GUARDED_BY instead of manual inspection.
 class NetworkController::DelegateImpl : public PhysicalNetwork::Delegate {
-public:
+  public:
     explicit DelegateImpl(NetworkController* networkController);
     virtual ~DelegateImpl();
 
-    int modifyFallthrough(unsigned vpnNetId, const std::string& physicalInterface,
-                          Permission permission, bool add) WARN_UNUSED_RESULT;
+    [[nodiscard]] int modifyFallthrough(unsigned vpnNetId, const std::string& physicalInterface,
+                                        Permission permission, bool add);
 
-private:
-    int addFallthrough(const std::string& physicalInterface,
-                       Permission permission) override WARN_UNUSED_RESULT;
-    int removeFallthrough(const std::string& physicalInterface,
-                          Permission permission) override WARN_UNUSED_RESULT;
+  private:
+    [[nodiscard]] int addFallthrough(const std::string& physicalInterface,
+                                     Permission permission) override;
+    [[nodiscard]] int removeFallthrough(const std::string& physicalInterface,
+                                        Permission permission) override;
 
-    int modifyFallthrough(const std::string& physicalInterface, Permission permission,
-                          bool add) WARN_UNUSED_RESULT;
+    [[nodiscard]] int modifyFallthrough(const std::string& physicalInterface, Permission permission,
+                                        bool add);
 
     NetworkController* const mNetworkController;
 };
@@ -234,11 +233,6 @@ uint32_t NetworkController::getNetworkForDnsLocked(unsigned* netId, uid_t uid) c
     }
     fwmark.netId = *netId;
     return fwmark.intValue;
-}
-
-uint32_t NetworkController::getNetworkForDns(unsigned* netId, uid_t uid) const {
-    ScopedRLock lock(mRWLock);
-    return getNetworkForDnsLocked(netId, uid);
 }
 
 // Returns the NetId that a given UID would use if no network is explicitly selected. Specifically,
@@ -850,5 +844,4 @@ void NetworkController::updateTcpSocketMonitorPolling() {
     }
 }
 
-}  // namespace net
-}  // namespace android
+}  // namespace android::net
