@@ -55,7 +55,7 @@ static void resolvStubInitFunction(void* handle, const char* symbol, FunctionTyp
 }
 
 int resolv_stub_init() {
-    void* netdResolvHandle;
+    void* netdResolvHandle = nullptr;
 
     for (const auto& dir : {APEX_LIB64_DIR, APEX_LIB_DIR}) {
         std::string path = std::string(dir) + "/" + LIBNAME;
@@ -76,7 +76,7 @@ int resolv_stub_init() {
 #define RESOLV_STUB_LOAD_SYMBOL(x) resolvStubInitFunction(netdResolvHandle, STR(x), &RESOLV_STUB.x)
     RESOLV_STUB_LOAD_SYMBOL(resolv_has_nameservers);
     RESOLV_STUB_LOAD_SYMBOL(resolv_init);
-    RESOLV_STUB_LOAD_SYMBOL(resolv_gethostbyaddr_from_local_cache);
+    RESOLV_STUB_LOAD_SYMBOL(resolv_gethostbyaddr_from_cache);
 #undef RESOLV_STUB_LOAD_SYMBOL
 #undef STR
 
