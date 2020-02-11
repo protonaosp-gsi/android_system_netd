@@ -5,7 +5,6 @@ aidl_interface {
     srcs: [
         "binder/android/net/metrics/INetdEventListener.aidl",
     ],
-    api_dir: "aidl/netdeventlistener",
     versions: ["1"],
 }
 
@@ -31,10 +30,12 @@ aidl_interface {
         // AIDL interface that callers can implement to receive networking events from netd.
         "binder/android/net/INetdUnsolicitedEventListener.aidl",
         "binder/android/net/InterfaceConfigurationParcel.aidl",
+        "binder/android/net/MarkMaskParcel.aidl",
+        "binder/android/net/RouteInfoParcel.aidl",
+        "binder/android/net/TetherConfigParcel.aidl",
         "binder/android/net/TetherStatsParcel.aidl",
         "binder/android/net/UidRangeParcel.aidl",
     ],
-    api_dir: "aidl/netd",
     backend: {
         cpp: {
             gen_log: true,
@@ -70,7 +71,6 @@ cc_library_static {
     srcs: [
         "BandwidthController.cpp",
         "ClatdController.cpp",
-        "ClatUtils.cpp",
         "Controllers.cpp",
         "NetdConstants.cpp",
         "FirewallController.cpp",
@@ -81,6 +81,7 @@ cc_library_static {
         "NetlinkCommands.cpp",
         "NetlinkListener.cpp",
         "NetlinkManager.cpp",
+        "OffloadUtils.cpp",
         "RouteController.cpp",
         "SockDiag.cpp",
         "StrictController.cpp",
@@ -102,10 +103,7 @@ cc_library_static {
         "libqtaguid",
         "libssl",
         "netd_aidl_interface-cpp",
-        "netd_event_listener_interface-V1-cpp",
-    ],
-    header_libs: [
-        "libnetd_resolv_headers",
+        "netd_event_listener_interface-cpp",
     ],
     aidl: {
         export_aidl_headers: true,
@@ -133,6 +131,7 @@ cc_binary {
         "libjsoncpp",
         "liblog",
         "libmdnssd",
+        "libnetd_resolv",
         "libnetdbpf",
         "libnetdutils",
         "libnetutils",
@@ -142,15 +141,12 @@ cc_binary {
         "libselinux",
         "libsysutils",
         "libutils",
-        "netd_aidl_interface-cpp",
-        "netd_event_listener_interface-V1-cpp",
+        "netd_aidl_interface-unstable-cpp",
+        "netd_event_listener_interface-cpp",
         "oemnetd_aidl_interface-cpp",
     ],
     static_libs: [
         "libnetd_server",
-    ],
-    header_libs: [
-        "libnetd_resolv_headers",
     ],
     srcs: [
         "DummyNetwork.cpp",
@@ -168,11 +164,16 @@ cc_binary {
         "PhysicalNetwork.cpp",
         "PppController.cpp",
         "Process.cpp",
-        "ResolvStub.cpp",
         "VirtualNetwork.cpp",
         "main.cpp",
         "oem_iptables_hook.cpp",
     ],
+    sanitize: {
+        cfi: true,
+        diag: {
+            cfi: true,
+        },
+    },
 }
 
 cc_binary {
@@ -192,14 +193,20 @@ cc_binary {
         "liblog",
         "libutils",
         "libbinder",
-        "dnsresolver_aidl_interface-V2-cpp",
-        "netd_aidl_interface-V2-cpp",
+        "dnsresolver_aidl_interface-cpp",
+        "netd_aidl_interface-cpp",
     ],
     srcs: [
         "ndc.cpp",
         "UidRanges.cpp",
         "NdcDispatcher.cpp",
     ],
+    sanitize: {
+        cfi: true,
+        diag: {
+            cfi: true,
+        },
+    },
 }
 
 cc_test {
@@ -215,7 +222,6 @@ cc_test {
     srcs: [
         "BandwidthControllerTest.cpp",
         "ClatdControllerTest.cpp",
-        "ClatUtilsTest.cpp",
         "ControllersTest.cpp",
         "FirewallControllerTest.cpp",
         "IdletimerControllerTest.cpp",
@@ -223,6 +229,7 @@ cc_test {
         "IptablesBaseTest.cpp",
         "IptablesRestoreControllerTest.cpp",
         "NFLogListenerTest.cpp",
+        "OffloadUtilsTest.cpp",
         "RouteControllerTest.cpp",
         "SockDiagTest.cpp",
         "StrictControllerTest.cpp",
@@ -236,8 +243,8 @@ cc_test {
         "libnetd_server",
         "libnetd_test_tun_interface",
         "libqtaguid",
-        "netd_aidl_interface-V2-cpp",
-        "netd_event_listener_interface-V1-cpp",
+        "netd_aidl_interface-cpp",
+        "netd_event_listener_interface-cpp",
     ],
     shared_libs: [
         "libbase",

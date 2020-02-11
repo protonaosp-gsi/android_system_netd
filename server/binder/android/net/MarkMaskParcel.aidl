@@ -14,31 +14,16 @@
  * limitations under the License.
  */
 
-#ifndef _CLAT_UTILS_H
-#define _CLAT_UTILS_H
+package android.net;
 
-#include <string>
-
-namespace android {
-namespace net {
-
-int hardwareAddressType(const std::string& interface);
-
-int getClatIngressMapFd(void);
-
-int getClatIngressProgFd(bool with_ethernet_header);
-
-int openNetlinkSocket(void);
-
-int processNetlinkResponse(int fd);
-
-int tcQdiscAddDevClsact(int fd, int ifIndex);
-int tcQdiscReplaceDevClsact(int fd, int ifIndex);
-int tcQdiscDelDevClsact(int fd, int ifIndex);
-
-int tcFilterAddDevBpf(int fd, int ifIndex, int bpfFd, bool ethernet);
-
-}  // namespace net
-}  // namespace android
-
-#endif
+/**
+ * Structure that stores a firewall mark and its mask.
+ *
+ * {@hide}
+ */
+parcelable MarkMaskParcel {
+    // The fwmark.
+    int mark;
+    // Net id mask of fwmark.
+    int mask;
+}

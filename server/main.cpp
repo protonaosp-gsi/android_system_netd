@@ -32,9 +32,9 @@
 
 #include "log/log.h"
 
-#include <android-base/properties.h>
 #include <binder/IPCThreadState.h>
 #include <binder/IServiceManager.h>
+#include <libbpf_android.h>
 #include <netdutils/Stopwatch.h>
 
 #include "Controllers.h"
@@ -48,9 +48,9 @@
 #include "Process.h"
 
 #include "netd_resolv/resolv.h"
-#include "netd_resolv/resolv_stub.h"
 
 using android::IPCThreadState;
+using android::sp;
 using android::status_t;
 using android::String16;
 using android::net::FwmarkServer;
@@ -82,8 +82,12 @@ void logCallback(const char* msg) {
     gLog.info(std::string(msg));
 }
 
-int tagSocketCallback(int sockFd, uint32_t tag, uid_t uid) {
+int tagSocketCallback(int sockFd, uint32_t tag, uid_t uid, pid_t) {
     return gCtls->trafficCtrl.tagSocket(sockFd, tag, uid, geteuid());
+}
+
+bool evaluateDomainNameCallback(const android_net_context&, const char* /*name*/) {
+    return true;
 }
 
 bool initDnsResolver() {
@@ -92,8 +96,9 @@ bool initDnsResolver() {
             .get_network_context = &getNetworkContextCallback,
             .log = &logCallback,
             .tagSocket = &tagSocketCallback,
+            .evaluate_domain_name = &evaluateDomainNameCallback,
     };
-    return RESOLV_STUB.resolv_init(callbacks);
+    return resolv_init(&callbacks);
 }
 
 }  // namespace
@@ -113,14 +118,8 @@ int main() {
         setCloseOnExec(sock);
     }
 
-    // Before we start any threads, populate the resolver stub pointers.
-    resolv_stub_init();
-
     // Make sure BPF programs are loaded before doing anything
-    while (!android::base::WaitForProperty("bpf.progs_loaded", "1",
-           std::chrono::seconds(5))) {
-        ALOGD("netd waited 5s for bpf.progs_loaded, still waiting...");
-    }
+    android::bpf::waitForProgsLoaded();
 
     NetlinkManager *nm = NetlinkManager::Instance();
     if (nm == nullptr) {
@@ -184,10 +183,9 @@ int main() {
 
     android::net::process::ScopedPidFile pidFile(PID_FILE_PATH);
 
-    // Now that netd is ready to process commands, advertise service
-    // availability for HAL clients.
-    NetdHwService mHwSvc;
-    if ((ret = mHwSvc.start()) != android::OK) {
+    // Now that netd is ready to process commands, advertise service availability for HAL clients.
+    sp<NetdHwService> mHwSvc(new NetdHwService());
+    if ((ret = mHwSvc->start()) != android::OK) {
         ALOGE("Unable to start NetdHwService: %d", ret);
         exit(1);
     }
