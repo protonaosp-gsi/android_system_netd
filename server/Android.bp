@@ -6,6 +6,14 @@ aidl_interface {
         "binder/android/net/metrics/INetdEventListener.aidl",
     ],
     versions: ["1"],
+    backend: {
+        ndk: {
+            apex_available: [
+                "//apex_available:platform",
+                "com.android.resolv",
+            ],
+        },
+    },
 }
 
 // These are used in netd_integration_test
@@ -17,6 +25,7 @@ filegroup {
         "InterfaceController.cpp",
         "NetlinkCommands.cpp",
         "NetlinkListener.cpp",
+        "SockDiag.cpp",
         "XfrmController.cpp",
         "TrafficController.cpp",
     ],
@@ -33,6 +42,7 @@ aidl_interface {
         "binder/android/net/MarkMaskParcel.aidl",
         "binder/android/net/RouteInfoParcel.aidl",
         "binder/android/net/TetherConfigParcel.aidl",
+        "binder/android/net/TetherOffloadRuleParcel.aidl",
         "binder/android/net/TetherStatsParcel.aidl",
         "binder/android/net/UidRangeParcel.aidl",
     ],
@@ -40,10 +50,17 @@ aidl_interface {
         cpp: {
             gen_log: true,
         },
+        java: {
+            apex_available: [
+                "//apex_available:platform", // used from services.net
+                "com.android.bluetooth.updatable",
+            ],
+        },
     },
     versions: [
         "1",
         "2",
+        "3",
     ],
 }
 
@@ -147,7 +164,7 @@ cc_binary {
         "libselinux",
         "libsysutils",
         "libutils",
-        "netd_aidl_interface-unstable-cpp",
+        "netd_aidl_interface-cpp",
         "netd_event_listener_interface-cpp",
         "oemnetd_aidl_interface-cpp",
     ],
@@ -243,7 +260,7 @@ cc_test {
         "libnetd_server",
         "libnetd_test_tun_interface",
         "libqtaguid",
-        "netd_aidl_interface-cpp",
+        "netd_aidl_interface-unstable-cpp",
         "netd_event_listener_interface-cpp",
     ],
     shared_libs: [
