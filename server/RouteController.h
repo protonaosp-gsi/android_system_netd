@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-#pragma once
+#ifndef NETD_SERVER_ROUTE_CONTROLLER_H
+#define NETD_SERVER_ROUTE_CONTROLLER_H
 
-#include "NetdConstants.h"  // IptablesTarget
+#include "NetdConstants.h"
 #include "Permission.h"
 
 #include <android-base/thread_annotations.h>
@@ -26,7 +27,8 @@
 #include <map>
 #include <mutex>
 
-namespace android::net {
+namespace android {
+namespace net {
 
 class UidRanges;
 
@@ -44,7 +46,7 @@ public:
 
     static const char* const LOCAL_MANGLE_INPUT;
 
-    [[nodiscard]] static int Init(unsigned localNetId);
+    static int Init(unsigned localNetId) WARN_UNUSED_RESULT;
 
     // Returns an ifindex given the interface name, by looking up in sInterfaceToTable.
     // This is currently only used by NetworkController::addInterfaceToNetwork
@@ -55,56 +57,55 @@ public:
     // used to add them.
     static uint32_t getIfIndex(const char* interface) EXCLUDES(sInterfaceToTableLock);
 
-    [[nodiscard]] static int addInterfaceToLocalNetwork(unsigned netId, const char* interface);
-    [[nodiscard]] static int removeInterfaceFromLocalNetwork(unsigned netId, const char* interface);
+    static int addInterfaceToLocalNetwork(unsigned netId, const char* interface) WARN_UNUSED_RESULT;
+    static int removeInterfaceFromLocalNetwork(unsigned netId,
+                                               const char* interface) WARN_UNUSED_RESULT;
 
-    [[nodiscard]] static int addInterfaceToPhysicalNetwork(unsigned netId, const char* interface,
-                                                           Permission permission);
-    [[nodiscard]] static int removeInterfaceFromPhysicalNetwork(unsigned netId,
-                                                                const char* interface,
-                                                                Permission permission);
+    static int addInterfaceToPhysicalNetwork(unsigned netId, const char* interface,
+                                             Permission permission) WARN_UNUSED_RESULT;
+    static int removeInterfaceFromPhysicalNetwork(unsigned netId, const char* interface,
+                                                  Permission permission) WARN_UNUSED_RESULT;
 
-    [[nodiscard]] static int addInterfaceToVirtualNetwork(unsigned netId, const char* interface,
-                                                          bool secure, const UidRanges& uidRanges);
-    [[nodiscard]] static int removeInterfaceFromVirtualNetwork(unsigned netId,
-                                                               const char* interface, bool secure,
-                                                               const UidRanges& uidRanges);
+    static int addInterfaceToVirtualNetwork(unsigned netId, const char* interface, bool secure,
+                                            const UidRanges& uidRanges) WARN_UNUSED_RESULT;
+    static int removeInterfaceFromVirtualNetwork(unsigned netId, const char* interface, bool secure,
+                                                 const UidRanges& uidRanges) WARN_UNUSED_RESULT;
 
-    [[nodiscard]] static int modifyPhysicalNetworkPermission(unsigned netId, const char* interface,
-                                                             Permission oldPermission,
-                                                             Permission newPermission);
+    static int modifyPhysicalNetworkPermission(unsigned netId, const char* interface,
+                                               Permission oldPermission,
+                                               Permission newPermission) WARN_UNUSED_RESULT;
 
-    [[nodiscard]] static int addUsersToVirtualNetwork(unsigned netId, const char* interface,
-                                                      bool secure, const UidRanges& uidRanges);
-    [[nodiscard]] static int removeUsersFromVirtualNetwork(unsigned netId, const char* interface,
-                                                           bool secure, const UidRanges& uidRanges);
+    static int addUsersToVirtualNetwork(unsigned netId, const char* interface, bool secure,
+                                        const UidRanges& uidRanges) WARN_UNUSED_RESULT;
+    static int removeUsersFromVirtualNetwork(unsigned netId, const char* interface, bool secure,
+                                             const UidRanges& uidRanges) WARN_UNUSED_RESULT;
 
-    [[nodiscard]] static int addUsersToRejectNonSecureNetworkRule(const UidRanges& uidRanges);
-    [[nodiscard]] static int removeUsersFromRejectNonSecureNetworkRule(const UidRanges& uidRanges);
+    static int addUsersToRejectNonSecureNetworkRule(const UidRanges& uidRanges)
+                                                    WARN_UNUSED_RESULT;
+    static int removeUsersFromRejectNonSecureNetworkRule(const UidRanges& uidRanges)
+                                                         WARN_UNUSED_RESULT;
 
-    [[nodiscard]] static int addInterfaceToDefaultNetwork(const char* interface,
-                                                          Permission permission);
-    [[nodiscard]] static int removeInterfaceFromDefaultNetwork(const char* interface,
-                                                               Permission permission);
+    static int addInterfaceToDefaultNetwork(const char* interface,
+                                            Permission permission) WARN_UNUSED_RESULT;
+    static int removeInterfaceFromDefaultNetwork(const char* interface,
+                                                 Permission permission) WARN_UNUSED_RESULT;
 
     // |nexthop| can be NULL (to indicate a directly-connected route), "unreachable" (to indicate a
     // route that's blocked), "throw" (to indicate the lack of a match), or a regular IP address.
-    [[nodiscard]] static int addRoute(const char* interface, const char* destination,
-                                      const char* nexthop, TableType tableType);
-    [[nodiscard]] static int removeRoute(const char* interface, const char* destination,
-                                         const char* nexthop, TableType tableType);
+    static int addRoute(const char* interface, const char* destination, const char* nexthop,
+                        TableType tableType) WARN_UNUSED_RESULT;
+    static int removeRoute(const char* interface, const char* destination, const char* nexthop,
+                           TableType tableType) WARN_UNUSED_RESULT;
 
-    [[nodiscard]] static int enableTethering(const char* inputInterface,
-                                             const char* outputInterface);
-    [[nodiscard]] static int disableTethering(const char* inputInterface,
-                                              const char* outputInterface);
+    static int enableTethering(const char* inputInterface,
+                               const char* outputInterface) WARN_UNUSED_RESULT;
+    static int disableTethering(const char* inputInterface,
+                                const char* outputInterface) WARN_UNUSED_RESULT;
 
-    [[nodiscard]] static int addVirtualNetworkFallthrough(unsigned vpnNetId,
-                                                          const char* physicalInterface,
-                                                          Permission permission);
-    [[nodiscard]] static int removeVirtualNetworkFallthrough(unsigned vpnNetId,
-                                                             const char* physicalInterface,
-                                                             Permission permission);
+    static int addVirtualNetworkFallthrough(unsigned vpnNetId, const char* physicalInterface,
+                                            Permission permission) WARN_UNUSED_RESULT;
+    static int removeVirtualNetworkFallthrough(unsigned vpnNetId, const char* physicalInterface,
+                                               Permission permission) WARN_UNUSED_RESULT;
 
     // For testing.
     static int (*iptablesRestoreCommandFunction)(IptablesTarget, const std::string&,
@@ -117,9 +118,9 @@ private:
     static std::map<std::string, uint32_t> sInterfaceToTable GUARDED_BY(sInterfaceToTableLock);
 
     static int configureDummyNetwork();
-    [[nodiscard]] static int flushRoutes(const char* interface) EXCLUDES(sInterfaceToTableLock);
-    [[nodiscard]] static int flushRoutes(uint32_t table);
-    static uint32_t getRouteTableForInterfaceLocked(const char* interface)
+    static int flushRoutes(const char* interface) EXCLUDES(sInterfaceToTableLock);
+    static int flushRoutes(uint32_t table);
+    static uint32_t getRouteTableForInterfaceLocked(const char *interface)
             REQUIRES(sInterfaceToTableLock);
     static uint32_t getRouteTableForInterface(const char *interface) EXCLUDES(sInterfaceToTableLock);
     static int modifyDefaultNetwork(uint16_t action, const char* interface, Permission permission);
@@ -140,10 +141,14 @@ private:
 // Public because they are called by by RouteControllerTest.cpp.
 // TODO: come up with a scheme of unit testing this code that does not rely on making all its
 // functions public.
-[[nodiscard]] int modifyIpRoute(uint16_t action, uint32_t table, const char* interface,
-                                const char* destination, const char* nexthop);
+int modifyIpRoute(uint16_t action, uint32_t table, const char* interface, const char* destination,
+                  const char* nexthop) WARN_UNUSED_RESULT;
+int flushRoutes(uint32_t table) WARN_UNUSED_RESULT;
 uint32_t getRulePriority(const nlmsghdr *nlh);
-[[nodiscard]] int modifyIncomingPacketMark(unsigned netId, const char* interface,
-                                           Permission permission, bool add);
+WARN_UNUSED_RESULT int modifyIncomingPacketMark(unsigned netId, const char* interface,
+                                                Permission permission, bool add);
 
-}  // namespace android::net
+}  // namespace net
+}  // namespace android
+
+#endif  // NETD_SERVER_ROUTE_CONTROLLER_H

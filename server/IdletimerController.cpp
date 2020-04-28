@@ -115,6 +115,7 @@
 
 #define LOG_TAG "IdletimerController"
 #include <log/log.h>
+#include <logwrap/logwrap.h>
 
 #include "IdletimerController.h"
 #include "NetdConstants.h"

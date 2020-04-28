@@ -14,19 +14,19 @@
  * limitations under the License.
  */
 
-#include <dirent.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
+#include <chrono>
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
+#include <errno.h>
 #include <string.h>
+#include <mutex>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <chrono>
-#include <cinttypes>
-#include <mutex>
+
+#include <fcntl.h>
+#include <dirent.h>
 
 #define LOG_TAG "Netd"
 
@@ -82,21 +82,11 @@ void logCallback(const char* msg) {
     gLog.info(std::string(msg));
 }
 
-int tagSocketCallback(int sockFd, uint32_t tag, uid_t uid, pid_t) {
-    return gCtls->trafficCtrl.tagSocket(sockFd, tag, uid, geteuid());
-}
-
-bool evaluateDomainNameCallback(const android_net_context&, const char* /*name*/) {
-    return true;
-}
-
 bool initDnsResolver() {
     ResolverNetdCallbacks callbacks = {
-            .check_calling_permission = &checkCallingPermissionCallback,
             .get_network_context = &getNetworkContextCallback,
             .log = &logCallback,
-            .tagSocket = &tagSocketCallback,
-            .evaluate_domain_name = &evaluateDomainNameCallback,
+            .check_calling_permission = &checkCallingPermissionCallback,
     };
     return RESOLV_STUB.resolv_init(callbacks);
 }
@@ -185,7 +175,7 @@ int main() {
         ALOGE("Unable to start NetdNativeService: %d", ret);
         exit(1);
     }
-    gLog.info("Registering NetdNativeService: %" PRId64 "us", subTime.getTimeAndResetUs());
+    gLog.info("Registering NetdNativeService: %.1fms", subTime.getTimeAndReset());
 
     android::net::process::ScopedPidFile pidFile(PID_FILE_PATH);
 
@@ -196,8 +186,9 @@ int main() {
         ALOGE("Unable to start NetdHwService: %d", ret);
         exit(1);
     }
-    gLog.info("Registering NetdHwService: %" PRId64 "us", subTime.getTimeAndResetUs());
-    gLog.info("Netd started in %" PRId64 "us", s.timeTakenUs());
+    gLog.info("Registering NetdHwService: %.1fms", subTime.getTimeAndReset());
+
+    gLog.info("Netd started in %dms", static_cast<int>(s.timeTaken()));
 
     IPCThreadState::self()->joinThreadPool();
 

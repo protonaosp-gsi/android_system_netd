@@ -23,15 +23,30 @@
 #include <linux/ipv6.h>
 #include <linux/pkt_cls.h>
 #include <linux/swab.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
 #include <stdbool.h>
 #include <stdint.h>
 
 #include "bpf_helpers.h"
-#include "bpf_net_helpers.h"
 #include "netdbpf/bpf_shared.h"
+
+// bionic/libc/kernel/uapi/linux/udp.h:
+//   struct __kernel_udphdr {
+// bionic/libc/kernel/tools/defaults.py:
+//   # We want to support both BSD and Linux member names in struct udphdr.
+//   "udphdr": "__kernel_udphdr",
+// so instead it just doesn't work... ugh.
+#define udphdr __kernel_udphdr
 
 // From kernel:include/net/ip.h
 #define IP_DF 0x4000  // Flag: "Don't Fragment"
+
+// Android only supports little endian architectures
+#define htons(x) (__builtin_constant_p(x) ? ___constant_swab16(x) : __builtin_bswap16(x))
+#define htonl(x) (__builtin_constant_p(x) ? ___constant_swab32(x) : __builtin_bswap32(x))
+#define ntohs(x) htons(x)
+#define ntohl(x) htonl(x)
 
 DEFINE_BPF_MAP(clat_ingress_map, HASH, ClatIngressKey, ClatIngressValue, 16)
 
@@ -41,6 +56,8 @@ static inline __always_inline int nat64(struct __sk_buff* skb, bool is_ethernet)
     const void* data_end = (void*)(long)skb->data_end;
     const struct ethhdr* const eth = is_ethernet ? data : NULL;  // used iff is_ethernet
     const struct ipv6hdr* const ip6 = is_ethernet ? (void*)(eth + 1) : data;
+    const struct tcphdr* const tcp = (void*)(ip6 + 1);
+    const struct udphdr* const udp = (void*)(ip6 + 1);
 
     // Must be meta-ethernet IPv6 frame
     if (skb->protocol != htons(ETH_P_IPV6)) return TC_ACT_OK;
@@ -58,10 +75,12 @@ static inline __always_inline int nat64(struct __sk_buff* skb, bool is_ethernet)
     if (ntohs(ip6->payload_len) > 0xFFFF - sizeof(struct iphdr)) return TC_ACT_OK;
 
     switch (ip6->nexthdr) {
-        case IPPROTO_TCP:  // For TCP & UDP the checksum neutrality of the chosen IPv6
-        case IPPROTO_UDP:  // address means there is no need to update their checksums.
-        case IPPROTO_GRE:  // We do not need to bother looking at GRE/ESP headers,
-        case IPPROTO_ESP:  // since there is never a checksum to update.
+        case IPPROTO_TCP:  // If TCP, must have 20 byte minimal TCP header
+            if (tcp + 1 > (struct tcphdr*)data_end) return TC_ACT_OK;
+            break;
+
+        case IPPROTO_UDP:  // If UDP, must have 8 byte minimal UDP header
+            if (udp + 1 > (struct udphdr*)data_end) return TC_ACT_OK;
             break;
 
         default:  // do not know how to handle anything else
@@ -116,9 +135,8 @@ static inline __always_inline int nat64(struct __sk_buff* skb, bool is_ethernet)
     // Note that there is no L4 checksum update: we are relying on the checksum neutrality
     // of the ipv6 address chosen by netd's ClatdController.
 
-    // Packet mutations begin - point of no return, but if this first modification fails
-    // the packet is probably still pristine, so let clatd handle it.
-    if (bpf_skb_change_proto(skb, htons(ETH_P_IP), 0)) return TC_ACT_OK;
+    // Packet mutations begin - point of no return.
+    if (bpf_skb_change_proto(skb, htons(ETH_P_IP), 0)) return TC_ACT_SHOT;
 
     // bpf_skb_change_proto() invalidates all pointers - reload them.
     data = (void*)(long)skb->data;

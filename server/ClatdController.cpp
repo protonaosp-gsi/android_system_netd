@@ -33,7 +33,6 @@
 #include <log/log.h>
 
 #include "ClatdController.h"
-#include "InterfaceController.h"
 
 #include "android-base/properties.h"
 #include "android-base/scopeguard.h"
@@ -140,11 +139,7 @@ bool ClatdController::isIpv4AddressFree(in_addr_t addr) {
 
     // Attempt to connect to the address. If the connection succeeds and getsockname returns the
     // same then the address is already assigned to the system and we can't use it.
-    struct sockaddr_in sin = {
-            .sin_family = AF_INET,
-            .sin_port = htons(53),
-            .sin_addr = {addr},
-    };
+    struct sockaddr_in sin = {.sin_family = AF_INET, .sin_addr = {addr}, .sin_port = 53};
     socklen_t len = sizeof(sin);
     bool inuse = connect(s, (struct sockaddr*)&sin, sizeof(sin)) == 0 &&
                  getsockname(s, (struct sockaddr*)&sin, &len) == 0 && (size_t)len >= sizeof(sin) &&
@@ -456,10 +451,6 @@ int ClatdController::startClatd(const std::string& interface, const std::string&
         ALOGE("ioctl(TUNSETIFF) failed (%s)", strerror(res));
         return -res;
     }
-
-    // disable IPv6 on it - failing to do so is not a critical error
-    res = InterfaceController::setEnableIPv6(v4interface.c_str(), 0);
-    if (res) ALOGE("setEnableIPv6 %s failed (%s)", v4interface.c_str(), strerror(res));
 
     // 5. initialize tracker object
     ClatdTracker tracker;

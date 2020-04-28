@@ -30,6 +30,8 @@
 #include <binder/IServiceManager.h>
 #include <binder/Status.h>
 #include <cutils/properties.h>
+#include <json/value.h>
+#include <json/writer.h>
 #include <log/log.h>
 #include <netdutils/DumpWriter.h>
 #include <utils/Errors.h>
@@ -38,6 +40,7 @@
 #include "BinderUtil.h"
 #include "Controllers.h"
 #include "InterfaceController.h"
+#include "NetdConstants.h"  // SHA256_SIZE
 #include "NetdNativeService.h"
 #include "NetdPermissions.h"
 #include "OemNetdListener.h"
@@ -905,16 +908,11 @@ binder::Status NetdNativeService::interfaceSetMtu(const std::string& ifName, int
 }
 
 binder::Status NetdNativeService::tetherStart(const std::vector<std::string>& dhcpRanges) {
-    return tetherStartWithConfiguration(true, dhcpRanges);
-}
-
-binder::Status NetdNativeService::tetherStartWithConfiguration(
-        bool usingLegacyDnsProxy, const std::vector<std::string>& dhcpRanges) {
     NETD_LOCKING_RPC(gCtls->tetherCtrl.lock, PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK);
     if (dhcpRanges.size() % 2 == 1) {
         return statusFromErrcode(-EINVAL);
     }
-    int res = gCtls->tetherCtrl.startTethering(usingLegacyDnsProxy, dhcpRanges);
+    int res = gCtls->tetherCtrl.startTethering(dhcpRanges);
     return statusFromErrcode(res);
 }
 

@@ -61,8 +61,9 @@ bool IPAddress::forString(const std::string& repr, IPAddress* ip) {
     };
     addrinfo* res;
     const int ret = getaddrinfo(repr.c_str(), nullptr, &hints, &res);
-    ScopedAddrinfo res_cleanup(res);
+    // TODO: move ScopedAddrinfo into libnetdutils and use it here.
     if (ret != 0) {
+        freeaddrinfo(res);
         return false;
     }
 
@@ -83,6 +84,7 @@ bool IPAddress::forString(const std::string& repr, IPAddress* ip) {
             break;
     }
 
+    freeaddrinfo(res);
     return rval;
 }
 

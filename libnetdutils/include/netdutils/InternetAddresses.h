@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#pragma once
+#ifndef NETDUTILS_INTERNETADDRESSES_H_
+#define NETDUTILS_INTERNETADDRESSES_H_
 
-#include <netdb.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <cstring>
@@ -103,16 +103,6 @@ static_assert(AF_INET6 <= std::numeric_limits<uint8_t>::max(), "AF_INET6 value t
 static_assert(sizeof(compact_ipdata) == 24U, "compact_ipdata unexpectedly large");
 
 }  // namespace internal_
-
-struct AddrinfoDeleter {
-    void operator()(struct addrinfo* p) const {
-        if (p != nullptr) {
-            freeaddrinfo(p);
-        }
-    }
-};
-
-typedef std::unique_ptr<struct addrinfo, struct AddrinfoDeleter> ScopedAddrinfo;
 
 inline bool usesScopedIds(const in6_addr& ipv6) {
     return (IN6_IS_ADDR_LINKLOCAL(&ipv6) || IN6_IS_ADDR_MC_LINKLOCAL(&ipv6));
@@ -242,23 +232,6 @@ class IPSockAddr {
   public:
     // TODO: static forString
 
-    static IPSockAddr toIPSockAddr(const std::string& repr, in_port_t port) {
-        return IPSockAddr(IPAddress::forString(repr), port);
-    }
-    static IPSockAddr toIPSockAddr(const sockaddr& sa) {
-        switch (sa.sa_family) {
-            case AF_INET:
-                return IPSockAddr(*reinterpret_cast<const sockaddr_in*>(&sa));
-            case AF_INET6:
-                return IPSockAddr(*reinterpret_cast<const sockaddr_in6*>(&sa));
-            default:
-                return IPSockAddr();
-        }
-    }
-    static IPSockAddr toIPSockAddr(const sockaddr_storage& ss) {
-        return toIPSockAddr(*reinterpret_cast<const sockaddr*>(&ss));
-    }
-
     IPSockAddr() = default;
     IPSockAddr(const IPSockAddr&) = default;
     IPSockAddr(IPSockAddr&&) = default;
@@ -318,3 +291,5 @@ class IPSockAddr {
 
 }  // namespace netdutils
 }  // namespace android
+
+#endif  // NETDUTILS_INTERNETADDRESSES_H_

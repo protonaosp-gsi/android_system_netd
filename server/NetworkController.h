@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-#pragma once
+#ifndef NETD_SERVER_NETWORK_CONTROLLER_H
+#define NETD_SERVER_NETWORK_CONTROLLER_H
 
 #include <android-base/thread_annotations.h>
 #include <android/multinetwork.h>
@@ -36,7 +37,8 @@
 
 struct android_net_context;
 
-namespace android::net {
+namespace android {
+namespace net {
 
 typedef std::shared_lock<std::shared_mutex> ScopedRLock;
 typedef std::lock_guard<std::shared_mutex> ScopedWLock;
@@ -91,40 +93,44 @@ public:
     NetworkController();
 
     unsigned getDefaultNetwork() const;
-    [[nodiscard]] int setDefaultNetwork(unsigned netId);
+    int setDefaultNetwork(unsigned netId) WARN_UNUSED_RESULT;
 
+    // Sets |*netId| to an appropriate NetId to use for DNS for the given user. Call with |*netId|
+    // set to a non-NETID_UNSET value if the user already has indicated a preference. Returns the
+    // fwmark value to set on the socket when performing the DNS request.
+    uint32_t getNetworkForDns(unsigned* netId, uid_t uid) const;
     unsigned getNetworkForUser(uid_t uid) const;
     unsigned getNetworkForConnect(uid_t uid) const;
     void getNetworkContext(unsigned netId, uid_t uid, struct android_net_context* netcontext) const;
     unsigned getNetworkForInterface(const char* interface) const;
     bool isVirtualNetwork(unsigned netId) const;
 
-    [[nodiscard]] int createPhysicalNetwork(unsigned netId, Permission permission);
-    [[nodiscard]] int createPhysicalOemNetwork(Permission permission, unsigned* netId);
-    [[nodiscard]] int createVirtualNetwork(unsigned netId, bool secure);
-    [[nodiscard]] int destroyNetwork(unsigned netId);
+    int createPhysicalNetwork(unsigned netId, Permission permission) WARN_UNUSED_RESULT;
+    int createPhysicalOemNetwork(Permission permission, unsigned *netId) WARN_UNUSED_RESULT;
+    int createVirtualNetwork(unsigned netId, bool secure) WARN_UNUSED_RESULT;
+    int destroyNetwork(unsigned netId) WARN_UNUSED_RESULT;
 
-    [[nodiscard]] int addInterfaceToNetwork(unsigned netId, const char* interface);
-    [[nodiscard]] int removeInterfaceFromNetwork(unsigned netId, const char* interface);
+    int addInterfaceToNetwork(unsigned netId, const char* interface) WARN_UNUSED_RESULT;
+    int removeInterfaceFromNetwork(unsigned netId, const char* interface) WARN_UNUSED_RESULT;
 
     Permission getPermissionForUser(uid_t uid) const;
     void setPermissionForUsers(Permission permission, const std::vector<uid_t>& uids);
     int checkUserNetworkAccess(uid_t uid, unsigned netId) const;
-    [[nodiscard]] int setPermissionForNetworks(Permission permission,
-                                               const std::vector<unsigned>& netIds);
+    int setPermissionForNetworks(Permission permission,
+                                 const std::vector<unsigned>& netIds) WARN_UNUSED_RESULT;
 
-    [[nodiscard]] int addUsersToNetwork(unsigned netId, const UidRanges& uidRanges);
-    [[nodiscard]] int removeUsersFromNetwork(unsigned netId, const UidRanges& uidRanges);
+    int addUsersToNetwork(unsigned netId, const UidRanges& uidRanges) WARN_UNUSED_RESULT;
+    int removeUsersFromNetwork(unsigned netId, const UidRanges& uidRanges) WARN_UNUSED_RESULT;
 
     // |nexthop| can be NULL (to indicate a directly-connected route), "unreachable" (to indicate a
     // route that's blocked), "throw" (to indicate the lack of a match), or a regular IP address.
     //
     // Routes are added to tables determined by the interface, so only |interface| is actually used.
     // |netId| is given only to sanity check that the interface has the correct netId.
-    [[nodiscard]] int addRoute(unsigned netId, const char* interface, const char* destination,
-                               const char* nexthop, bool legacy, uid_t uid);
-    [[nodiscard]] int removeRoute(unsigned netId, const char* interface, const char* destination,
-                                  const char* nexthop, bool legacy, uid_t uid);
+    int addRoute(unsigned netId, const char* interface, const char* destination,
+                 const char* nexthop, bool legacy, uid_t uid) WARN_UNUSED_RESULT;
+    int removeRoute(unsigned netId, const char* interface, const char* destination,
+                    const char* nexthop, bool legacy, uid_t uid) WARN_UNUSED_RESULT;
 
     // Notes that the specified address has appeared on the specified interface.
     void addInterfaceAddress(unsigned ifIndex, const char* address);
@@ -141,12 +147,7 @@ public:
   private:
     bool isValidNetworkLocked(unsigned netId) const;
     Network* getNetworkLocked(unsigned netId) const;
-
-    // Sets |*netId| to an appropriate NetId to use for DNS for the given user. Call with |*netId|
-    // set to a non-NETID_UNSET value if the user already has indicated a preference. Returns the
-    // fwmark value to set on the socket when performing the DNS request.
     uint32_t getNetworkForDnsLocked(unsigned* netId, uid_t uid) const;
-
     unsigned getNetworkForUserLocked(uid_t uid) const;
     unsigned getNetworkForConnectLocked(uid_t uid) const;
     unsigned getNetworkForInterfaceLocked(const char* interface) const;
@@ -155,11 +156,11 @@ public:
     VirtualNetwork* getVirtualNetworkForUserLocked(uid_t uid) const;
     Permission getPermissionForUserLocked(uid_t uid) const;
     int checkUserNetworkAccessLocked(uid_t uid, unsigned netId) const;
-    [[nodiscard]] int createPhysicalNetworkLocked(unsigned netId, Permission permission);
+    int createPhysicalNetworkLocked(unsigned netId, Permission permission) WARN_UNUSED_RESULT;
 
-    [[nodiscard]] int modifyRoute(unsigned netId, const char* interface, const char* destination,
-                                  const char* nexthop, bool add, bool legacy, uid_t uid);
-    [[nodiscard]] int modifyFallthroughLocked(unsigned vpnNetId, bool add);
+    int modifyRoute(unsigned netId, const char* interface, const char* destination,
+                    const char* nexthop, bool add, bool legacy, uid_t uid) WARN_UNUSED_RESULT;
+    int modifyFallthroughLocked(unsigned vpnNetId, bool add) WARN_UNUSED_RESULT;
     void updateTcpSocketMonitorPolling();
 
     class DelegateImpl;
@@ -188,4 +189,7 @@ public:
 
 };
 
-}  // namespace android::net
+}  // namespace net
+}  // namespace android
+
+#endif  // NETD_SERVER_NETWORK_CONTROLLER_H

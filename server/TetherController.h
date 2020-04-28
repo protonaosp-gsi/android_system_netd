@@ -43,8 +43,6 @@ class TetherController {
     // some point since the controller was initialized.
     std::multimap<std::string, ForwardingDownstream> mFwdIfaces;
 
-    bool mIsTetheringStarted = false;
-
     // NetId to use for forwarded DNS queries. This may not be the default
     // network, e.g., in the case where we are tethering to a DUN APN.
     unsigned               mDnsNetId = 0;
@@ -75,9 +73,8 @@ class TetherController {
     bool disableForwarding(const char* requester);
     const std::set<std::string>& getIpfwdRequesterList() const;
 
-    //TODO: Clean up the overload function
-    int startTethering(bool isLegacyDnsProxy, int num_addrs, char** dhcp_ranges);
-    int startTethering(bool isLegacyDnsProxy, const std::vector<std::string>& dhcpRanges);
+    int startTethering(int num_addrs, char **dhcp_ranges);
+    int startTethering(const std::vector<std::string>& dhcpRanges);
     int stopTethering();
     bool isTetheringStarted();
 

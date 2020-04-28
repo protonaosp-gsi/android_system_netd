@@ -21,8 +21,8 @@
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
-#include <iostream>
 #include <mutex>
 #include <set>
 #include <vector>
@@ -50,6 +50,7 @@
 #include <com/android/internal/net/IOemNetd.h>
 #include <cutils/multiuser.h>
 #include <gtest/gtest.h>
+#include <logwrap/logwrap.h>
 #include <netdbpf/bpf_shared.h>
 #include <netutils/ifc.h>
 #include "Fwmark.h"
@@ -60,13 +61,12 @@
 #include "XfrmController.h"
 #include "android/net/INetd.h"
 #include "binder/IServiceManager.h"
-#include "netdutils/InternetAddresses.h"
 #include "netdutils/Stopwatch.h"
 #include "netdutils/Syscalls.h"
 #include "netid_client.h"  // NETID_UNSET
-#include "test_utils.h"
 #include "tun_interface.h"
 
+#define IP_PATH "/system/bin/ip"
 #define IP6TABLES_PATH "/system/bin/ip6tables"
 #define IPTABLES_PATH "/system/bin/iptables"
 #define TUN_DEV "/dev/tun"
@@ -87,14 +87,12 @@ using android::base::ReadFileToString;
 using android::base::StartsWith;
 using android::base::StringPrintf;
 using android::base::Trim;
-using android::base::unique_fd;
 using android::net::INetd;
 using android::net::InterfaceConfigurationParcel;
 using android::net::InterfaceController;
 using android::net::TetherStatsParcel;
 using android::net::TunInterface;
 using android::net::UidRangeParcel;
-using android::netdutils::ScopedAddrinfo;
 using android::netdutils::sSyscalls;
 using android::netdutils::Stopwatch;
 
@@ -151,8 +149,7 @@ class BinderTest : public ::testing::Test {
         sTun2.destroy();
     }
 
-    static void fakeRemoteSocketPair(unique_fd* clientSocket, unique_fd* serverSocket,
-                                     unique_fd* acceptedSocket);
+    static void fakeRemoteSocketPair(int *clientSocket, int *serverSocket, int *acceptedSocket);
 
     void createVpnNetworkWithUid(bool secure, uid_t uid, int vpnNetId = TEST_NETID2,
                                  int fallthroughNetId = TEST_NETID1);
@@ -173,7 +170,7 @@ class TimedOperation : public Stopwatch {
   public:
     explicit TimedOperation(const std::string &name): mName(name) {}
     virtual ~TimedOperation() {
-        std::cerr << "    " << mName << ": " << timeTakenUs() << "us" << std::endl;
+        fprintf(stderr, "    %s: %6.1f ms\n", mName.c_str(), timeTaken());
     }
 
   private:
@@ -185,6 +182,57 @@ TEST_F(BinderTest, IsAlive) {
     bool isAlive = false;
     mNetd->isAlive(&isAlive);
     ASSERT_TRUE(isAlive);
+}
+
+static int randomUid() {
+    return 100000 * arc4random_uniform(7) + 10000 + arc4random_uniform(5000);
+}
+
+static std::vector<std::string> runCommand(const std::string& command) {
+    std::vector<std::string> lines;
+    FILE *f = popen(command.c_str(), "r");  // NOLINT(cert-env33-c)
+    if (f == nullptr) {
+        perror("popen");
+        return lines;
+    }
+
+    char *line = nullptr;
+    size_t bufsize = 0;
+    ssize_t linelen = 0;
+    while ((linelen = getline(&line, &bufsize, f)) >= 0) {
+        lines.push_back(std::string(line, linelen));
+        free(line);
+        line = nullptr;
+    }
+
+    pclose(f);
+    return lines;
+}
+
+static std::vector<std::string> listIpRules(const char *ipVersion) {
+    std::string command = StringPrintf("%s %s rule list", IP_PATH, ipVersion);
+    return runCommand(command);
+}
+
+static std::vector<std::string> listIptablesRule(const char *binary, const char *chainName) {
+    std::string command = StringPrintf("%s -w -n -L %s", binary, chainName);
+    return runCommand(command);
+}
+
+static int iptablesRuleLineLength(const char *binary, const char *chainName) {
+    return listIptablesRule(binary, chainName).size();
+}
+
+static bool iptablesRuleExists(const char *binary,
+                               const char *chainName,
+                               const std::string& expectedRule) {
+    std::vector<std::string> rules = listIptablesRule(binary, chainName);
+    for (const auto& rule : rules) {
+        if(rule.find(expectedRule) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool iptablesNoSocketAllowRuleExists(const char *chainName){
@@ -293,7 +341,7 @@ TEST_F(BinderTest, IpSecTunnelInterface) {
 }
 
 TEST_F(BinderTest, IpSecSetEncapSocketOwner) {
-    unique_fd uniqueFd(socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+    android::base::unique_fd uniqueFd(socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0));
     android::os::ParcelFileDescriptor sockFd(std::move(uniqueFd));
 
     int sockOptVal = UDP_ENCAP_ESPINUDP;
@@ -580,18 +628,22 @@ TEST_F(BinderTest, NetworkRejectNonSecureVpn) {
 
     std::vector<UidRangeParcel> uidRanges = {makeUidRangeParcel(BASE_UID + 150, BASE_UID + 224),
                                              makeUidRangeParcel(BASE_UID + 226, BASE_UID + 300)};
-    // Make sure no rules existed before calling commands.
-    for (auto const& range : uidRanges) {
-        EXPECT_FALSE(ipRuleExistsForRange(RULE_PRIORITY, range, "prohibit"));
-    }
+
+    const std::vector<std::string> initialRulesV4 = listIpRules(IP_RULE_V4);
+    const std::vector<std::string> initialRulesV6 = listIpRules(IP_RULE_V6);
+
     // Create two valid rules.
     ASSERT_TRUE(mNetd->networkRejectNonSecureVpn(true, uidRanges).isOk());
+    EXPECT_EQ(initialRulesV4.size() + 2, listIpRules(IP_RULE_V4).size());
+    EXPECT_EQ(initialRulesV6.size() + 2, listIpRules(IP_RULE_V6).size());
     for (auto const& range : uidRanges) {
         EXPECT_TRUE(ipRuleExistsForRange(RULE_PRIORITY, range, "prohibit"));
     }
 
     // Remove the rules.
     ASSERT_TRUE(mNetd->networkRejectNonSecureVpn(false, uidRanges).isOk());
+    EXPECT_EQ(initialRulesV4.size(), listIpRules(IP_RULE_V4).size());
+    EXPECT_EQ(initialRulesV6.size(), listIpRules(IP_RULE_V6).size());
     for (auto const& range : uidRanges) {
         EXPECT_FALSE(ipRuleExistsForRange(RULE_PRIORITY, range, "prohibit"));
     }
@@ -600,12 +652,15 @@ TEST_F(BinderTest, NetworkRejectNonSecureVpn) {
     binder::Status status = mNetd->networkRejectNonSecureVpn(false, uidRanges);
     ASSERT_EQ(binder::Status::EX_SERVICE_SPECIFIC, status.exceptionCode());
     EXPECT_EQ(ENOENT, status.serviceSpecificErrorCode());
+
+    // All rules should be the same as before.
+    EXPECT_EQ(initialRulesV4, listIpRules(IP_RULE_V4));
+    EXPECT_EQ(initialRulesV6, listIpRules(IP_RULE_V6));
 }
 
 // Create a socket pair that isLoopbackSocket won't think is local.
-void BinderTest::fakeRemoteSocketPair(unique_fd* clientSocket, unique_fd* serverSocket,
-                                      unique_fd* acceptedSocket) {
-    serverSocket->reset(socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0));
+void BinderTest::fakeRemoteSocketPair(int *clientSocket, int *serverSocket, int *acceptedSocket) {
+    *serverSocket = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_in6 server6 = { .sin6_family = AF_INET6, .sin6_addr = sTun.dstAddr() };
     ASSERT_EQ(0, bind(*serverSocket, (struct sockaddr *) &server6, sizeof(server6)));
 
@@ -613,14 +668,13 @@ void BinderTest::fakeRemoteSocketPair(unique_fd* clientSocket, unique_fd* server
     ASSERT_EQ(0, getsockname(*serverSocket, (struct sockaddr *) &server6, &addrlen));
     ASSERT_EQ(0, listen(*serverSocket, 10));
 
-    clientSocket->reset(socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    *clientSocket = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_in6 client6 = { .sin6_family = AF_INET6, .sin6_addr = sTun.srcAddr() };
     ASSERT_EQ(0, bind(*clientSocket, (struct sockaddr *) &client6, sizeof(client6)));
     ASSERT_EQ(0, connect(*clientSocket, (struct sockaddr *) &server6, sizeof(server6)));
     ASSERT_EQ(0, getsockname(*clientSocket, (struct sockaddr *) &client6, &addrlen));
 
-    acceptedSocket->reset(
-            accept4(*serverSocket, (struct sockaddr*)&server6, &addrlen, SOCK_CLOEXEC));
+    *acceptedSocket = accept4(*serverSocket, (struct sockaddr *) &server6, &addrlen, SOCK_CLOEXEC);
     ASSERT_NE(-1, *acceptedSocket);
 
     ASSERT_EQ(0, memcmp(&client6, &server6, sizeof(client6)));
@@ -648,7 +702,7 @@ void checkSocketpairClosed(int clientSocket, int acceptedSocket) {
 }
 
 TEST_F(BinderTest, SocketDestroy) {
-    unique_fd clientSocket, serverSocket, acceptedSocket;
+    int clientSocket, serverSocket, acceptedSocket;
     ASSERT_NO_FATAL_FAILURE(fakeRemoteSocketPair(&clientSocket, &serverSocket, &acceptedSocket));
 
     // Pick a random UID in the system UID range.
@@ -688,6 +742,10 @@ TEST_F(BinderTest, SocketDestroy) {
     skipUids.resize(skipUids.size() - 1);
     EXPECT_TRUE(mNetd->socketDestroy(uidRanges, skipUids).isOk());
     checkSocketpairClosed(clientSocket, acceptedSocket);
+
+    close(clientSocket);
+    close(serverSocket);
+    close(acceptedSocket);
 }
 
 namespace {
@@ -989,11 +1047,8 @@ TEST_F(BinderTest, TetherGetStats) {
     std::string intIface1 = StringPrintf("netdtest_%u", arc4random_uniform(10000));
     std::string intIface2 = StringPrintf("netdtest_%u", arc4random_uniform(10000));
     std::string intIface3 = StringPrintf("netdtest_%u", arc4random_uniform(10000));
-
-    // Ensure we won't use the same interface name, otherwise the test will fail.
-    u_int32_t rNumber = arc4random_uniform(10000);
-    std::string extIface1 = StringPrintf("netdtest_%u", rNumber);
-    std::string extIface2 = StringPrintf("netdtest_%u", rNumber + 1);
+    std::string extIface1 = StringPrintf("netdtest_%u", arc4random_uniform(10000));
+    std::string extIface2 = StringPrintf("netdtest_%u", arc4random_uniform(10000));
 
     addTetherCounterValues(IPTABLES_PATH,  intIface1, extIface1, 123, 111);
     addTetherCounterValues(IP6TABLES_PATH, intIface1, extIface1, 456,  10);
@@ -1566,13 +1621,13 @@ TEST_F(BinderTest, BandwidthSetRemoveInterfaceAlert) {
 }
 
 TEST_F(BinderTest, BandwidthSetGlobalAlert) {
-    int64_t testAlertBytes = 2097200;
+    long testAlertBytes = 2097149;
 
     binder::Status status = mNetd->bandwidthSetGlobalAlert(testAlertBytes);
     EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
     expectBandwidthGlobalAlertRuleExists(testAlertBytes);
 
-    testAlertBytes = 2098230;
+    testAlertBytes = 2097152;
     status = mNetd->bandwidthSetGlobalAlert(testAlertBytes);
     EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
     expectBandwidthGlobalAlertRuleExists(testAlertBytes);
@@ -1607,6 +1662,21 @@ TEST_F(BinderTest, BandwidthManipulateSpecialApp) {
 }
 
 namespace {
+
+std::vector<std::string> listIpRoutes(const char* ipVersion, const char* table) {
+    std::string command = StringPrintf("%s %s route ls table %s", IP_PATH, ipVersion, table);
+    return runCommand(command);
+}
+
+bool ipRouteExists(const char* ipVersion, const char* table, const std::string& ipRoute) {
+    std::vector<std::string> routes = listIpRoutes(ipVersion, table);
+    for (const auto& route : routes) {
+        if (route.find(ipRoute) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
 
 std::string ipRouteString(const std::string& ifName, const std::string& dst,
                           const std::string& nextHop) {
@@ -1902,20 +1972,16 @@ TEST_F(BinderTest, NetworkPermissionDefault) {
 }
 
 TEST_F(BinderTest, NetworkSetProtectAllowDeny) {
-    binder::Status status = mNetd->networkSetProtectAllow(TEST_UID1);
+    const int testUid = randomUid();
+    binder::Status status = mNetd->networkSetProtectAllow(testUid);
     EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
     bool ret = false;
-    status = mNetd->networkCanProtect(TEST_UID1, &ret);
+    status = mNetd->networkCanProtect(testUid, &ret);
     EXPECT_TRUE(ret);
 
-    status = mNetd->networkSetProtectDeny(TEST_UID1);
+    status = mNetd->networkSetProtectDeny(testUid);
     EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
-
-    // Clear uid permission before calling networkCanProtect to ensure
-    // the call won't be affected by uid permission.
-    EXPECT_TRUE(mNetd->networkClearPermissionForUser({TEST_UID1}).isOk());
-
-    status = mNetd->networkCanProtect(TEST_UID1, &ret);
+    status = mNetd->networkCanProtect(testUid, &ret);
     EXPECT_FALSE(ret);
 }
 
@@ -1992,30 +2058,22 @@ TEST_F(BinderTest, TetherStartStopStatus) {
     std::vector<std::string> noDhcpRange = {};
     static const char dnsdName[] = "dnsmasq";
 
-    for (bool usingLegacyDnsProxy : {true, false}) {
-        binder::Status status =
-                mNetd->tetherStartWithConfiguration(usingLegacyDnsProxy, noDhcpRange);
-        EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
-        SCOPED_TRACE(StringPrintf("usingLegacyDnsProxy: %d", usingLegacyDnsProxy));
-        if (usingLegacyDnsProxy == true) {
-            expectProcessExists(dnsdName);
-        } else {
-            expectProcessDoesNotExist(dnsdName);
-        }
+    binder::Status status = mNetd->tetherStart(noDhcpRange);
+    EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
+    expectProcessExists(dnsdName);
 
-        bool tetherEnabled;
-        status = mNetd->tetherIsEnabled(&tetherEnabled);
-        EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
-        EXPECT_TRUE(tetherEnabled);
+    bool tetherEnabled;
+    status = mNetd->tetherIsEnabled(&tetherEnabled);
+    EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
+    EXPECT_TRUE(tetherEnabled);
 
-        status = mNetd->tetherStop();
-        EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
-        expectProcessDoesNotExist(dnsdName);
+    status = mNetd->tetherStop();
+    EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
+    expectProcessDoesNotExist(dnsdName);
 
-        status = mNetd->tetherIsEnabled(&tetherEnabled);
-        EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
-        EXPECT_FALSE(tetherEnabled);
-    }
+    status = mNetd->tetherIsEnabled(&tetherEnabled);
+    EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
+    EXPECT_FALSE(tetherEnabled);
 }
 
 TEST_F(BinderTest, TetherInterfaceAddRemoveList) {
@@ -3108,14 +3166,10 @@ void checkDataReceived(int udpSocket, int tunFd) {
 
 bool sendIPv6PacketFromUid(uid_t uid, const in6_addr& dstAddr, Fwmark* fwmark, int tunFd) {
     ScopedUidChange scopedUidChange(uid);
-    unique_fd testSocket(socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+    android::base::unique_fd testSocket(socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0));
     if (testSocket < 0) return false;
 
-    const sockaddr_in6 dst6 = {
-            .sin6_family = AF_INET6,
-            .sin6_port = 42,
-            .sin6_addr = dstAddr,
-    };
+    const sockaddr_in6 dst6 = {.sin6_family = AF_INET6, .sin6_addr = dstAddr, .sin6_port = 42};
     int res = connect(testSocket, (sockaddr*)&dst6, sizeof(dst6));
     socklen_t fwmarkLen = sizeof(fwmark->intValue);
     EXPECT_NE(-1, getsockopt(testSocket, SOL_SOCKET, SO_MARK, &(fwmark->intValue), &fwmarkLen));

@@ -14,14 +14,16 @@
  * limitations under the License.
  */
 
-#pragma once
+#ifndef NETD_SERVER_VIRTUAL_NETWORK_H
+#define NETD_SERVER_VIRTUAL_NETWORK_H
 
 #include <set>
 
 #include "Network.h"
 #include "UidRanges.h"
 
-namespace android::net {
+namespace android {
+namespace net {
 
 // A VirtualNetwork may be "secure" or not.
 //
@@ -38,14 +40,15 @@ public:
     bool isSecure() const;
     bool appliesToUser(uid_t uid) const;
 
-    [[nodiscard]] int addUsers(const UidRanges& uidRanges, const std::set<uid_t>& protectableUsers);
-    [[nodiscard]] int removeUsers(const UidRanges& uidRanges,
-                                  const std::set<uid_t>& protectableUsers);
+    int addUsers(const UidRanges& uidRanges,
+                 const std::set<uid_t>& protectableUsers) WARN_UNUSED_RESULT;
+    int removeUsers(const UidRanges& uidRanges,
+                    const std::set<uid_t>& protectableUsers) WARN_UNUSED_RESULT;
 
-  private:
+private:
     Type getType() const override;
-    [[nodiscard]] int addInterface(const std::string& interface) override;
-    [[nodiscard]] int removeInterface(const std::string& interface) override;
+    int addInterface(const std::string& interface) override WARN_UNUSED_RESULT;
+    int removeInterface(const std::string& interface) override WARN_UNUSED_RESULT;
     int maybeCloseSockets(bool add, const UidRanges& uidRanges,
                           const std::set<uid_t>& protectableUsers);
 
@@ -53,4 +56,7 @@ public:
     UidRanges mUidRanges;
 };
 
-}  // namespace android::net
+}  // namespace net
+}  // namespace android
+
+#endif  // NETD_SERVER_VIRTUAL_NETWORK_H

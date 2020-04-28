@@ -87,7 +87,7 @@ enum UidOwnerMatchType {
     IIF_MATCH = (1 << 5),
 };
 
-enum BpfPermissionMatch {
+enum BpfPemissionMatch {
     BPF_PERMISSION_INTERNET = 1 << 2,
     BPF_PERMISSION_UPDATE_DEVICE_STATS = 1 << 3,
 };

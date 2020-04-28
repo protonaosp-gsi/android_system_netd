@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-#pragma once
+#ifndef NETD_SERVER_NETLINK_UTIL_H
+#define NETD_SERVER_NETLINK_UTIL_H
 
 #include <functional>
 #include <linux/netlink.h>
@@ -22,7 +23,8 @@
 
 #include "NetdConstants.h"
 
-namespace android::net {
+namespace android {
+namespace net {
 
 const sockaddr_nl KERNEL_NLADDR = {AF_NETLINK, 0, 0, 0};
 
@@ -42,29 +44,41 @@ typedef std::function<void(nlmsghdr *)> NetlinkDumpCallback;
 typedef std::function<bool(nlmsghdr *)> NetlinkDumpFilter;
 
 // Opens an RTNetlink socket and connects it to the kernel.
-[[nodiscard]] int openNetlinkSocket(int protocol);
+WARN_UNUSED_RESULT int openNetlinkSocket(int protocol);
 
 // Receives a netlink ACK. Returns 0 if the command succeeded or negative errno if the command
 // failed or receiving the ACK failed.
-[[nodiscard]] int recvNetlinkAck(int sock);
+WARN_UNUSED_RESULT int recvNetlinkAck(int sock);
 
 // Sends a netlink request and possibly expects an ACK. The first element of iov should be null and
 // will be set to the netlink message headerheader. The subsequent elements are the contents of the
 // request.
-[[nodiscard]] int sendNetlinkRequest(uint16_t action, uint16_t flags, iovec* iov, int iovlen,
-                                     const NetlinkDumpCallback* callback);
+
+// Disable optimizations in ASan build.
+// ASan reports an out-of-bounds 32-bit(!) access in the first loop of the
+// function (over iov[]).
+#ifdef __clang__
+#if __has_feature(address_sanitizer)
+__attribute__((optnone))
+#endif
+#endif
+WARN_UNUSED_RESULT int sendNetlinkRequest(uint16_t action, uint16_t flags, iovec* iov, int iovlen,
+                                          const NetlinkDumpCallback *callback);
 
 // Processes a netlink dump, passing every message to the specified |callback|.
-[[nodiscard]] int processNetlinkDump(int sock, const NetlinkDumpCallback& callback);
+WARN_UNUSED_RESULT int processNetlinkDump(int sock, const NetlinkDumpCallback& callback);
 
 // Flushes netlink objects that take an rtmsg structure (FIB rules, routes...). |getAction| and
 // |deleteAction| specify the netlink message types, e.g., RTM_GETRULE and RTM_DELRULE.
 // |shouldDelete| specifies whether a given object should be deleted or not. |what| is a
 // human-readable name for the objects being flushed, e.g. "rules".
-[[nodiscard]] int rtNetlinkFlush(uint16_t getAction, uint16_t deleteAction, const char* what,
-                                 const NetlinkDumpFilter& shouldDelete);
+WARN_UNUSED_RESULT int rtNetlinkFlush(uint16_t getAction, uint16_t deleteAction,
+                                      const char *what, const NetlinkDumpFilter& shouldDelete);
 
 // Returns the value of the specific __u32 attribute, or 0 if the attribute was not present.
 uint32_t getRtmU32Attribute(const nlmsghdr *nlh, int attribute);
 
-}  // namespace android::net
+}  // namespace net
+}  // namespace android
+
+#endif  // NETD_SERVER_NETLINK_UTIL_H

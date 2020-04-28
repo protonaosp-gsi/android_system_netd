@@ -23,12 +23,13 @@
 
 #include "log/log.h"
 
-namespace android::net {
+namespace android {
+namespace net {
 
 namespace {
 
-[[nodiscard]] int addToDefault(unsigned netId, const std::string& interface, Permission permission,
-                               PhysicalNetwork::Delegate* delegate) {
+WARN_UNUSED_RESULT int addToDefault(unsigned netId, const std::string& interface,
+                                    Permission permission, PhysicalNetwork::Delegate* delegate) {
     if (int ret = RouteController::addInterfaceToDefaultNetwork(interface.c_str(), permission)) {
         ALOGE("failed to add interface %s to default netId %u", interface.c_str(), netId);
         return ret;
@@ -39,8 +40,9 @@ namespace {
     return 0;
 }
 
-[[nodiscard]] int removeFromDefault(unsigned netId, const std::string& interface,
-                                    Permission permission, PhysicalNetwork::Delegate* delegate) {
+WARN_UNUSED_RESULT int removeFromDefault(unsigned netId, const std::string& interface,
+                                         Permission permission,
+                                         PhysicalNetwork::Delegate* delegate) {
     if (int ret = RouteController::removeInterfaceFromDefaultNetwork(interface.c_str(),
                                                                      permission)) {
         ALOGE("failed to remove interface %s from default netId %u", interface.c_str(), netId);
@@ -54,13 +56,15 @@ namespace {
 
 }  // namespace
 
-PhysicalNetwork::Delegate::~Delegate() {}
+PhysicalNetwork::Delegate::~Delegate() {
+}
 
 PhysicalNetwork::PhysicalNetwork(unsigned netId, PhysicalNetwork::Delegate* delegate) :
         Network(netId), mDelegate(delegate), mPermission(PERMISSION_NONE), mIsDefault(false) {
 }
 
-PhysicalNetwork::~PhysicalNetwork() {}
+PhysicalNetwork::~PhysicalNetwork() {
+}
 
 Permission PhysicalNetwork::getPermission() const {
     return mPermission;
@@ -202,4 +206,5 @@ int PhysicalNetwork::removeInterface(const std::string& interface) {
     return 0;
 }
 
-}  // namespace android::net
+}  // namespace net
+}  // namespace android

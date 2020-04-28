@@ -48,6 +48,7 @@
 #define LOG_TAG "BandwidthController"
 #include <cutils/properties.h>
 #include <log/log.h>
+#include <logwrap/logwrap.h>
 
 #include <netdutils/Syscalls.h>
 #include "BandwidthController.h"

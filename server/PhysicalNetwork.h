@@ -14,23 +14,25 @@
  * limitations under the License.
  */
 
-#pragma once
+#ifndef NETD_SERVER_PHYSICAL_NETWORK_H
+#define NETD_SERVER_PHYSICAL_NETWORK_H
 
 #include "Network.h"
 #include "Permission.h"
 
-namespace android::net {
+namespace android {
+namespace net {
 
 class PhysicalNetwork : public Network {
-  public:
+public:
     class Delegate {
-      public:
+    public:
         virtual ~Delegate();
 
-        [[nodiscard]] virtual int addFallthrough(const std::string& physicalInterface,
-                                                 Permission permission) = 0;
-        [[nodiscard]] virtual int removeFallthrough(const std::string& physicalInterface,
-                                                    Permission permission) = 0;
+        virtual int addFallthrough(const std::string& physicalInterface,
+                                   Permission permission) WARN_UNUSED_RESULT = 0;
+        virtual int removeFallthrough(const std::string& physicalInterface,
+                                      Permission permission) WARN_UNUSED_RESULT = 0;
     };
 
     PhysicalNetwork(unsigned netId, Delegate* delegate);
@@ -38,15 +40,15 @@ class PhysicalNetwork : public Network {
 
     // These refer to permissions that apps must have in order to use this network.
     Permission getPermission() const;
-    [[nodiscard]] int setPermission(Permission permission);
+    int setPermission(Permission permission) WARN_UNUSED_RESULT;
 
-    [[nodiscard]] int addAsDefault();
-    [[nodiscard]] int removeAsDefault();
+    int addAsDefault() WARN_UNUSED_RESULT;
+    int removeAsDefault() WARN_UNUSED_RESULT;
 
-  private:
+private:
     Type getType() const override;
-    [[nodiscard]] int addInterface(const std::string& interface) override;
-    [[nodiscard]] int removeInterface(const std::string& interface) override;
+    int addInterface(const std::string& interface) override WARN_UNUSED_RESULT;
+    int removeInterface(const std::string& interface) override WARN_UNUSED_RESULT;
     int destroySocketsLackingPermission(Permission permission);
     void invalidateRouteCache(const std::string& interface);
 
@@ -55,4 +57,7 @@ class PhysicalNetwork : public Network {
     bool mIsDefault;
 };
 
-}  // namespace android::net
+}  // namespace net
+}  // namespace android
+
+#endif  // NETD_SERVER_PHYSICAL_NETWORK_H

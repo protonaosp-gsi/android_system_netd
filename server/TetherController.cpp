@@ -36,7 +36,6 @@
 #include <vector>
 
 #define LOG_TAG "TetherController"
-#include <android-base/scopeguard.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
@@ -117,6 +116,22 @@ bool inBpToolsMode() {
     return !strcmp(BP_TOOLS_MODE, bootmode);
 }
 
+int setPosixSpawnFileActionsAddDup2(posix_spawn_file_actions_t* fa, int fd, int new_fd) {
+    int res = posix_spawn_file_actions_init(fa);
+    if (res) {
+        return res;
+    }
+    return posix_spawn_file_actions_adddup2(fa, fd, new_fd);
+}
+
+int setPosixSpawnAttrFlags(posix_spawnattr_t* attr, short flags) {
+    int res = posix_spawnattr_init(attr);
+    if (res) {
+        return res;
+    }
+    return posix_spawnattr_setflags(attr, flags);
+}
+
 }  // namespace
 
 auto TetherController::iptablesRestoreFunction = execIptablesRestoreWithOutput;
@@ -190,15 +205,8 @@ const std::set<std::string>& TetherController::getIpfwdRequesterList() const {
     return mForwardingRequests;
 }
 
-int TetherController::startTethering(bool usingLegacyDnsProxy, int num_addrs, char** dhcp_ranges) {
-    if (!usingLegacyDnsProxy && num_addrs == 0) {
-        // Both DHCP and DnsProxy are disabled, we don't need to start dnsmasq
-        configureForTethering(true);
-        mIsTetheringStarted = true;
-        return 0;
-    }
-
-    if (mIsTetheringStarted) {
+int TetherController::startTethering(int num_addrs, char **dhcp_ranges) {
+    if (mDaemonPid != 0) {
         ALOGE("Tethering already started");
         errno = EBUSY;
         return -errno;
@@ -237,11 +245,8 @@ int TetherController::startTethering(bool usingLegacyDnsProxy, int num_addrs, ch
             kDnsmasqUsername,
     };
 
-    if (!usingLegacyDnsProxy) {
-        argVector.push_back("--port=0");
-    }
-
-    // DHCP server will be disabled if num_addrs == 0 and no --dhcp-range is passed.
+    // DHCP server will be disabled if num_addrs == 0 and no --dhcp-range is
+    // passed.
     for (int addrIndex = 0; addrIndex < num_addrs; addrIndex += 2) {
         argVector.push_back(StringPrintf("--dhcp-range=%s,%s,1h", dhcp_ranges[addrIndex],
                                          dhcp_ranges[addrIndex + 1]));
@@ -262,33 +267,23 @@ int TetherController::startTethering(bool usingLegacyDnsProxy, int num_addrs, ch
     // dup2 creates fd without CLOEXEC, dnsmasq will receive commands through the
     // duplicated fd.
     posix_spawn_file_actions_t fa;
-    int res = posix_spawn_file_actions_init(&fa);
+    int res = setPosixSpawnFileActionsAddDup2(&fa, pipeRead.get(), STDIN_FILENO);
     if (res) {
-        ALOGE("posix_spawn_file_actions_init failed (%s)", strerror(res));
-        return -res;
-    }
-    const android::base::ScopeGuard faGuard = [&] { posix_spawn_file_actions_destroy(&fa); };
-    res = posix_spawn_file_actions_adddup2(&fa, pipeRead.get(), STDIN_FILENO);
-    if (res) {
-        ALOGE("posix_spawn_file_actions_adddup2 failed (%s)", strerror(res));
+        ALOGE("posix_spawn set fa failed (%s)", strerror(res));
         return -res;
     }
 
     posix_spawnattr_t attr;
-    res = posix_spawnattr_init(&attr);
+    res = setPosixSpawnAttrFlags(&attr, POSIX_SPAWN_USEVFORK);
     if (res) {
-        ALOGE("posix_spawnattr_init failed (%s)", strerror(res));
-        return -res;
-    }
-    const android::base::ScopeGuard attrGuard = [&] { posix_spawnattr_destroy(&attr); };
-    res = posix_spawnattr_setflags(&attr, POSIX_SPAWN_USEVFORK);
-    if (res) {
-        ALOGE("posix_spawnattr_setflags failed (%s)", strerror(res));
+        ALOGE("posix_spawn set attr flag failed (%s)", strerror(res));
         return -res;
     }
 
     pid_t pid;
     res = posix_spawn(&pid, args[0], &fa, &attr, &args[0], nullptr);
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&fa);
     if (res) {
         ALOGE("posix_spawn failed (%s)", strerror(res));
         return -res;
@@ -296,7 +291,6 @@ int TetherController::startTethering(bool usingLegacyDnsProxy, int num_addrs, ch
     mDaemonPid = pid;
     mDaemonFd = pipeWrite.release();
     configureForTethering(true);
-    mIsTetheringStarted = true;
     applyDnsInterfaces();
     ALOGD("Tethering services running");
 
@@ -312,8 +306,7 @@ std::vector<char*> TetherController::toCstrVec(const std::vector<std::string>& a
     return addrsCstrVec;
 }
 
-int TetherController::startTethering(bool usingLegacyDnsProxy,
-                                     const std::vector<std::string>& dhcpRanges) {
+int TetherController::startTethering(const std::vector<std::string>& dhcpRanges) {
     struct in_addr v4_addr;
     for (const auto& dhcpRange : dhcpRanges) {
         if (!inet_aton(dhcpRange.c_str(), &v4_addr)) {
@@ -321,20 +314,14 @@ int TetherController::startTethering(bool usingLegacyDnsProxy,
         }
     }
     auto dhcp_ranges = toCstrVec(dhcpRanges);
-    return startTethering(usingLegacyDnsProxy, dhcp_ranges.size(), dhcp_ranges.data());
+    return startTethering(dhcp_ranges.size(), dhcp_ranges.data());
 }
 
 int TetherController::stopTethering() {
     configureForTethering(false);
 
-    if (!mIsTetheringStarted) {
-        ALOGE("Tethering already stopped");
-        return 0;
-    }
-
-    mIsTetheringStarted = false;
-    // dnsmasq is not started
     if (mDaemonPid == 0) {
+        ALOGE("Tethering already stopped");
         return 0;
     }
 
@@ -351,7 +338,7 @@ int TetherController::stopTethering() {
 }
 
 bool TetherController::isTetheringStarted() {
-    return mIsTetheringStarted;
+    return (mDaemonPid == 0 ? false : true);
 }
 
 // dnsmasq can't parse commands larger than this due to the fixed-size buffer
