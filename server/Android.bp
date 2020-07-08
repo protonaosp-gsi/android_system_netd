@@ -23,13 +23,17 @@ aidl_interface {
             apex_available: [
                 "//apex_available:platform", // used from services.net
                 "com.android.bluetooth.updatable",
+                "com.android.tethering",
             ],
+            // this is part of updatable modules(NetworkStack) which targets 29(Q)
+            min_sdk_version: "29",
         },
     },
     versions: [
         "1",
         "2",
         "3",
+        "4",
     ],
 }
 
@@ -75,7 +79,7 @@ aidl_interface {
 java_library {
     name: "netd_aidl_interfaces-platform-java",
     static_libs: [
-        "netd_aidl_interface-java",
+        "netd_aidl_interface-unstable-java",
         "netd_event_listener_interface-java",
     ],
     // TODO: remove bluetooth, which doesn't actually use netd at all.
@@ -95,6 +99,7 @@ filegroup {
         "InterfaceController.cpp",
         "NetlinkCommands.cpp",
         "NetlinkListener.cpp",
+        "OffloadUtils.cpp",
         "SockDiag.cpp",
         "XfrmController.cpp",
         "TrafficController.cpp",
@@ -143,7 +148,7 @@ cc_library_static {
         "libpcap",
         "libqtaguid",
         "libssl",
-        "netd_aidl_interface-cpp",
+        "netd_aidl_interface-unstable-cpp",
         "netd_event_listener_interface-cpp",
     ],
     aidl: {
@@ -188,7 +193,7 @@ cc_binary {
         "libselinux",
         "libsysutils",
         "libutils",
-        "netd_aidl_interface-cpp",
+        "netd_aidl_interface-unstable-cpp",
         "netd_event_listener_interface-cpp",
         "oemnetd_aidl_interface-cpp",
     ],
