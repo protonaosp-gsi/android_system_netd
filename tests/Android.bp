@@ -62,7 +62,7 @@ cc_test {
     name: "netd_integration_test",
     test_suites: [
         "device-tests",
-        "vts",
+        "vts"
     ],
     require_root: true,
     defaults: ["netd_defaults"],
@@ -86,6 +86,7 @@ cc_test {
         "libnetutils",
         "libprocessgroup",
         "libssl",
+        "libsysutils",
         "libutils",
     ],
     static_libs: [
