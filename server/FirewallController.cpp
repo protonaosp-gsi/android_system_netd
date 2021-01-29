@@ -53,10 +53,6 @@ constexpr const uid_t kDefaultMaximumUid = UID_MAX - 1;  // UID_MAX defined as U
 // Proc file containing the uid mapping for the user namespace of the current process.
 const char kUidMapProcFile[] = "/proc/self/uid_map";
 
-bool getBpfOwnerStatus() {
-    return gCtls->trafficCtrl.getBpfEnabled();
-}
-
 }  // namespace
 
 namespace android {
@@ -73,6 +69,7 @@ const char* FirewallController::LOCAL_FORWARD = "fw_FORWARD";
 const char* FirewallController::LOCAL_DOZABLE = "fw_dozable";
 const char* FirewallController::LOCAL_STANDBY = "fw_standby";
 const char* FirewallController::LOCAL_POWERSAVE = "fw_powersave";
+const char* FirewallController::LOCAL_RESTRICTED = "fw_restricted";
 
 // ICMPv6 types that are required for any form of IPv6 connectivity to work. Note that because the
 // fw_dozable chain is called from both INPUT and OUTPUT, this includes both packets that we need
@@ -94,13 +91,15 @@ FirewallController::FirewallController(void) : mMaxUid(discoverMaximumValidUid(k
 
 int FirewallController::setupIptablesHooks(void) {
     int res = 0;
-    mUseBpfOwnerMatch = getBpfOwnerStatus();
+    // mUseBpfOwnerMatch should be removed, but it is still depended upon by test code.
+    mUseBpfOwnerMatch = true;
     if (mUseBpfOwnerMatch) {
         return res;
     }
     res |= createChain(LOCAL_DOZABLE, getFirewallType(DOZABLE));
     res |= createChain(LOCAL_STANDBY, getFirewallType(STANDBY));
     res |= createChain(LOCAL_POWERSAVE, getFirewallType(POWERSAVE));
+    res |= createChain(LOCAL_RESTRICTED, getFirewallType(RESTRICTED));
     return res;
 }
 
@@ -154,6 +153,9 @@ int FirewallController::enableChildChains(ChildChain chain, bool enable) {
             break;
         case POWERSAVE:
             name = LOCAL_POWERSAVE;
+            break;
+        case RESTRICTED:
+            name = LOCAL_RESTRICTED;
             break;
         default:
             return res;
@@ -219,6 +221,8 @@ FirewallType FirewallController::getFirewallType(ChildChain chain) {
             return DENYLIST;
         case POWERSAVE:
             return ALLOWLIST;
+        case RESTRICTED:
+            return ALLOWLIST;
         case NONE:
             return mFirewallType;
         default:
@@ -243,16 +247,19 @@ int FirewallController::setUidRule(ChildChain chain, int uid, FirewallRule rule)
     std::vector<std::string> chainNames;
     switch(chain) {
         case DOZABLE:
-            chainNames = { LOCAL_DOZABLE };
+            chainNames = {LOCAL_DOZABLE};
             break;
         case STANDBY:
-            chainNames = { LOCAL_STANDBY };
+            chainNames = {LOCAL_STANDBY};
             break;
         case POWERSAVE:
-            chainNames = { LOCAL_POWERSAVE };
+            chainNames = {LOCAL_POWERSAVE};
+            break;
+        case RESTRICTED:
+            chainNames = {LOCAL_RESTRICTED};
             break;
         case NONE:
-            chainNames = { LOCAL_INPUT, LOCAL_OUTPUT };
+            chainNames = {LOCAL_INPUT, LOCAL_OUTPUT};
             break;
         default:
             ALOGW("Unknown child chain: %d", chain);

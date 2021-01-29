@@ -203,6 +203,9 @@ static inline int bpf_owner_match(struct __sk_buff* skb, uint32_t uid, int direc
         if ((enabledRules & POWERSAVE_MATCH) && !(uidRules & POWERSAVE_MATCH)) {
             return BPF_DROP;
         }
+        if ((enabledRules & RESTRICTED_MATCH) && !(uidRules & RESTRICTED_MATCH)) {
+            return BPF_DROP;
+        }
     }
     if (direction == BPF_INGRESS && (uidRules & IIF_MATCH)) {
         // Drops packets not coming from lo nor the allowlisted interface
@@ -280,13 +283,13 @@ static __always_inline inline int bpf_traffic_account(struct __sk_buff* skb, int
     return match;
 }
 
-SEC("cgroupskb/ingress/stats")
-int bpf_cgroup_ingress(struct __sk_buff* skb) {
+DEFINE_BPF_PROG("cgroupskb/ingress/stats", AID_ROOT, AID_ROOT, bpf_cgroup_ingress)
+(struct __sk_buff* skb) {
     return bpf_traffic_account(skb, BPF_INGRESS);
 }
 
-SEC("cgroupskb/egress/stats")
-int bpf_cgroup_egress(struct __sk_buff* skb) {
+DEFINE_BPF_PROG("cgroupskb/egress/stats", AID_ROOT, AID_ROOT, bpf_cgroup_egress)
+(struct __sk_buff* skb) {
     return bpf_traffic_account(skb, BPF_EGRESS);
 }
 

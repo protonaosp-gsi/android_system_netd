@@ -13,10 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#define LOG_TAG "Netd"
 
 #include "Network.h"
 
-#define LOG_TAG "Netd"
+#include "RouteController.h"
+#include "SockDiag.h"
 #include "log/log.h"
 
 #include <android-base/strings.h>
@@ -86,9 +88,39 @@ std::string Network::toString() const {
     return repr.str();
 }
 
-
-Network::Network(unsigned netId) : mNetId(netId) {
+bool Network::appliesToUser(uid_t uid) const {
+    return mUidRanges.hasUid(uid);
 }
+
+int Network::addUsers(const UidRanges& uidRanges) {
+    for (const std::string& interface : mInterfaces) {
+        if (int ret = RouteController::addUsersToVirtualNetwork(mNetId, interface.c_str(), mSecure,
+                                                                uidRanges)) {
+            ALOGE("failed to add users on interface %s of netId %u", interface.c_str(), mNetId);
+            return ret;
+        }
+    }
+    mUidRanges.add(uidRanges);
+    return 0;
+}
+
+int Network::removeUsers(const UidRanges& uidRanges) {
+    for (const std::string& interface : mInterfaces) {
+        if (int ret = RouteController::removeUsersFromVirtualNetwork(mNetId, interface.c_str(),
+                                                                     mSecure, uidRanges)) {
+            ALOGE("failed to remove users on interface %s of netId %u", interface.c_str(), mNetId);
+            return ret;
+        }
+    }
+    mUidRanges.remove(uidRanges);
+    return 0;
+}
+
+bool Network::isSecure() const {
+    return mSecure;
+}
+
+Network::Network(unsigned netId, bool secure) : mNetId(netId), mSecure(secure) {}
 
 }  // namespace net
 }  // namespace android
