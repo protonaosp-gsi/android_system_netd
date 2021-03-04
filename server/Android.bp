@@ -1,3 +1,27 @@
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "system_netd_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["system_netd_license"],
+}
+
+java_library {
+    name: "netd_aidl_interface-lateststable-java",
+    sdk_version: "system_current",
+    min_sdk_version: "29",
+    static_libs: [
+        "netd_aidl_interface-V5-java",
+    ],
+    apex_available: [
+        "//apex_available:platform", // used from services.net
+        "com.android.bluetooth.updatable",
+        "com.android.tethering",
+        "com.android.wifi",
+    ],
+}
+
 aidl_interface {
     name: "netd_aidl_interface",
     local_include_dir: "binder",
@@ -36,6 +60,21 @@ aidl_interface {
         "3",
         "4",
         "5",
+    ],
+}
+
+java_library {
+    name: "netd_event_listener_interface-lateststable-java",
+    sdk_version: "system_current",
+    min_sdk_version: "29",
+    static_libs: [
+        "netd_event_listener_interface-V1-java",
+    ],
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.bluetooth.updatable",
+        "com.android.wifi",
+        "com.android.tethering",
     ],
 }
 
@@ -139,8 +178,8 @@ cc_library_static {
         "libqtaguid",
         "libssl",
         "libsysutils",
-        "netd_aidl_interface-unstable-cpp",
-        "netd_event_listener_interface-cpp",
+        "netd_aidl_interface-V6-cpp",
+        "netd_event_listener_interface-V1-cpp",
     ],
     aidl: {
         export_aidl_headers: true,
@@ -182,8 +221,8 @@ cc_binary {
         "libselinux",
         "libsysutils",
         "libutils",
-        "netd_aidl_interface-unstable-cpp",
-        "netd_event_listener_interface-cpp",
+        "netd_aidl_interface-V6-cpp",
+        "netd_event_listener_interface-V1-cpp",
         "oemnetd_aidl_interface-cpp",
     ],
     static_libs: [
@@ -231,8 +270,8 @@ cc_binary {
         "liblog",
         "libutils",
         "libbinder",
-        "dnsresolver_aidl_interface-cpp",
-        "netd_aidl_interface-unstable-cpp",
+        "dnsresolver_aidl_interface-V7-cpp",
+        "netd_aidl_interface-V6-cpp",
     ],
     srcs: [
         "ndc.cpp",
@@ -278,8 +317,8 @@ cc_test {
         "libnetd_server",
         "libnetd_test_tun_interface",
         "libqtaguid",
-        "netd_aidl_interface-unstable-cpp",
-        "netd_event_listener_interface-cpp",
+        "netd_aidl_interface-V6-cpp",
+        "netd_event_listener_interface-V1-cpp",
     ],
     shared_libs: [
         "libbase",
