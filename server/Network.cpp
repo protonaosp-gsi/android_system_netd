@@ -74,6 +74,9 @@ std::string Network::toString() const {
         case PHYSICAL:
             repr << "PHYSICAL";
             break;
+        case UNREACHABLE:
+            repr << "UNREACHABLE";
+            break;
         case VIRTUAL:
             repr << "VIRTUAL";
             break;
@@ -104,53 +107,6 @@ bool Network::hasInvalidUidRanges(const UidRanges& uidRanges) const {
         return true;
     }
     return false;
-}
-
-int Network::addUsers(const UidRanges& uidRanges) {
-    if (hasInvalidUidRanges(uidRanges)) {
-        return -EINVAL;
-    }
-
-    for (const std::string& interface : mInterfaces) {
-        int ret;
-        if (isVirtual()) {
-            ret = RouteController::addUsersToVirtualNetwork(mNetId, interface.c_str(), mSecure,
-                                                            uidRanges);
-        } else if (isPhysical()) {
-            ret = RouteController::addUsersToPhysicalNetwork(mNetId, interface.c_str(), uidRanges);
-        } else {
-            ALOGE("failed to add users. Invalid network type %d, netId %d", getType(), mNetId);
-            return -EINVAL;
-        }
-        if (ret) {
-            ALOGE("failed to add users on interface %s of netId %u", interface.c_str(), mNetId);
-            return ret;
-        }
-    }
-    mUidRanges.add(uidRanges);
-    return 0;
-}
-
-int Network::removeUsers(const UidRanges& uidRanges) {
-    for (const std::string& interface : mInterfaces) {
-        int ret;
-        if (isVirtual()) {
-            ret = RouteController::removeUsersFromVirtualNetwork(mNetId, interface.c_str(), mSecure,
-                                                                 uidRanges);
-        } else if (isPhysical()) {
-            ret = RouteController::removeUsersFromPhysicalNetwork(mNetId, interface.c_str(),
-                                                                  uidRanges);
-        } else {
-            ALOGE("failed to remove users. Invalid network type %d, netId %d", getType(), mNetId);
-            return -EINVAL;
-        }
-        if (ret) {
-            ALOGE("failed to remove users on interface %s of netId %u", interface.c_str(), mNetId);
-            return ret;
-        }
-    }
-    mUidRanges.remove(uidRanges);
-    return 0;
 }
 
 bool Network::isSecure() const {

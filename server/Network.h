@@ -31,6 +31,7 @@ public:
         DUMMY,
         LOCAL,
         PHYSICAL,
+        UNREACHABLE,
         VIRTUAL,
     };
 
@@ -46,20 +47,23 @@ public:
     const std::set<std::string>& getInterfaces() const;
 
     // These return 0 on success or negative errno on failure.
-    [[nodiscard]] virtual int addInterface(const std::string& interface) = 0;
-    [[nodiscard]] virtual int removeInterface(const std::string& interface) = 0;
+    [[nodiscard]] virtual int addInterface(const std::string&) { return -EINVAL; }
+    [[nodiscard]] virtual int removeInterface(const std::string&) { return -EINVAL; }
     [[nodiscard]] int clearInterfaces();
 
     std::string toString() const;
     bool appliesToUser(uid_t uid) const;
-    [[nodiscard]] int addUsers(const UidRanges& uidRanges);
-    [[nodiscard]] int removeUsers(const UidRanges& uidRanges);
+    [[nodiscard]] virtual int addUsers(const UidRanges&) { return -EINVAL; };
+    [[nodiscard]] virtual int removeUsers(const UidRanges&) { return -EINVAL; };
     bool isSecure() const;
     bool isPhysical() { return getType() == PHYSICAL; }
+    bool isUnreachable() { return getType() == UNREACHABLE; }
     bool isVirtual() { return getType() == VIRTUAL; }
+    bool canAddUsers() { return isPhysical() || isVirtual() || isUnreachable(); }
 
 protected:
     explicit Network(unsigned netId, bool mSecure = false);
+    bool hasInvalidUidRanges(const UidRanges& uidRanges) const;
 
     const unsigned mNetId;
     std::set<std::string> mInterfaces;
@@ -71,8 +75,6 @@ private:
         REMOVE,
         ADD,
     };
-
-    bool hasInvalidUidRanges(const UidRanges& uidRanges) const;
 };
 
 }  // namespace android::net

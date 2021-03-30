@@ -18,9 +18,6 @@
 
 #include "DummyNetwork.h"
 
-#include "RouteController.h"
-
-#include "log/log.h"
 #include "errno.h"
 
 namespace android {
@@ -44,14 +41,6 @@ DummyNetwork::~DummyNetwork() {
 
 Network::Type DummyNetwork::getType() const {
     return DUMMY;
-}
-
-int DummyNetwork::addInterface(const std::string& /* interface */) {
-    return -EINVAL;
-}
-
-int DummyNetwork::removeInterface(const std::string& /* interface */) {
-    return -EINVAL;
 }
 
 }  // namespace net
