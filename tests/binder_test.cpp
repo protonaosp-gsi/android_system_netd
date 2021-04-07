@@ -1097,7 +1097,7 @@ bool iptablesIdleTimerInterfaceRuleExists(const char* binary, const char* chainN
 void expectIdletimerInterfaceRuleExists(const std::string& ifname, int timeout,
                                         const std::string& classLabel) {
     std::string IdletimerRule =
-            StringPrintf("timeout:%u label:%s send_nl_msg:1", timeout, classLabel.c_str());
+            StringPrintf("timeout:%u label:%s send_nl_msg", timeout, classLabel.c_str());
     for (const auto& binary : {IPTABLES_PATH, IP6TABLES_PATH}) {
         EXPECT_TRUE(iptablesIdleTimerInterfaceRuleExists(binary, IDLETIMER_RAW_PREROUTING, ifname,
                                                          IdletimerRule, RAW_TABLE));
@@ -1109,7 +1109,7 @@ void expectIdletimerInterfaceRuleExists(const std::string& ifname, int timeout,
 void expectIdletimerInterfaceRuleNotExists(const std::string& ifname, int timeout,
                                            const std::string& classLabel) {
     std::string IdletimerRule =
-            StringPrintf("timeout:%u label:%s send_nl_msg:1", timeout, classLabel.c_str());
+            StringPrintf("timeout:%u label:%s send_nl_msg", timeout, classLabel.c_str());
     for (const auto& binary : {IPTABLES_PATH, IP6TABLES_PATH}) {
         EXPECT_FALSE(iptablesIdleTimerInterfaceRuleExists(binary, IDLETIMER_RAW_PREROUTING, ifname,
                                                           IdletimerRule, RAW_TABLE));
@@ -4044,10 +4044,20 @@ TEST_F(NetdBinderTest, PerAppDefaultNetwork_UnconnectedSocket) {
     expectPacketSentOnNetId(AID_ROOT, NETID_UNSET, systemDefaultFd, UNCONNECTED_SOCKET);
     expectPacketSentOnNetId(TEST_UID1, NETID_UNSET, appDefaultFd, UNCONNECTED_SOCKET);
 
-    // Set TEST_UID1's default network to unreachable. Its traffic should get ENETUNREACH error.
-    // Other traffic still go through the system default network.
+    // Set TEST_UID1's default network to unreachable. Its traffic should still go through the
+    // per-app default network. Other traffic go through the system default network.
+    // PS: per-app default network take precedence over unreachable network. This should happens
+    //     only in the transition period when both rules are briefly set.
     EXPECT_TRUE(mNetd->networkAddUidRanges(INetd::UNREACHABLE_NET_ID,
                                            {makeUidRangeParcel(TEST_UID1, TEST_UID1)})
+                        .isOk());
+    expectPacketSentOnNetId(AID_ROOT, NETID_UNSET, systemDefaultFd, UNCONNECTED_SOCKET);
+    expectPacketSentOnNetId(TEST_UID1, NETID_UNSET, appDefaultFd, UNCONNECTED_SOCKET);
+
+    // Remove TEST_UID1's default network from OEM-paid network. Its traffic should get ENETUNREACH
+    // error. Other traffic still go through the system default network.
+    EXPECT_TRUE(mNetd->networkRemoveUidRanges(APP_DEFAULT_NETID,
+                                              {makeUidRangeParcel(TEST_UID1, TEST_UID1)})
                         .isOk());
     expectPacketSentOnNetId(AID_ROOT, NETID_UNSET, systemDefaultFd, UNCONNECTED_SOCKET);
     expectUnreachableError(TEST_UID1, NETID_UNSET, UNCONNECTED_SOCKET);
