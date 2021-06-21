@@ -158,8 +158,33 @@ int PhysicalNetwork::removeAsDefault() {
     return 0;
 }
 
-Network::Type PhysicalNetwork::getType() const {
-    return PHYSICAL;
+int PhysicalNetwork::addUsers(const UidRanges& uidRanges) {
+    if (hasInvalidUidRanges(uidRanges)) {
+        return -EINVAL;
+    }
+
+    for (const std::string& interface : mInterfaces) {
+        int ret = RouteController::addUsersToPhysicalNetwork(mNetId, interface.c_str(), uidRanges);
+        if (ret) {
+            ALOGE("failed to add users on interface %s of netId %u", interface.c_str(), mNetId);
+            return ret;
+        }
+    }
+    mUidRanges.add(uidRanges);
+    return 0;
+}
+
+int PhysicalNetwork::removeUsers(const UidRanges& uidRanges) {
+    for (const std::string& interface : mInterfaces) {
+        int ret = RouteController::removeUsersFromPhysicalNetwork(mNetId, interface.c_str(),
+                                                                  uidRanges);
+        if (ret) {
+            ALOGE("failed to remove users on interface %s of netId %u", interface.c_str(), mNetId);
+            return ret;
+        }
+    }
+    mUidRanges.remove(uidRanges);
+    return 0;
 }
 
 int PhysicalNetwork::addInterface(const std::string& interface) {
@@ -167,7 +192,7 @@ int PhysicalNetwork::addInterface(const std::string& interface) {
         return 0;
     }
     if (int ret = RouteController::addInterfaceToPhysicalNetwork(mNetId, interface.c_str(),
-                                                                 mPermission)) {
+                                                                 mPermission, mUidRanges)) {
         ALOGE("failed to add interface %s to netId %u", interface.c_str(), mNetId);
         return ret;
     }
@@ -194,7 +219,7 @@ int PhysicalNetwork::removeInterface(const std::string& interface) {
     // to find the interface index in the cache in cases where the interface is already gone
     // (e.g. bt-pan).
     if (int ret = RouteController::removeInterfaceFromPhysicalNetwork(mNetId, interface.c_str(),
-                                                                      mPermission)) {
+                                                                      mPermission, mUidRanges)) {
         ALOGE("failed to remove interface %s from netId %u", interface.c_str(), mNetId);
         return ret;
     }
