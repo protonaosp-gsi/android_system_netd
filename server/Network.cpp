@@ -13,10 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#define LOG_TAG "Netd"
 
 #include "Network.h"
 
-#define LOG_TAG "Netd"
+#include "RouteController.h"
+#include "SockDiag.h"
 #include "log/log.h"
 
 #include <android-base/strings.h>
@@ -59,25 +61,7 @@ std::string Network::toString() const {
     const char kSeparator[] = " ";
     std::stringstream repr;
 
-    repr << mNetId;
-
-    repr << kSeparator;
-    switch (getType()) {
-        case DUMMY:
-            repr << "DUMMY";
-            break;
-        case LOCAL:
-            repr << "LOCAL";
-            break;
-        case PHYSICAL:
-            repr << "PHYSICAL";
-            break;
-        case VIRTUAL:
-            repr << "VIRTUAL";
-            break;
-        default:
-            repr << "unknown";
-    }
+    repr << mNetId << kSeparator << getTypeString();
 
     if (mInterfaces.size() > 0) {
         repr << kSeparator << android::base::Join(mInterfaces, ",");
@@ -86,9 +70,29 @@ std::string Network::toString() const {
     return repr.str();
 }
 
-
-Network::Network(unsigned netId) : mNetId(netId) {
+bool Network::appliesToUser(uid_t uid) const {
+    return mUidRanges.hasUid(uid);
 }
+
+bool Network::hasInvalidUidRanges(const UidRanges& uidRanges) const {
+    if (uidRanges.overlapsSelf()) {
+        ALOGE("uid range %s overlaps self", uidRanges.toString().c_str());
+        return true;
+    }
+
+    if (uidRanges.overlaps(mUidRanges)) {
+        ALOGE("uid range %s overlaps %s", uidRanges.toString().c_str(),
+              mUidRanges.toString().c_str());
+        return true;
+    }
+    return false;
+}
+
+bool Network::isSecure() const {
+    return mSecure;
+}
+
+Network::Network(unsigned netId, bool secure) : mNetId(netId), mSecure(secure) {}
 
 }  // namespace net
 }  // namespace android
