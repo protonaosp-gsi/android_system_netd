@@ -12,7 +12,7 @@ java_library {
     sdk_version: "system_current",
     min_sdk_version: "29",
     static_libs: [
-        "netd_aidl_interface-V5-java",
+        "netd_aidl_interface-V6-java",
     ],
     apex_available: [
         "//apex_available:platform", // used from services.net
@@ -36,7 +36,7 @@ cc_library_static {
 cc_library_static {
     name: "netd_aidl_interface-lateststable-ndk_platform",
     whole_static_libs: [
-        "netd_aidl_interface-V5-ndk_platform",
+        "netd_aidl_interface-V6-ndk_platform",
     ],
     apex_available: [
         "com.android.resolv",
@@ -47,7 +47,7 @@ cc_library_static {
 cc_library_static {
     name: "netd_aidl_interface-lateststable-cpp",
     whole_static_libs: [
-        "netd_aidl_interface-V5-cpp",
+        "netd_aidl_interface-V6-cpp",
     ],
 }
 
@@ -60,6 +60,9 @@ aidl_interface {
         "binder/android/net/INetdUnsolicitedEventListener.aidl",
         "binder/android/net/InterfaceConfigurationParcel.aidl",
         "binder/android/net/MarkMaskParcel.aidl",
+        "binder/android/net/NativeNetworkConfig.aidl",
+        "binder/android/net/NativeNetworkType.aidl",
+        "binder/android/net/NativeVpnType.aidl",
         "binder/android/net/RouteInfoParcel.aidl",
         "binder/android/net/TetherConfigParcel.aidl",
         "binder/android/net/TetherOffloadRuleParcel.aidl",
@@ -97,6 +100,7 @@ aidl_interface {
         "3",
         "4",
         "5",
+        "6",
     ],
 }
 
@@ -288,6 +292,7 @@ cc_binary {
     ],
     sanitize: {
         cfi: true,
+        memtag_heap: true,
     },
 }
 
@@ -318,6 +323,7 @@ cc_binary {
     ],
     sanitize: {
         cfi: true,
+        memtag_heap: true,
     },
 }
 

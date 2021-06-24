@@ -107,7 +107,7 @@ public:
 
     [[nodiscard]] int createPhysicalNetwork(unsigned netId, Permission permission);
     [[nodiscard]] int createPhysicalOemNetwork(Permission permission, unsigned* netId);
-    [[nodiscard]] int createVirtualNetwork(unsigned netId, bool secure);
+    [[nodiscard]] int createVirtualNetwork(unsigned netId, bool secure, NativeVpnType vpnType);
     [[nodiscard]] int destroyNetwork(unsigned netId);
 
     [[nodiscard]] int addInterfaceToNetwork(unsigned netId, const char* interface);
@@ -154,8 +154,6 @@ public:
     // set to a non-NETID_UNSET value if the user already has indicated a preference. Returns the
     // fwmark value to set on the socket when performing the DNS request.
     uint32_t getNetworkForDnsLocked(unsigned* netId, uid_t uid) const;
-
-    unsigned getNetworkForUserLocked(uid_t uid) const;
     unsigned getNetworkForConnectLocked(uid_t uid) const;
     unsigned getNetworkForInterfaceLocked(const char* interface) const;
     bool canProtectLocked(uid_t uid) const;
